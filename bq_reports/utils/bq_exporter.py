@@ -996,11 +996,135 @@ class ReportExporter(MultiShopExporter):
         ws.title = "单品日销量"
         self._write_data_to_sheet(ws, results, ["账号", "日期", "商品名称", "销量"])
         wb.save(output_path)
-        
+
         return ExportResult(
             total_count=len(self.merchants),
             success_count=len(self.merchants) - len(errors),
             failed_count=len(errors),
             output_path=str(output_path),
             errors=errors
+        )
+
+    def export_orders_by_nationality(
+        self,
+        output_path: Optional[Union[str, Path]] = None
+    ) -> ExportResult:
+        """
+        订单国籍报表（单门店）
+
+        Sheet1: 订单明细（订单号、时间、国籍、实收金额、订单明细）
+        Sheet2: 按国籍汇总（国籍、总金额、订单数）
+
+        Args:
+            output_path: 可选，自定义输出路径
+
+        Returns:
+            ExportResult
+        """
+        from .sql_templates import get_template
+        from datetime import datetime, timezone, timedelta
+        from collections import defaultdict
+
+        dataset = "shop1922991923200000"
+        sql = get_template('order_nationality')
+
+        query = sql.format(
+            project=self.project_id,
+            dataset=dataset
+        )
+
+        rows = list(self.client.query(query).result())
+
+        # 格式化数据
+        orders = []
+        for row in rows:
+            # finish_time 是 Unix 秒，转为 Asia/Bangkok 时间
+            finish_ts = int(row.order_time or 0)
+            if finish_ts > 0:
+                dt = datetime.fromtimestamp(finish_ts, tz=timezone(timedelta(hours=7)))
+                time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                time_str = ""
+
+            orders.append({
+                "订单号": row.order_number or "",
+                "时间": time_str,
+                "国籍": row.nationality or "未知",
+                "实收金额": float(row.received_amount or 0),
+                "订单明细": row.order_details or ""
+            })
+
+        # 按国籍汇总
+        nationality_stats = defaultdict(lambda: {"总金额": 0.0, "订单数": 0})
+        for order in orders:
+            nat = order["国籍"]
+            nationality_stats[nat]["总金额"] += order["实收金额"]
+            nationality_stats[nat]["订单数"] += 1
+
+        summary = []
+        for nat, stats in sorted(nationality_stats.items(), key=lambda x: x[1]["总金额"], reverse=True):
+            summary.append({
+                "国籍": nat,
+                "总金额": round(stats["总金额"], 2),
+                "订单数": stats["订单数"]
+            })
+
+        # 写入 Excel（双 sheet）
+        output_path = output_path or self.output_path
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        wb = Workbook()
+
+        ws1 = wb.active
+        ws1.title = "订单明细"
+        self._write_data_to_sheet(ws1, orders, ["订单号", "时间", "国籍", "实收金额", "订单明细"])
+
+        ws2 = wb.create_sheet(title="国籍汇总")
+        self._write_data_to_sheet(ws2, summary, ["国籍", "总金额", "订单数"])
+
+        wb.save(output_path)
+
+        # ========== 校验 ==========
+        from .validators import RangeValidator, ValidationResult, ValidationError
+
+        # 1. 范围校验：实收金额非负
+        range_validator = RangeValidator([
+            {"field": "实收金额", "min": 0, "name": "实收金额非负"}
+        ])
+        validation_result = range_validator.validate(orders)
+
+        # 2. 自定义一致性校验：Sheet2 汇总 = Sheet1 聚合
+        recalc_stats = defaultdict(lambda: {"总金额": 0.0, "订单数": 0})
+        for order in orders:
+            nat = order["国籍"]
+            recalc_stats[nat]["总金额"] += order["实收金额"]
+            recalc_stats[nat]["订单数"] += 1
+
+        consistency_errors = []
+        for row in summary:
+            nat = row["国籍"]
+            expected_amount = round(recalc_stats[nat]["总金额"], 2)
+            expected_count = recalc_stats[nat]["订单数"]
+            if abs(row["总金额"] - expected_amount) > 0.01 or row["订单数"] != expected_count:
+                consistency_errors.append(ValidationError(
+                    rule="nationality_consistency",
+                    message=f"国籍 '{nat}' 汇总不一致: Sheet2(金额={row['总金额']}, 订单数={row['订单数']}) != Sheet1聚合(金额={expected_amount}, 订单数={expected_count})",
+                    details={"国籍": nat, "sheet2_amount": row["总金额"], "sheet1_amount": expected_amount,
+                             "sheet2_count": row["订单数"], "sheet1_count": expected_count}
+                ))
+
+        if consistency_errors:
+            consistency_result = ValidationResult.failure(consistency_errors, {"checked": len(summary)})
+            validation_result = validation_result.merge(consistency_result)
+        else:
+            validation_result = validation_result.merge(ValidationResult.success({"checked": len(summary)}))
+
+        return ExportResult(
+            total_count=1,
+            success_count=1,
+            failed_count=0,
+            output_path=str(output_path),
+            validation_result=validation_result,
+            errors=[]
         )

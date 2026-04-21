@@ -172,6 +172,8 @@ ORDER BY t.uuid;
 
 当决策为 Python 模式时，生成独立可执行的 Python 脚本。
 
+> **注意：所有脚本必须在开头调用 `setup_proxy()`，否则连接 BigQuery 会 600 秒超时。**
+
 ### 脚本结构
 
 ```python
@@ -186,7 +188,17 @@ from google.cloud import bigquery
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
+# 代理设置 —— 必须！否则 BigQuery 连接会 600 秒超时
+def setup_proxy():
+    proxy_url = "http://127.0.0.1:7897"
+    import os
+    os.environ["HTTP_PROXY"] = proxy_url
+    os.environ["HTTPS_PROXY"] = proxy_url
+    os.environ["http_proxy"] = proxy_url
+    os.environ["https_proxy"] = proxy_url
+
 def main():
+    setup_proxy()  # <-- 必须在查询前调用
     args = parse_args()
     client = bigquery.Client(project=args.project)
 
@@ -367,6 +379,9 @@ validators = create_default_validators(
 
 | 陷阱 | 说明 | 解法 |
 |------|------|------|
+| 字段名假设 | `ttpos_sale_bill` 里是 `order_no` 而非 `bill_no`，不要凭经验猜字段名 | 写 SQL 前先用 `bq_client.get_table("project.dataset.table")` 查 schema |
+| 忘记设代理 | 新脚本没调 `setup_proxy()` 会报 `ConnectTimeoutError`，600 秒超时 | 所有脚本开头调用 `setup_proxy()`，设置 `HTTP_PROXY`/`HTTPS_PROXY` 为 `http://127.0.0.1:7897` |
+| JSON vs 结构化字段 | `nationality_name` 存的是 JSON `{"zh":"兰花"}`，但 `ttpos_multi_language_name` 表有结构化字段 `zh_name`/`en_name`/`th_name` | 优先 JOIN `ttpos_multi_language_name` 取结构化字段，而非解析 JSON |
 | 中文列名 | BigQuery 不支持中文列别名 | 用英文别名，Excel 里再改表头 |
 | 多语言 JSON | name 字段是 JSON 不是纯文本 | `JSON_EXTRACT_SCALAR(name, '$.zh')` |
 | 软删除 | 每张表都有 delete_time | 所有 JOIN 和 WHERE 都加 `delete_time = 0` |

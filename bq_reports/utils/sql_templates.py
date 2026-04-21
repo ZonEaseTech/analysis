@@ -496,6 +496,46 @@ GROUP BY c.uuid, cs.erpnext_company_abbr, c.name
 """
 
 
+# ==================== 7. 订单国籍相关 ====================
+
+# 订单国籍明细（POS 订单 + 国籍 + 商品明细）
+ORDER_NATIONALITY_SQL = """
+WITH
+order_items AS (
+  SELECT
+    sop.sale_bill_uuid,
+    STRING_AGG(COALESCE(
+      JSON_EXTRACT_SCALAR(pp.name, '$.zh'),
+      JSON_EXTRACT_SCALAR(pp.name, '$.en'),
+      JSON_EXTRACT_SCALAR(pp.name, '$.th'),
+      '未知'
+    ), ', ') AS items
+  FROM `{project}.{dataset}.ttpos_sale_order_product` sop
+  JOIN `{project}.{dataset}.ttpos_product_package` pp
+    ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
+  WHERE sop.delete_time = 0
+    AND sop.cancel_time = 0
+    AND sop.product_type IN (0, 2)
+  GROUP BY sop.sale_bill_uuid
+)
+SELECT
+  sb.order_no AS order_number,
+  sb.finish_time AS order_time,
+  COALESCE(mln.zh_name, mln.en_name, mln.th_name, '未知') AS nationality,
+  ROUND(sb.payment_amount, 2) AS received_amount,
+  COALESCE(oi.items, '') AS order_details
+FROM `{project}.{dataset}.ttpos_sale_bill` sb
+LEFT JOIN `{project}.{dataset}.ttpos_nationality` n
+  ON n.uuid = sb.nationality_uuid AND n.delete_time = 0
+LEFT JOIN `{project}.{dataset}.ttpos_multi_language_name` mln
+  ON mln.uuid = n.multi_language_name_uuid AND mln.delete_time = 0
+LEFT JOIN order_items oi ON oi.sale_bill_uuid = sb.uuid
+WHERE sb.delete_time = 0
+  AND sb.status = 1
+ORDER BY sb.finish_time DESC
+"""
+
+
 # ==================== 模板字典（便于查找） ====================
 
 SQL_TEMPLATES = {
@@ -503,23 +543,26 @@ SQL_TEMPLATES = {
     'sales_revenue': SALES_REVENUE_SQL,
     'takeout_summary': TAKEOUT_ORDER_SUMMARY_SQL,
     'comprehensive_sales': COMPREHENSIVE_SALES_SQL,
-    
+
     # 物品消耗
     'material_consumption': MATERIAL_CONSUMPTION_SQL,
     'specific_material_consumption': SPECIFIC_MATERIAL_CONSUMPTION_SQL,
-    
+
     # BOM商品
     'bom_product_sales': BOM_PRODUCT_SALES_SQL,
-    
+
     # 日销量
     'daily_item_sales': DAILY_ITEM_SALES_SQL,
-    
+
     # 库存
     'purchase_in': PURCHASE_IN_SQL,
     'material_related_sales': MATERIAL_RELATED_SALES_SQL,
-    
+
     # 外卖营业额
     'takeout_revenue': TAKEOUT_REVENUE_SQL,
+
+    # 订单国籍
+    'order_nationality': ORDER_NATIONALITY_SQL,
 }
 
 
