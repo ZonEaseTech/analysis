@@ -1007,6 +1007,8 @@ class ReportExporter(MultiShopExporter):
 
     def export_orders_by_nationality(
         self,
+        start_date: str,
+        end_date: str,
         output_path: Optional[Union[str, Path]] = None
     ) -> ExportResult:
         """
@@ -1016,6 +1018,8 @@ class ReportExporter(MultiShopExporter):
         Sheet2: 按国籍汇总（国籍、总金额、订单数）
 
         Args:
+            start_date: 开始日期 (YYYY-MM-DD)
+            end_date: 结束日期 (YYYY-MM-DD，不包含)
             output_path: 可选，自定义输出路径
 
         Returns:
@@ -1025,12 +1029,17 @@ class ReportExporter(MultiShopExporter):
         from datetime import datetime, timezone, timedelta
         from collections import defaultdict
 
+        start_ts = self._to_timestamp(start_date)
+        end_ts = self._to_timestamp(end_date)
+
         dataset = "shop1922991923200000"
         sql = get_template('order_nationality')
 
         query = sql.format(
             project=self.project_id,
-            dataset=dataset
+            dataset=dataset,
+            start_ts=start_ts,
+            end_ts=end_ts
         )
 
         rows = list(self.client.query(query).result())

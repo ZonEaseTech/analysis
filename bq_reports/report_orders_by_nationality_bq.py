@@ -19,6 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description="订单国籍报表导出")
     parser.add_argument("--output", required=True, help="输出 Excel 文件路径")
     parser.add_argument("--project", default="diyl-407103", help="GCP 项目 ID")
+    parser.add_argument("--start-date", required=True, help="开始日期 (YYYY-MM-DD)")
+    parser.add_argument("--end-date", required=True, help="结束日期 (YYYY-MM-DD，不包含)")
 
     args = parser.parse_args()
 
@@ -32,6 +34,8 @@ def main():
     )
 
     result = exporter.export_orders_by_nationality(
+        start_date=args.start_date,
+        end_date=args.end_date,
         output_path=args.output
     )
 

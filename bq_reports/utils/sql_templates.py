@@ -532,6 +532,8 @@ LEFT JOIN `{project}.{dataset}.ttpos_multi_language_name` mln
 LEFT JOIN order_items oi ON oi.sale_bill_uuid = sb.uuid
 WHERE sb.delete_time = 0
   AND sb.status = 1
+  AND sb.finish_time >= {start_ts}
+  AND sb.finish_time < {end_ts}
 ORDER BY sb.finish_time DESC
 """
 
