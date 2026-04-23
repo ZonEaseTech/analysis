@@ -1,109 +1,43 @@
 ---
 name: bigquery-export
-description: 从 BigQuery 导出 TTPOS 数据报表。生成 SQL 查询或 Python 脚本（google-cloud-bigquery + openpyxl）。当用户提到"导出"、"报表"、"BigQuery"、"BQ"、"数据导出"、"Excel 导出"、"表格导出"、"数据聚合"时触发。
+description: TTPOS BigQuery 数据导出入口。识别用户意图并路由到子文档：表结构速查、SQL 模式、外卖报表、利润报表、编码匹配。
 triggers:
-  - 导出
-  - 报表
   - BigQuery
   - BQ
+  - ttpos_
   - 数据导出
-  - Excel 导出
-  - 表格导出
-  - 数据聚合
-  - 外卖营业额
-  - 外卖统计
 ---
 
-# BigQuery 数据导出
+# BigQuery 数据导出入口
 
-## 快速开始
+## 快速路由
 
-### 外卖营业额统计（华莱士标准）
-
-```python
-from utils.bq_exporter import TakeoutRevenueExporter
-
-exporter = TakeoutRevenueExporter(
-    project_id="diyl-407103",
-    output_path="exports/takeout_revenue.xlsx"
-)
-
-result = exporter.export_takeout_revenue(
-    start_date="2026-03-01",
-    end_date="2026-04-01",
-    merchant_xlsx="resources/merchants.xlsx"
-)
-
-print(f"导出完成: {result.success_count}/{result.total_count} 家")
-print(f"校验结果: {'通过' if result.validation_result.is_valid else '失败'}")
-```
-
-### 通用多门店导出
-
-```python
-from utils.bq_exporter import MultiShopExporter
-from utils.validators import ConsistencyValidator, RangeValidator
-
-exporter = MultiShopExporter(
-    project_id="diyl-407103",
-    output_path="exports/report.xlsx"
-)
-
-# 添加校验器
-exporter.set_validators([
-    ConsistencyValidator(total_field="total", sum_fields=["a", "b"]),
-    RangeValidator([{"field": "amount", "min": 0}])
-])
-
-# 加载商家列表
-exporter.load_merchants("resources/merchants.xlsx")
-
-# 执行导出
-result = exporter.export(
-    sql_template="SELECT ... FROM `{project}.{dataset}.table` ...",
-    start_ts=1772323200,
-    end_ts=1775001600
-)
-```
-
-## 触发条件
-
-用户需要从 BigQuery 导出 TTPOS 业务数据，包括但不限于：
-- 商品/BOM/成本卡数据
-- 订单/销售报表
-- 库存/进出货记录
-- 会员消费/充值报表
-- 任何需要跨表聚合、行转列、多 Sheet 导出的场景
+| 用户意图 | 目标文档 |
+|----------|----------|
+| 查表结构 / 字段含义 / JOIN 关系 | [schema-reference.md](schema-reference.md) |
+| 写 SQL / 行转列 / 时间处理 / 字符串聚合 | [query-patterns.md](query-patterns.md) |
+| 外卖营业额 / 外卖统计 / 平台订单 | [takeout-report.md](takeout-report.md) |
+| 利润 / 成本 / 毛利率 / BOM 成本 | [profit-margin.md](profit-margin.md) |
+| 已有 Excel 匹配 BQ 编码 / 补编码 | [excel-matching.md](excel-matching.md) |
+| 不确定意图 | 走下方 Phase 1 需求澄清流程 |
 
 ---
 
 ## Phase 1: 需求澄清
 
-### 1.1 从用户描述中提取
+### 信息提取
 
 | 信息项 | 说明 | 示例 |
 |--------|------|------|
-| **数据主题** | 导什么 | BOM 成分、订单明细、库存盘点 |
-| **BQ 项目** | GCP project ID | `diyl-407103` |
-| **门店 dataset** | `shop{company_uuid}` | `shop3087884357632000` |
-| **时间范围** | **必须指定**（硬规则） | 起止日期 `YYYY-MM-DD` 或 `YYYY-MM` 月份 |
-| **过滤条件** | 总部/门店/状态（可选） | `headquarter_uuid = xxx` |
-| **输出格式** | CSV/Excel/行转列/拼接 | "每个物品单独一列"、"导成 Excel" |
-| **语言偏好** | 多语言字段提取哪种 | 中文(zh)、泰文(th)、英文(en) |
+| 数据主题 | 导什么 | BOM 成分、订单明细、库存盘点 |
+| BQ 项目 | GCP project ID | `diyl-407103` |
+| 门店 dataset | `shop{company_uuid}` | `shop3087884357632000` |
+| 时间范围 | **必须指定**（硬规则） | `2026-03-01` 至 `2026-04-01` |
+| 过滤条件 | 总部/门店/状态 | `headquarter_uuid = xxx` |
+| 输出格式 | CSV/Excel/行转列/拼接 | "每个物品单独一列" |
+| 语言偏好 | 多语言字段提取 | 中文(zh)、泰文(th)、英文(en) |
 
-### 1.2 信息不足时引导
-
-```yaml
-AskQuestion:
-  Q1: BigQuery 项目和门店 dataset？
-    hint: "格式: project.shop{company_uuid}，如 diyl-407103.shop3087884357632000"
-  Q2: 需要哪些过滤条件？
-    options: [总部数据(headquarter_uuid), 指定时间范围, 指定状态, 不需要过滤]
-  Q3: 输出格式偏好？
-    options: [纯 SQL（复制到 BQ 控制台跑）, Python 脚本（直接导出 Excel）, 先看 SQL 再决定]
-```
-
-### 1.3 决策：SQL vs Python
+### SQL vs Python 决策
 
 ```
 用户需求 ──→ 能用单条 SQL 解决吗？
@@ -112,16 +46,8 @@ AskQuestion:
               │   适用：简单聚合、固定列数行转列、字符串拼接
               │
               └─ NO → Python 脚本模式
-                  适用：
-                  ├─ 动态列数（每行物品数不同，要自动展开）
-                  ├─ 多 Sheet 导出（按分类/门店分 Sheet）
-                  ├─ 复杂后处理（计算占比、排名、条件格式）
-                  ├─ 跨门店批量（循环多个 dataset 聚合）
-                  ├─ **多数据源**（BQ + ERPNext API 混合查询）
-                  ├─ **月度库存报表**（盘点 + 采购 + 调入 + 消耗）
-                  ├─ 大数据量分批导出
-                  ├─ **已有数据补编码**（给已有 Excel 匹配 BQ 编码、名称标准化）
-                  └─ Excel 格式要求（合并单元格、表头样式、列宽）
+                  适用：动态列数、多 Sheet、复杂后处理、跨门店批量、
+                       多数据源（BQ + ERPNext）、大数据量分批、Excel 格式
 ```
 
 ---
@@ -132,9 +58,9 @@ AskQuestion:
 
 关键点：
 - 所有表前缀 `ttpos_`
-- 软删除统一用 `delete_time = 0` 过滤
+- 软删除统一用 `delete_time = 0`
 - 多语言字段（name 等）存储为 JSON：`{"zh":"中文","th":"ไทย","en":"English"}`
-- 时间字段为 Unix 时间戳（秒），非 datetime
+- 时间字段为 Unix 时间戳（秒）
 
 ---
 
@@ -142,424 +68,64 @@ AskQuestion:
 
 读取 [query-patterns.md](query-patterns.md) 选择合适模式。
 
-### SQL 模式规范
+### SQL 语法速查
 
 ```sql
--- BigQuery 语法要点：
--- 1. 表引用：`project`.`dataset`.`ttpos_table_name`
--- 2. JSON 提取：JSON_EXTRACT_SCALAR(field, '$.zh')
--- 3. 字符串聚合：STRING_AGG(expr, delimiter ORDER BY col)
--- 4. 类型转换：CAST(num AS STRING)（不是 CONVERT）
--- 5. 时间转换：TIMESTAMP_SECONDS(unix_ts)
--- 6. 条件聚合：MAX(IF(condition, value, NULL))（不是 CASE WHEN 也行）
--- 7. 列名限制：只能用英文、数字、下划线（不支持中文列名）
--- 8. NULL 处理：IFNULL(expr, default)（不是 ISNULL）
-```
-
-### 通用模板
-
-```sql
-SELECT
-  JSON_EXTRACT_SCALAR(t.name, '$.zh') AS name_zh,
-  -- ...其他字段
-FROM `{project}`.`{dataset}`.`ttpos_{table}` AS t
-WHERE t.delete_time = 0
-  -- ...其他过滤
-ORDER BY t.uuid;
+-- 表引用：`project`.`dataset`.`ttpos_table_name`
+-- JSON 提取：JSON_EXTRACT_SCALAR(field, '$.zh')
+-- 字符串聚合：STRING_AGG(expr, ', ' ORDER BY col)
+-- 时间转换：TIMESTAMP_SECONDS(unix_ts)
+-- 条件聚合：MAX(IF(condition, value, NULL))
+-- 列名限制：只能用英文、数字、下划线
+-- NULL 处理：IFNULL(expr, default)
 ```
 
 ---
 
-## Phase 4: Python 脚本生成
+## Phase 4: Python 脚本
 
-当决策为 Python 模式时，生成独立可执行的 Python 脚本。
+当决策为 Python 模式时，生成独立可执行脚本。
 
-> **注意：所有脚本必须在开头调用 `setup_proxy()`，否则连接 BigQuery 会 600 秒超时。**
+> **所有脚本必须在开头调用 `setup_proxy()`，否则连接 BigQuery 会 600 秒超时。**
 
-### 脚本结构
+### 脚本规范
 
-```python
-#!/usr/bin/env python3
-"""
-{报表描述}
-用法: python export_{name}.py [--project PROJECT] [--dataset DATASET] [--output OUTPUT]
-依赖: pip install google-cloud-bigquery openpyxl
-"""
-import argparse
-from google.cloud import bigquery
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+1. **独立可执行** — 复制走就能跑
+2. **参数化** — project/dataset/output 通过 argparse 传入
+3. **时间范围必传** — 禁止无时间过滤的全量导出
+4. **GCP 认证** — `GOOGLE_APPLICATION_CREDENTIALS` 或 `gcloud auth application-default login`
+5. **Excel 样式** — 表头样式、自动列宽、冻结首行
+6. **脚本放置** — `ttpos-scripts/bigquery/` 目录下
 
-# 代理设置 —— 必须！否则 BigQuery 连接会 600 秒超时
-def setup_proxy():
-    proxy_url = "http://127.0.0.1:7897"
-    import os
-    os.environ["HTTP_PROXY"] = proxy_url
-    os.environ["HTTPS_PROXY"] = proxy_url
-    os.environ["http_proxy"] = proxy_url
-    os.environ["https_proxy"] = proxy_url
-
-def main():
-    setup_proxy()  # <-- 必须在查询前调用
-    args = parse_args()
-    client = bigquery.Client(project=args.project)
-
-    # 1. 查询数据
-    rows = query_data(client, args.dataset)
-
-    # 2. 处理/聚合
-    processed = process_data(rows)
-
-    # 3. 写入 Excel
-    write_excel(processed, args.output)
-    print(f"导出完成: {args.output}")
-
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", default="diyl-407103")
-    parser.add_argument("--dataset", required=True, help="shop{company_uuid}")
-    parser.add_argument("--output", default="export.xlsx")
-    return parser.parse_args()
-
-def query_data(client, dataset):
-    sql = f"""
-    SELECT ...
-    FROM `{client.project}`.`{dataset}`.`ttpos_xxx` AS t
-    WHERE t.delete_time = 0
-    """
-    return list(client.query(sql).result())
-
-def process_data(rows):
-    # 行转列、聚合、分组等复杂逻辑
-    ...
-
-def write_excel(data, output_path):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Sheet1"
-
-    # 表头样式
-    header_font = Font(bold=True, size=11)
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_font_white = Font(bold=True, size=11, color="FFFFFF")
-
-    # 写入表头
-    headers = ["列1", "列2", "列3"]
-    for col_idx, header in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font = header_font_white
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-
-    # 写入数据
-    for row_idx, row_data in enumerate(data, 2):
-        for col_idx, value in enumerate(row_data, 1):
-            ws.cell(row=row_idx, column=col_idx, value=value)
-
-    # 自动列宽
-    for col in ws.columns:
-        max_length = max(len(str(cell.value or "")) for cell in col)
-        ws.column_dimensions[col[0].column_letter].width = min(max_length + 4, 50)
-
-    wb.save(output_path)
-
-if __name__ == "__main__":
-    main()
-```
-
-### Python 脚本规范
-
-1. **独立可执行** — 不依赖项目代码，复制走就能跑
-2. **参数化** — project/dataset/output 都通过 argparse 传入
-3. **时间范围必传** — 所有导出报表**必须**支持 `start_date`/`end_date`（或 `month`），禁止无时间过滤的全量导出
-4. **GCP 认证** — 依赖 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `gcloud auth application-default login`
-5. **Excel 样式** — 默认带表头样式、自动列宽、冻结首行
-6. **脚本放置** — 生成到 `ttpos-scripts/bigquery/` 目录下
+脚本模板见 [query-patterns.md](query-patterns.md) Python 模式部分。
 
 ---
-
-## 专项：外卖营业额统计
-
-### 统计口径（华莱士标准）
-
-外卖订单判定（满足**任一条件**即计入，自动去重）：
-
-| 条件 | 判定逻辑 | 数据源 |
-|------|----------|--------|
-| **条件1** | 支付方式匹配 `Robinhood/Grab/Lineman/Shopee`（不区分大小写/空格） | `ttpos_payment_order` |
-| **条件2** | 订单来源渠道匹配 `Grab/LINE MAN`（多语言名称或JSON快照） | `ttpos_order_source` |
-| **条件3** | 账单类型为会员外送 `bill_type = 2` | `ttpos_sale_bill` |
-| **外加** | 外卖平台已完成订单 `platform IN ('grab', 'lineman', 'shopee')` | `ttpos_takeout_order` |
-
-### 使用工具类
-
-```python
-from utils.takeout_detector import TakeoutOrderDetector
-
-# 使用默认配置
-detector = TakeoutOrderDetector.default()
-
-# 生成 SQL 条件片段
-sql_condition = detector.build_payment_condition("po")
-# 结果: REGEXP_CONTAINS(LOWER(REPLACE(po.payment_method_name, ' ', '')), r'robinhood|grab|lineman|shopee')
-
-# 获取完整 SQL 模板
-sql_template = detector.get_sql_template()
-```
-
-### 交叉校验机制
-
-导出报表**必须**执行以下校验：
-
-```python
-from utils.validators import (
-    ValidationChain, 
-    ConsistencyValidator, 
-    RangeValidator,
-    RatioValidator,
-    CrossSourceValidator
-)
-
-# 创建校验链
-validators = ValidationChain()
-
-# 1. 内部一致性校验
-validators.add(ConsistencyValidator(
-    total_field='total_turnover',
-    sum_fields=['takeout_turnover', 'non_takeout_turnover']
-))
-
-# 2. 数值范围校验
-validators.add(RangeValidator([
-    {"field": "total_turnover", "min": 0, "name": "总营业额非负"},
-    {"field": "takeout_turnover", "min": 0, "name": "外卖营业额非负"},
-]))
-
-# 3. 比例校验（外卖占比不超过100%）
-validators.add(RatioValidator(
-    parent_field='total_turnover',
-    child_field='takeout_turnover',
-    max_ratio=1.0
-))
-
-# 4. 跨源比对校验（抽样）
-validators.add(CrossSourceValidator(
-    bq_client=client,
-    sample_count=5,
-    compare_field='total_turnover'
-))
-
-# 执行校验
-result = validators.validate(excel_data)
-if not result.is_valid:
-    print("校验失败:", result.errors)
-```
-
-### 快捷校验函数
-
-```python
-from utils.validators import create_default_validators
-
-# 一键创建外卖营业额报表的标准校验链
-validators = create_default_validators(
-    total_field="total_turnover",
-    takeout_field="takeout_turnover",
-    non_takeout_field="non_takeout_turnover"
-)
-```
 
 ## Phase 5: 迭代
 
-根据用户反馈：
-- 调整列/字段
-- 修改过滤条件
-- 切换输出格式（SQL ↔ Python）
-- 增加 Sheet 或分组维度
+根据用户反馈调整列/字段、过滤条件、输出格式或增加 Sheet。
 
 ---
 
-## 常见陷阱
+## 项目硬规则
 
-| 陷阱 | 说明 | 解法 |
+1. **虚拟环境**：`venv/bin/python`，禁止直接用系统 `python3`
+2. **代理设置**：`setup_proxy()` → `http://127.0.0.1:7897`
+3. **时间范围必传**：所有导出报表必须有 `start_date`/`end_date`
+4. **软删除过滤**：所有 JOIN 和 WHERE 加 `delete_time = 0`
+5. **多语言提取**：`JSON_EXTRACT_SCALAR(name, '$.zh')`，勿直接当文本
+
+---
+
+## 高频陷阱
+
+| 陷阱 | 后果 | 解法 |
 |------|------|------|
-| 字段名假设 | `ttpos_sale_bill` 里是 `order_no` 而非 `bill_no`，不要凭经验猜字段名 | 写 SQL 前先用 `bq_client.get_table("project.dataset.table")` 查 schema |
-| 忘记设代理 | 新脚本没调 `setup_proxy()` 会报 `ConnectTimeoutError`，600 秒超时 | 所有脚本开头调用 `setup_proxy()`，设置 `HTTP_PROXY`/`HTTPS_PROXY` 为 `http://127.0.0.1:7897` |
-| JSON vs 结构化字段 | `nationality_name` 存的是 JSON `{"zh":"兰花"}`，但 `ttpos_multi_language_name` 表有结构化字段 `zh_name`/`en_name`/`th_name` | 优先 JOIN `ttpos_multi_language_name` 取结构化字段，而非解析 JSON |
-| 中文列名 | BigQuery 不支持中文列别名 | 用英文别名，Excel 里再改表头 |
-| 多语言 JSON | name 字段是 JSON 不是纯文本 | `JSON_EXTRACT_SCALAR(name, '$.zh')` |
-| 软删除 | 每张表都有 delete_time | 所有 JOIN 和 WHERE 都加 `delete_time = 0` |
-| 时间戳 | 存的是 Unix 秒，不是 datetime | `TIMESTAMP_SECONDS(ts)` 或 Python 里 `datetime.fromtimestamp()` |
-| 多租户 dataset | 每个门店独立 dataset | 必须指定 `shop{uuid}`，跨店要 UNION |
-| NULL 编码 | m.code 可能为空 | `IFNULL(m.code, '')` |
-| GROUP BY | BQ 严格模式，SELECT 非聚合列必须在 GROUP BY 中 | 确保一致 |
-| 盘点日期 | submit_time 是提交时间，不是盘点日期 | 按 submit_time 范围过滤，注意选对日期 |
-| 调入单位换算 | 调拨数量需乘 unit_conversion_rate 转基准单位 | `SUM(num * unit_conversion_rate)` |
-| 跨店物品对齐 | 不同门店可能有不同物品 | 用 material code 做 key 合并，缺失填 0 |
-| ERPNext 数据 | 采购数据不在 BQ 中 | 通过 ERPNext API 单独查询，Python 侧 merge |
-| Excel 缓存编码过时 | 已有 Excel 中的编码可能是历史快照，和 BQ 当前编码不同步 | 以 BQ 为唯一权威源，Excel 内部映射仅作参考；匹配后反向查 BQ 验证 |
-| 正向匹配后不做反向验证 | 多数据源匹配时，英文名匹配成功但编码对应的中文名可能完全不同 | 匹配后必须反向验证：用匹配到的编码查 BQ，确认返回的中文名和原始数据一致 |
-| 编码体系已更新 | 物品编码可能被重新分配（如生菜从 VE00002 变为 MK01019） | 明确列出编码冲突项，告知用户"编码体系可能有更新"；如涉及采购/库存对账，需确认 ERP 端编码版本 |
-| 时间范围超出数据边界 | 用户指定的时间范围（如 4/21-4/22）BQ 里实际无数据，但 SQL 本身正确；原因是门店数据只同步到更早日期的 | 导出前先查 `MIN/MAX(finish_time)` 确认实际数据边界，把可用时间范围告知用户，让用户确认后调整再导出 |
-| **BOM 空壳** | `product_bom_card` 存在但 `related_material` 为空，导致成本计算为 0 | 查询时 JOIN `related_material` 验证，发现空 BOM 时从外部数据源（ERPNext/Excel fallback）补充 |
-| **套餐重复扣料** | 套餐 parent + child 都出现在 `sale_order_product`，聚合时同一物料被重复计算 | 按 `parent_sop_uuid` 去重：只保留 parent 行（`product_type=1`）或 child 行（`product_type=2`），不要同时保留 |
-| **合并单元格写公式** | openpyxl 合并后给每个子单元格写值，只有左上角生效，其余被忽略 | 只在合并区域的左上角单元格写公式/值，合并本身会覆盖其余单元格 |
-| **大量公式 Excel 卡顿** | 几万行带公式的 Excel 打开极慢，openpyxl 写入也慢 | 公式改为静态值；或用多进程分 Sheet 写入；或让客户在 Excel 里手动填充公式 |
-| **ERPNext 价格 UOM 歧义** | 同一 `item_code` 可能有多个 `Item Price`（g/pc/Nos 等），直接取第一个会错 | 按 UOM 优先级排序（g > pc > Nos > pkt > ctn），同优先级取最新 modified |
-| **单位换算误用** | BOM 的 `num` 已经是目标单位的消耗量，不需要再除以 `conversion_rate` | 成本 = `num × price_per_stock_uom`，不除 conversion_rate |
-| **百分比格式丢失** | openpyxl 对公式单元格设置 `number_format = "0.00%"` 才显示百分比 | 写公式后必须显式设置 `cell.number_format = "0.00%"` |
-| **门店名称硬编码** | 从特定 Excel 的特定列读取门店编号→名称映射，文件格式一变就崩 | 抽象为资源适配器，通过配置描述列映射，而非硬编码列索引 |
-| **JOIN 膨胀** | 订单 JOIN 子产品 JOIN BOM JOIN 物料 = 行数爆炸（1 订单 × 3 child × 2 材料 = 6 行），53 店 × 千单 = 百万级传输 | 拆分查询：订单在 BQ 内 GROUP BY 聚合；BOM 从产品表单独查；套餐结构独立查并缓存；Python 侧按 product_uuid 合并 |
-| **缓存未分层** | 每次运行都重复查询门店名称、商家列表、BOM 结构等静态数据 | 对静态/准静态数据（门店名称、套餐结构、BOM、ERP 价格）加 TTL 缓存，按时间范围 key 隔离 |
-
----
-
-## 最佳实践：已有 Excel 数据匹配 BQ 编码
-
-场景：用户给出已有 Excel（如销售业绩、物品消耗报表），要求把物品名称匹配上 BQ 编码。
-
-### 匹配流程
-
-```
-1. 读取 Excel，提取唯一物品名称列表
-2. 从 BQ ttpos_material 查所有 code + 多语言名称（JSON 提取 zh/en/th）
-3. 建立映射：优先用 BQ 数据，Excel 内部已有映射仅作参考
-4. 匹配后反向验证：用匹配到的编码查 BQ，确认中文名是否一致
-5. 报告冲突项和不匹配项
-6. 输出新 Excel（插入编码列，保留原数据不变）
-```
-
-### 关键原则
-
-| 原则 | 说明 |
-|------|------|
-| **BQ 为唯一权威源** | Excel 中的编码可能是历史快照，编码体系可能已更新 |
-| **反向验证必须做** | 正向匹配成功 ≠ 编码正确，必须用编码反查 BQ 确认中文名一致 |
-| **冲突要显式报告** | 发现 BQ 编码和 Excel 旧编码不一致时，列出差异让用户确认 |
-| **编码更新要提醒** | 如涉及采购/库存对账，需确认 ERP 端用的是哪版编码 |
-
----
-
-## 专项：利润报表（成本 + 售价 + 毛利率）
-
-### 成本计算口径
-
-```
-单份总成本 = Σ(BOM消耗数量 × 物料单价)
-毛利       = 销售额 − 单份总成本 × 销量
-毛利率     = 毛利 / 销售额
-```
-
-**注意**：BOM `num` 已经是目标单位消耗量，**不除** `conversion_rate`。
-
-### 数据源分层
-
-| 层级 | 数据源 | 用途 | 优先级 |
-|------|--------|------|--------|
-| 主源 | BQ `ttpos_product_bom` + `related_material` | BOM 结构 + 消耗量 | 第一 |
-| 定价 | ERPNext `Item Price` | 物料单价（按 UOM 优先级） | 第一 |
-| Fallback | 客户提供的 Excel/表格 | BOM 补充（当 BQ BOM 为空壳时） | 第二 |
-| 映射 | 客户提供的门店列表 Excel | 门店编号 → 名称 | 参考 |
-
-### 去重规则（套餐）
-
-`ttpos_sale_order_product` 中套餐 parent（`product_type=1`）和 child（`product_type=2`）同时存在时：
-- **只保留 parent 行**聚合销量和销售额
-- child 行的 `parent_sop_uuid` 指向 parent，用于识别归属
-- 避免同一订单中套餐物料被重复计算
-
-### Excel 公式模式（推荐）
-
-把计算列交给 Excel 公式，方便客户调价格后自动重算：
-
-```python
-# L: 物品总成本 = 单价 × 消耗数量 × 销量
-ws.cell(row=r, column=12, value=f"=I{r}*J{r}*D{r}")
-
-# M: 单份总成本 = SUMPRODUCT(单价列, 消耗列)
-ws.cell(row=start, column=13, value=f"=SUMPRODUCT(I{start}:I{end},J{start}:J{end})")
-
-# N: 毛利 = 销售额 − 单份总成本×销量
-ws.cell(row=start, column=14, value=f"=F{start}-M{start}*D{start}")
-
-# O: 毛利率 = IF(销售额=0, 0, 毛利/销售额)
-ws.cell(row=start, column=15, value=f"=IF(F{start}=0,0,N{start}/F{start})")
-ws.cell(row=start, column=15).number_format = "0.00%"
-```
-
-**限制**：几万行带公式的 Excel 打开会很慢。静态值 + 公式混合策略：A-K 写值，L-O 写公式，合并单元格区域只在左上角写公式。
-
-### 多进程加速写入
-
-```python
-from multiprocessing import Process
-
-def write_sheet(sheet_name, rows, headers, output_path, sheet_index):
-    wb = load_workbook(output_path)
-    ws = wb.create_sheet(title=sheet_name, index=sheet_index)
-    # ... 写入逻辑
-    wb.save(output_path)
-
-# 每个 Sheet 一个进程
-processes = [
-    Process(target=write_sheet, args=("套餐", combo_rows, headers, output_path, 0)),
-    Process(target=write_sheet, args=("单品", single_rows, headers, output_path, 1)),
-]
-for p in processes:
-    p.start()
-for p in processes:
-    p.join()
-```
-
-### SQL 性能优化：避免 JOIN 膨胀
-
-当 SQL 涉及 订单 → 子产品 → BOM → 物料 多级 JOIN 时，结果行数会指数级增长。
-
-**问题示例**：
-- 1 个套餐订单含 3 个子产品，每个子产品含 2 个 BOM 物料
-- JOIN 后 1 条订单 → 6 条结果行（6x 膨胀）
-- 53 店 × 日均 1000 单 × 6 = 318,000 行/天 传输到 Python
-
-**优化方案：三查询分离**
-
-```
-查询1（订单聚合）
-  → 在 BQ 内 GROUP BY product_uuid，返回 (uuid, name, SUM(qty), SUM(revenue))
-  → 每店仅 ~30-80 行
-
-查询2（BOM 结构）
-  → 从产品表 ttpos_product_bom + related_material 查
-  → 不扫描订单表，每店 ~500-800 行
-  → 缓存 TTL：1天
-
-查询3（套餐结构，仅套餐模式）
-  → 从订单查 combo_uuid → child_uuid 的 DISTINCT 映射
-  → 结果有界（稳定菜单下每店 ~100-400 行）
-  → 缓存 TTL：7天
-
-Python 侧合并
-  → 按 product_uuid 将订单与 BOM 匹配
-  → 套餐通过 structure 找到 child_uuids，汇总 child BOM
-```
-
-**效果对比**（53 店利润报表）
-
-| 指标 | 旧版（单查询 JOIN） | 新版（三查询分离） |
-|------|---------------------|---------------------|
-| 传输数据量 | ~200 万行 | ~5 万行 |
-| 单日导出耗时 | 3-7 分钟 | ~1 分钟 |
-| BQ 扫描费用 | 高（JOIN 多级表） | 低（订单表仅扫一次） |
-| 单品结果 | — | 与旧版完全一致 |
-| 套餐结果（单日） | — | 与旧版完全一致 |
-| 套餐结果（多日） | — | 差异 <0.1% |
-
-**差异原因与取舍**：
-
-- 套餐结构从"时间范围内所有订单"推断，若菜单在期间变化（如替换某个子产品），新版会汇总所有出现过的子产品的 BOM
-- 旧版按每个订单实时关联当时的子产品和 BOM，更精确但慢
-- **单日查询：结果完全一致**
-- **多日查询：差异 <0.1%，可接受**
-- 若需绝对精确且能容忍 3-7 分钟耗时，保留旧版 JOIN 方式作为 `--precise` fallback
-
-**BOM 从产品表 vs 从订单关联的区别**：
-
-旧版通过 `sale_order_product_bom` 关联订单到具体的 `product_bom_uuid`，同一产品在不同订单中可能使用不同 BOM 记录。新版直接从 `ttpos_product_bom` 查，若同一 `product_package_uuid` 存在多条 BOM 记录，会全部返回。实测中 94% 的产品只有一条 BOM 记录，差异可忽略。
+| 忘记设代理 | `ConnectTimeoutError` 600s 超时 | 脚本开头调 `setup_proxy()` |
+| JSON 字段当文本 | 返回 `"{"zh":"..."}"` 而非中文 | 用 `JSON_EXTRACT_SCALAR` |
+| 中文列别名 | BQ 语法错误 | 英文别名，Excel 里改表头 |
+| 时间戳当 datetime | 过滤条件失效 | `TIMESTAMP_SECONDS(ts)` 转换 |
+| GROUP BY 漏列 | BQ 严格模式报错 | SELECT 非聚合列必须进 GROUP BY |
+| NULL 编码 | 匹配失败 | `IFNULL(m.code, '')` |
+| JOIN 膨胀 | 行数指数级增长，传输量爆炸 | 拆分查询，详情见 [profit-margin.md](profit-margin.md) |
+| 合并单元格写公式 | 只有左上角生效 | 只在合并区域左上角写公式 |
