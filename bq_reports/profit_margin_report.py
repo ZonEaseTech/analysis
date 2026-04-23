@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-利润报表导出 —— 套餐/单品利润分析（配置驱动版）
+利润报表导出 —— 套餐/单品利润分析（配置驱动版，聚合优化版）
 
-利用 report_engine 封装并发查询和 Excel 写入，报表脚本只关注：
-  1. SQL 模板
-  2. 聚合逻辑（去重、分组、BOM 展开）
-  3. 业务规则（价格解析、fallback BOM 匹配）
-
-Excel 列定义、合并规则、公式规则全部外置到 YAML：
-  resources/reports/profit_margin.yaml
+优化点：
+1. 订单与 BOM 分两次查询，消除 JOIN 膨胀
+2. 订单在 BQ 内聚合，大幅减少传输数据量
+3. 套餐结构独立查询并缓存
 
 Usage:
     python -m bq_reports.profit_margin_report --month 2026-03 --output exports/profit_202603.xlsx --use-erp-price
@@ -212,113 +209,63 @@ def _load_merchants(config: dict, store_names: dict, override_path: str = None):
 
 
 # ============================================================================
-# SQL 模板
+# SQL 模板（聚合优化版）
 # ============================================================================
 
-COMBO_SQL = """
-WITH
-combo_parent AS (
-  SELECT
-    sop.uuid AS parent_sop_uuid,
-    sop.product_package_uuid AS combo_uuid,
-    JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS combo_name,
-    sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num) AS combo_qty,
-    sop.total_price AS combo_revenue
-  FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
-  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
-    ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
-  JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
-    ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
-  WHERE sop.delete_time = 0
-    AND sop.cancel_time = 0
-    AND sop.status = 1
-    AND sb.status = 1
-    AND sb.finish_time >= {start_ts}
-    AND sb.finish_time < {end_ts}
-    AND sop.product_type = 1
-)
-
+# 套餐订单聚合（BQ 内完成，只返回产品级汇总）
+COMBO_ORDERS_SQL = """
 SELECT
-  cp.parent_sop_uuid,
-  cp.combo_uuid,
-  cp.combo_name,
-  cp.combo_qty,
-  cp.combo_revenue,
-  JSON_EXTRACT_SCALAR(child_pp.name, '$.zh') AS child_name,
-  m.code AS material_code,
-  JSON_EXTRACT_SCALAR(m.name, '$.zh') AS material_name,
-  rm.num AS bom_num,
-  rm_base.base_unit_conversion_rate AS material_conversion_rate,
-  m.price AS material_bq_price,
-  (child_sop.num * child_sop.copy_num * IF(child_sop.unit_num = 0, 1, child_sop.unit_num)) AS child_qty
-FROM combo_parent cp
-JOIN `{project}`.`{dataset}`.`ttpos_sale_order_product` child_sop
-  ON child_sop.package_uuid = cp.parent_sop_uuid
-  AND child_sop.delete_time = 0
-  AND child_sop.cancel_time = 0
-  AND child_sop.status = 1
-JOIN `{project}`.`{dataset}`.`ttpos_product_package` child_pp
-  ON child_pp.uuid = child_sop.product_package_uuid AND child_pp.delete_time = 0
-JOIN `{project}`.`{dataset}`.`ttpos_sale_order_product_bom` sopb
-  ON sopb.sale_order_product_uuid = child_sop.uuid AND sopb.delete_time = 0
-JOIN `{project}`.`{dataset}`.`ttpos_product_bom` pb
-  ON pb.uuid = sopb.product_bom_uuid AND pb.delete_time = 0
-LEFT JOIN `{project}`.`{dataset}`.`ttpos_related_material` rm
-  ON (
-    (pb.product_bom_card_uuid > 0 AND rm.related_uuid = pb.product_bom_card_uuid)
-    OR (pb.product_bom_card_uuid = 0 AND rm.related_uuid = pb.uuid)
-  )
-  AND rm.delete_time = 0
-LEFT JOIN `{project}`.`{dataset}`.`ttpos_material` m
-  ON m.uuid = rm.material_uuid AND m.delete_time = 0
-LEFT JOIN (
-  SELECT material_uuid, MAX(base_unit_conversion_rate) AS base_unit_conversion_rate
-  FROM `{project}`.`{dataset}`.`ttpos_related_material`
-  WHERE delete_time = 0
-  GROUP BY material_uuid
-) rm_base ON rm_base.material_uuid = m.uuid
+  sop.product_package_uuid AS item_uuid,
+  JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS item_name,
+  SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)) AS qty,
+  SUM(sop.total_price) AS revenue
+FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
+JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
+  ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
+JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
+  ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
+WHERE sop.delete_time = 0
+  AND sop.cancel_time = 0
+  AND sop.status = 1
+  AND sb.status = 1
+  AND sb.finish_time >= {start_ts}
+  AND sb.finish_time < {end_ts}
+  AND sop.product_type = 1
+GROUP BY item_uuid, item_name
 """
 
-SINGLE_SQL = """
-WITH
-single_sales AS (
-  SELECT
-    sop.uuid AS sop_uuid,
-    sop.product_package_uuid AS product_uuid,
-    JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS product_name,
-    sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num) AS product_qty,
-    sop.total_price AS product_revenue
-  FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
-  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
-    ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
-  JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
-    ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
-  WHERE sop.delete_time = 0
-    AND sop.cancel_time = 0
-    AND sop.status = 1
-    AND sb.status = 1
-    AND sb.finish_time >= {start_ts}
-    AND sb.finish_time < {end_ts}
-    AND sop.product_type = 0
-)
-
+# 单品订单聚合
+SINGLE_ORDERS_SQL = """
 SELECT
-  ss.sop_uuid,
-  ss.product_uuid,
-  ss.product_name,
-  ss.product_qty,
-  ss.product_revenue,
+  sop.product_package_uuid AS item_uuid,
+  JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS item_name,
+  SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)) AS qty,
+  SUM(sop.total_price) AS revenue
+FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
+JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
+  ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
+JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
+  ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
+WHERE sop.delete_time = 0
+  AND sop.cancel_time = 0
+  AND sop.status = 1
+  AND sb.status = 1
+  AND sb.finish_time >= {start_ts}
+  AND sb.finish_time < {end_ts}
+  AND sop.product_type = 0
+GROUP BY item_uuid, item_name
+"""
+
+# 产品 BOM 结构（不关联订单表，纯产品级数据）
+BOM_SQL = """
+SELECT
+  pb.product_package_uuid AS item_uuid,
   m.code AS material_code,
   JSON_EXTRACT_SCALAR(m.name, '$.zh') AS material_name,
   rm.num AS bom_num,
   rm_base.base_unit_conversion_rate AS material_conversion_rate,
-  m.price AS material_bq_price,
-  ss.product_qty AS sale_qty
-FROM single_sales ss
-JOIN `{project}`.`{dataset}`.`ttpos_product_bom` pb
-  ON pb.product_package_uuid = ss.product_uuid AND pb.delete_time = 0
-JOIN `{project}`.`{dataset}`.`ttpos_sale_order_product_bom` sopb
-  ON sopb.product_bom_uuid = pb.uuid AND sopb.sale_order_product_uuid = ss.sop_uuid AND sopb.delete_time = 0
+  m.price AS material_bq_price
+FROM `{project}`.`{dataset}`.`ttpos_product_bom` pb
 LEFT JOIN `{project}`.`{dataset}`.`ttpos_related_material` rm
   ON (
     (pb.product_bom_card_uuid > 0 AND rm.related_uuid = pb.product_bom_card_uuid)
@@ -333,6 +280,25 @@ LEFT JOIN (
   WHERE delete_time = 0
   GROUP BY material_uuid
 ) rm_base ON rm_base.material_uuid = m.uuid
+WHERE pb.delete_time = 0
+"""
+
+# 套餐结构（combo_uuid -> child_uuid），从当前时间范围订单推断
+COMBO_STRUCTURE_SQL = """
+SELECT DISTINCT
+  parent_sop.product_package_uuid AS combo_uuid,
+  child_sop.product_package_uuid AS child_uuid
+FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` parent_sop
+JOIN `{project}`.`{dataset}`.`ttpos_sale_order_product` child_sop
+  ON child_sop.package_uuid = parent_sop.uuid
+  AND child_sop.delete_time = 0
+JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
+  ON sb.uuid = parent_sop.sale_bill_uuid AND sb.delete_time = 0
+WHERE parent_sop.product_type = 1
+  AND parent_sop.delete_time = 0
+  AND sb.status = 1
+  AND sb.finish_time >= {start_ts}
+  AND sb.finish_time < {end_ts}
 """
 
 
@@ -361,86 +327,168 @@ def _resolve_price(material_code, bq_price, erp_prices):
 
 
 # ============================================================================
-# 数据聚合
+# 套餐结构加载（缓存）
 # ============================================================================
 
-def aggregate_combo_rows(raw_rows, erp_prices=None):
-    """聚合套餐数据为明细行格式。按 parent_sop_uuid 去重。"""
-    instance_totals = {}
-    for row in raw_rows:
-        instance_key = (row.store_num, row.store_name, row.parent_sop_uuid)
-        if instance_key not in instance_totals:
-            instance_totals[instance_key] = {
-                "combo_uuid": row.combo_uuid,
-                "combo_name": row.combo_name,
-                "qty": float(row.combo_qty or 0),
-                "revenue": float(row.combo_revenue or 0),
-            }
+def _load_combo_structures(engine, merchants, start_ts, end_ts, config: dict = None):
+    """
+    查询并缓存每个门店的套餐结构。
+    返回: {store_num: {combo_uuid: [child_uuid, ...]}}
+    """
+    cfg = config or {}
+    cache_ttl = cfg.get("cache", {}).get("combo_structure_ttl", 604800)  # 7天
+    key = cache_key("combo_structures", {"count": len(merchants), "start": start_ts, "end": end_ts})
+    cached = get_cache(key, ttl_seconds=cache_ttl)
+    if cached is not None:
+        print(f"[Combo Structure] 缓存命中: {len(cached)} 个门店")
+        return cached
 
-    data = defaultdict(lambda: {"qty": 0.0, "revenue": 0.0, "bom": {}})
-    for instance_key, totals in instance_totals.items():
-        store_num, store_name, _ = instance_key
-        key = (store_num, store_name, totals["combo_uuid"], totals["combo_name"])
-        data[key]["qty"] += totals["qty"]
-        data[key]["revenue"] += totals["revenue"]
+    print("[Combo Structure] 从 BQ 查询套餐结构...")
+    raw_rows, errors = engine.query(
+        sql_template=COMBO_STRUCTURE_SQL,
+        merchants=merchants,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        workers=10,
+        row_proxy_factory=lambda row, acc, num, name: type("RowProxy", (), {
+            "__getattr__": lambda self, attr: getattr(row, attr),
+            "account": acc, "store_num": num, "store_name": name,
+        })(),
+        label="套餐结构",
+    )
 
+    structures = {}
     for row in raw_rows:
-        key = (row.store_num, row.store_name, row.combo_uuid, row.combo_name)
+        store_num = row.store_num
+        if store_num not in structures:
+            structures[store_num] = {}
+        combo_uuid = str(row.combo_uuid)
+        child_uuid = str(row.child_uuid)
+        if combo_uuid not in structures[store_num]:
+            structures[store_num][combo_uuid] = []
+        if child_uuid not in structures[store_num][combo_uuid]:
+            structures[store_num][combo_uuid].append(child_uuid)
+
+    set_cache(key, structures)
+    total_combos = sum(len(v) for v in structures.values())
+    print(f"[Combo Structure] 加载 {len(structures)} 个门店，共 {total_combos} 个套餐")
+    return structures
+
+
+# ============================================================================
+# BOM 加载（缓存）
+# ============================================================================
+
+def _load_boms(engine, merchants, config: dict = None):
+    """
+    查询并缓存每个门店的产品 BOM。
+    返回: {store_num: {item_uuid: [(material_code, material_name, bom_num, conv_rate, bq_price), ...]}}
+    """
+    cfg = config or {}
+    cache_ttl = cfg.get("cache", {}).get("bom_ttl", 86400)  # 1天
+    key = cache_key("boms", {"count": len(merchants)})
+    cached = get_cache(key, ttl_seconds=cache_ttl)
+    if cached is not None:
+        print(f"[BOM] 缓存命中: {len(cached)} 个门店")
+        return cached
+
+    print("[BOM] 从 BQ 查询产品 BOM...")
+    raw_rows, errors = engine.query(
+        sql_template=BOM_SQL,
+        merchants=merchants,
+        start_ts=0,
+        end_ts=2147483647,
+        workers=10,
+        row_proxy_factory=lambda row, acc, num, name: type("RowProxy", (), {
+            "__getattr__": lambda self, attr: getattr(row, attr),
+            "account": acc, "store_num": num, "store_name": name,
+        })(),
+        label="BOM",
+    )
+
+    boms = {}
+    for row in raw_rows:
+        store_num = row.store_num
+        if store_num not in boms:
+            boms[store_num] = {}
+        item_uuid = str(row.item_uuid)
+        if item_uuid not in boms[store_num]:
+            boms[store_num][item_uuid] = []
         material_code = row.material_code
-        if not material_code:
-            continue
-        if material_code not in data[key]["bom"]:
-            material_name = row.material_name
-            bom_num = float(row.bom_num or 0)
-            unit_price, uom = _resolve_price(material_code, row.material_bq_price, erp_prices)
-            cost_per_unit = bom_num * unit_price
-            data[key]["bom"][material_code] = (material_name, bom_num, unit_price, uom, cost_per_unit)
+        if material_code:
+            boms[store_num][item_uuid].append((
+                str(material_code),
+                row.material_name or "",
+                float(row.bom_num or 0),
+                float(row.material_conversion_rate or 1),
+                float(row.material_bq_price or 0),
+            ))
 
-    result = {}
+    set_cache(key, boms)
+    total_items = sum(len(v) for v in boms.values())
+    print(f"[BOM] 加载 {len(boms)} 个门店，共 {total_items} 个产品的 BOM")
+    return boms
+
+
+# ============================================================================
+# 数据聚合（新版：预聚合 orders + 预加载 BOM）
+# ============================================================================
+
+def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, mode="combo"):
+    """
+    聚合订单和 BOM 数据。
+
+    Args:
+        order_rows: 引擎返回的订单行（已带 store_num, store_name）
+        bom_data: {store_num: {item_uuid: [(material_code, ...), ...]}}
+        combo_structure: {store_num: {combo_uuid: [child_uuid, ...]}}
+        mode: "combo" 或 "single"
+    """
+    data = {}
+    for row in order_rows:
+        store_num = row.store_num
+        store_name = row.store_name
+        item_uuid = str(row.item_uuid)
+        item_name = row.item_name
+        qty = float(row.qty or 0)
+        revenue = float(row.revenue or 0)
+
+        key = (store_num, store_name, item_uuid, item_name)
+        if key not in data:
+            data[key] = {"qty": 0.0, "revenue": 0.0, "bom": {}}
+        data[key]["qty"] += qty
+        data[key]["revenue"] += revenue
+
+    # 为每个 item 匹配 BOM
     for key, val in data.items():
-        result[key] = {
-            "qty": val["qty"],
-            "revenue": val["revenue"],
-            "bom": [
-                (code, name, bom_num, price, uom, cost)
-                for code, (name, bom_num, price, uom, cost) in val["bom"].items()
-            ]
-        }
-    return result
+        store_num, store_name, item_uuid, item_name = key
+        store_boms = bom_data.get(store_num, {})
 
+        if mode == "combo":
+            # 套餐：获取子产品，合并它们的 BOM
+            store_struct = combo_structure.get(store_num, {})
+            child_uuids = store_struct.get(item_uuid, [])
+            for child_uuid in child_uuids:
+                child_bom = store_boms.get(child_uuid, [])
+                for material_code, material_name, bom_num, conv_rate, bq_price in child_bom:
+                    if not material_code:
+                        continue
+                    if material_code not in val["bom"]:
+                        unit_price, uom = _resolve_price(material_code, bq_price, erp_prices)
+                        cost_per_unit = bom_num * unit_price
+                        val["bom"][material_code] = (material_name, bom_num, unit_price, uom, cost_per_unit)
+        else:
+            # 单品：直接匹配 BOM
+            item_bom = store_boms.get(item_uuid, [])
+            for material_code, material_name, bom_num, conv_rate, bq_price in item_bom:
+                if not material_code:
+                    continue
+                if material_code not in val["bom"]:
+                    unit_price, uom = _resolve_price(material_code, bq_price, erp_prices)
+                    cost_per_unit = bom_num * unit_price
+                    val["bom"][material_code] = (material_name, bom_num, unit_price, uom, cost_per_unit)
 
-def aggregate_single_rows(raw_rows, erp_prices=None):
-    """聚合单品数据为明细行格式。按 sop_uuid 去重。"""
-    instance_totals = {}
-    for row in raw_rows:
-        instance_key = (row.store_num, row.store_name, row.sop_uuid)
-        if instance_key not in instance_totals:
-            instance_totals[instance_key] = {
-                "product_uuid": row.product_uuid,
-                "product_name": row.product_name,
-                "qty": float(row.product_qty or 0),
-                "revenue": float(row.product_revenue or 0),
-            }
-
-    data = defaultdict(lambda: {"qty": 0.0, "revenue": 0.0, "bom": {}})
-    for instance_key, totals in instance_totals.items():
-        store_num, store_name, _ = instance_key
-        key = (store_num, store_name, totals["product_uuid"], totals["product_name"])
-        data[key]["qty"] += totals["qty"]
-        data[key]["revenue"] += totals["revenue"]
-
-    for row in raw_rows:
-        key = (row.store_num, row.store_name, row.product_uuid, row.product_name)
-        material_code = row.material_code
-        if not material_code:
-            continue
-        if material_code not in data[key]["bom"]:
-            material_name = row.material_name
-            bom_num = float(row.bom_num or 0)
-            unit_price, uom = _resolve_price(material_code, row.material_bq_price, erp_prices)
-            cost_per_unit = bom_num * unit_price
-            data[key]["bom"][material_code] = (material_name, bom_num, unit_price, uom, cost_per_unit)
-
+    # 转换为列表格式（与旧版兼容）
     result = {}
     for key, val in data.items():
         result[key] = {
@@ -552,7 +600,6 @@ def main():
         return 1
 
     if args.month:
-        # 按月模式
         year, mon = int(args.month[:4]), int(args.month[5:7])
         start_dt = datetime(year, mon, 1, tzinfo=timezone.utc)
         if mon == 12:
@@ -561,9 +608,7 @@ def main():
             end_dt = datetime(year, mon + 1, 1, tzinfo=timezone.utc)
         range_label = args.month.replace("-", "")
     elif args.start_date and args.end_date:
-        # 按日期范围模式
         start_dt = datetime.strptime(args.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        # 结束日期取当天的 23:59:59（即次日 00:00:00 作为 exclusive 边界）
         end_dt = datetime.strptime(args.end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
         range_label = f"{args.start_date.replace('-', '')}_{args.end_date.replace('-', '')}"
     else:
@@ -606,6 +651,16 @@ def main():
     # 加载补充 BOM
     fallback_boms = _load_fallback_boms(config)
 
+    # 预加载套餐结构（如果 mode 包含 combo）
+    combo_structure = {}
+    if args.mode in ("combo", "both"):
+        combo_structure = _load_combo_structures(engine, merchants, start_ts, end_ts, config)
+        print()
+
+    # 预加载 BOM（所有 mode 都需要）
+    bom_data = _load_boms(engine, merchants, config)
+    print()
+
     # 确定要处理的 mode
     modes = []
     if args.mode in ("combo", "both"):
@@ -623,10 +678,10 @@ def main():
 
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
-        sql_template = COMBO_SQL if mode == "combo" else SINGLE_SQL
+        sql_template = COMBO_ORDERS_SQL if mode == "combo" else SINGLE_ORDERS_SQL
         print(f"\n========== 开始处理 {item_label} ==========\n")
 
-        # 并发查询（引擎封装）
+        # 并发查询聚合后的订单
         raw_rows, errors = engine.query(
             sql_template=sql_template,
             merchants=merchants,
@@ -640,16 +695,16 @@ def main():
             label=item_label,
         )
 
-        # 聚合（报表脚本自定义逻辑）
-        if mode == "combo":
-            agg_data = aggregate_combo_rows(raw_rows, erp_prices=erp_prices)
-        else:
-            agg_data = aggregate_single_rows(raw_rows, erp_prices=erp_prices)
+        # 聚合（订单 + BOM）
+        agg_data = aggregate_with_bom(
+            raw_rows, bom_data, combo_structure,
+            erp_prices=erp_prices, mode=mode
+        )
 
         # 扁平化
         flat_rows = _build_rows(agg_data, mode, fallback_boms=fallback_boms, erp_prices=erp_prices)
 
-        # 加载列配置并写入 Excel（引擎封装）
+        # 加载列配置并写入 Excel
         sheet_cfg = engine.load_sheet_config(args.column_config, item_label)
         ws = wb.create_sheet(title=item_label)
         engine.write_sheet(ws, sheet_cfg, flat_rows)

@@ -103,3 +103,5 @@ cache:
   fallback_bom_ttl: 86400      # 1天
   erp_prices_ttl: 3600         # 1小时
   merchant_list_ttl: 86400     # 1天
+  combo_structure_ttl: 604800  # 7天（套餐结构变化频率低）
+  bom_ttl: 86400               # 1天（产品 BOM 可能更新）
