@@ -86,7 +86,8 @@ result = exporter.export(
 | **数据主题** | 导什么 | BOM 成分、订单明细、库存盘点 |
 | **BQ 项目** | GCP project ID | `diyl-407103` |
 | **门店 dataset** | `shop{company_uuid}` | `shop3087884357632000` |
-| **过滤条件** | 总部/门店/时间/状态 | `headquarter_uuid = xxx`、某个月 |
+| **时间范围** | **必须指定**（硬规则） | 起止日期 `YYYY-MM-DD` 或 `YYYY-MM` 月份 |
+| **过滤条件** | 总部/门店/状态（可选） | `headquarter_uuid = xxx` |
 | **输出格式** | CSV/Excel/行转列/拼接 | "每个物品单独一列"、"导成 Excel" |
 | **语言偏好** | 多语言字段提取哪种 | 中文(zh)、泰文(th)、英文(en) |
 
@@ -270,9 +271,10 @@ if __name__ == "__main__":
 
 1. **独立可执行** — 不依赖项目代码，复制走就能跑
 2. **参数化** — project/dataset/output 都通过 argparse 传入
-3. **GCP 认证** — 依赖 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `gcloud auth application-default login`
-4. **Excel 样式** — 默认带表头样式、自动列宽、冻结首行
-5. **脚本放置** — 生成到 `ttpos-scripts/bigquery/` 目录下
+3. **时间范围必传** — 所有导出报表**必须**支持 `start_date`/`end_date`（或 `month`），禁止无时间过滤的全量导出
+4. **GCP 认证** — 依赖 `GOOGLE_APPLICATION_CREDENTIALS` 环境变量或 `gcloud auth application-default login`
+5. **Excel 样式** — 默认带表头样式、自动列宽、冻结首行
+6. **脚本放置** — 生成到 `ttpos-scripts/bigquery/` 目录下
 
 ---
 
