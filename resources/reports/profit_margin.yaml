@@ -1,0 +1,64 @@
+# 利润报表列配置
+# 报表脚本通过此配置驱动 Excel 写入，无需硬编码列索引。
+#
+# 字段说明：
+#   name:          表头名称
+#   field_index:   在 _build_rows 返回的列表中的索引（0-based）
+#   type:          value | formula | block_formula
+#   format:        数字格式，如 "0.00", "0.00%"
+#   width:         列宽
+#   merge:         是否合并（block 级别）
+#   formula:       公式模板，支持 {row} {block_start} {block_end}
+#   negative_red:  负值标红
+#
+# 公式模板变量：
+#   {row}         → 当前 Excel 行号
+#   {block_start} → block 起始行号
+#   {block_end}   → block 结束行号
+
+sheets:
+  套餐:
+    merge_key_indices: [0, 1, 2]   # 门店编号、门店名称、套餐名称相同则合并
+    columns:
+      - {name: "门店编号",    field_index: 0,  merge: true,  width: 10}
+      - {name: "门店名称",    field_index: 1,  merge: true,  width: 30}
+      - {name: "套餐名称",    field_index: 2,  merge: true,  width: 30}
+      - {name: "销量",        field_index: 3,  type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "单价",        field_index: 4,  type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "销售额",      field_index: 5,  type: value, format: "0.00", merge: true,  width: 12}
+      - {name: "BOM物品名称", field_index: 6,  width: 25}
+      - {name: "BOM物品编码", field_index: 7,  width: 15}
+      - {name: "物品单个成本",field_index: 8,  type: value, format: "0.00", width: 12}
+      - {name: "消耗数量",    field_index: 9,  type: value, format: "0.00", width: 10}
+      - {name: "单位",        field_index: 10, width: 8}
+      - {name: "物品总成本",  field_index: 11, type: formula,      format: "0.00",
+          formula: "=I{row}*J{row}*D{block_start}"}
+      - {name: "套餐单份总成本", field_index: 12, type: block_formula, format: "0.00", merge: true,
+          formula: "=SUMPRODUCT(I{block_start}:I{block_end},J{block_start}:J{block_end})"}
+      - {name: "毛利",        field_index: 13, type: block_formula, format: "0.00", merge: true, negative_red: true,
+          formula: "=F{block_start}-M{block_start}*D{block_start}"}
+      - {name: "毛利率",      field_index: 14, type: block_formula, format: "0.00%", merge: true, negative_red: true,
+          formula: "=IF(F{block_start}=0,0,N{block_start}/F{block_start})"}
+
+  单品:
+    merge_key_indices: [0, 1, 2]
+    columns:
+      - {name: "门店编号",    field_index: 0,  merge: true,  width: 10}
+      - {name: "门店名称",    field_index: 1,  merge: true,  width: 30}
+      - {name: "单品名称",    field_index: 2,  merge: true,  width: 30}
+      - {name: "销量",        field_index: 3,  type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "单价",        field_index: 4,  type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "销售额",      field_index: 5,  type: value, format: "0.00", merge: true,  width: 12}
+      - {name: "BOM物品名称", field_index: 6,  width: 25}
+      - {name: "BOM物品编码", field_index: 7,  width: 15}
+      - {name: "物品单个成本",field_index: 8,  type: value, format: "0.00", width: 12}
+      - {name: "消耗数量",    field_index: 9,  type: value, format: "0.00", width: 10}
+      - {name: "单位",        field_index: 10, width: 8}
+      - {name: "物品总成本",  field_index: 11, type: formula,      format: "0.00",
+          formula: "=I{row}*J{row}*D{block_start}"}
+      - {name: "单品单份总成本", field_index: 12, type: block_formula, format: "0.00", merge: true,
+          formula: "=SUMPRODUCT(I{block_start}:I{block_end},J{block_start}:J{block_end})"}
+      - {name: "毛利",        field_index: 13, type: block_formula, format: "0.00", merge: true, negative_red: true,
+          formula: "=F{block_start}-M{block_start}*D{block_start}"}
+      - {name: "毛利率",      field_index: 14, type: block_formula, format: "0.00%", merge: true, negative_red: true,
+          formula: "=IF(F{block_start}=0,0,N{block_start}/F{block_start})"}

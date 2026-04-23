@@ -400,6 +400,14 @@ validators = create_default_validators(
 | 正向匹配后不做反向验证 | 多数据源匹配时，英文名匹配成功但编码对应的中文名可能完全不同 | 匹配后必须反向验证：用匹配到的编码查 BQ，确认返回的中文名和原始数据一致 |
 | 编码体系已更新 | 物品编码可能被重新分配（如生菜从 VE00002 变为 MK01019） | 明确列出编码冲突项，告知用户"编码体系可能有更新"；如涉及采购/库存对账，需确认 ERP 端编码版本 |
 | 时间范围超出数据边界 | 用户指定的时间范围（如 4/21-4/22）BQ 里实际无数据，但 SQL 本身正确；原因是门店数据只同步到更早日期的 | 导出前先查 `MIN/MAX(finish_time)` 确认实际数据边界，把可用时间范围告知用户，让用户确认后调整再导出 |
+| **BOM 空壳** | `product_bom_card` 存在但 `related_material` 为空，导致成本计算为 0 | 查询时 JOIN `related_material` 验证，发现空 BOM 时从外部数据源（ERPNext/Excel fallback）补充 |
+| **套餐重复扣料** | 套餐 parent + child 都出现在 `sale_order_product`，聚合时同一物料被重复计算 | 按 `parent_sop_uuid` 去重：只保留 parent 行（`product_type=1`）或 child 行（`product_type=2`），不要同时保留 |
+| **合并单元格写公式** | openpyxl 合并后给每个子单元格写值，只有左上角生效，其余被忽略 | 只在合并区域的左上角单元格写公式/值，合并本身会覆盖其余单元格 |
+| **大量公式 Excel 卡顿** | 几万行带公式的 Excel 打开极慢，openpyxl 写入也慢 | 公式改为静态值；或用多进程分 Sheet 写入；或让客户在 Excel 里手动填充公式 |
+| **ERPNext 价格 UOM 歧义** | 同一 `item_code` 可能有多个 `Item Price`（g/pc/Nos 等），直接取第一个会错 | 按 UOM 优先级排序（g > pc > Nos > pkt > ctn），同优先级取最新 modified |
+| **单位换算误用** | BOM 的 `num` 已经是目标单位的消耗量，不需要再除以 `conversion_rate` | 成本 = `num × price_per_stock_uom`，不除 conversion_rate |
+| **百分比格式丢失** | openpyxl 对公式单元格设置 `number_format = "0.00%"` 才显示百分比 | 写公式后必须显式设置 `cell.number_format = "0.00%"` |
+| **门店名称硬编码** | 从特定 Excel 的特定列读取门店编号→名称映射，文件格式一变就崩 | 抽象为资源适配器，通过配置描述列映射，而非硬编码列索引 |
 
 ---
 
@@ -426,3 +434,76 @@ validators = create_default_validators(
 | **反向验证必须做** | 正向匹配成功 ≠ 编码正确，必须用编码反查 BQ 确认中文名一致 |
 | **冲突要显式报告** | 发现 BQ 编码和 Excel 旧编码不一致时，列出差异让用户确认 |
 | **编码更新要提醒** | 如涉及采购/库存对账，需确认 ERP 端用的是哪版编码 |
+
+---
+
+## 专项：利润报表（成本 + 售价 + 毛利率）
+
+### 成本计算口径
+
+```
+单份总成本 = Σ(BOM消耗数量 × 物料单价)
+毛利       = 销售额 − 单份总成本 × 销量
+毛利率     = 毛利 / 销售额
+```
+
+**注意**：BOM `num` 已经是目标单位消耗量，**不除** `conversion_rate`。
+
+### 数据源分层
+
+| 层级 | 数据源 | 用途 | 优先级 |
+|------|--------|------|--------|
+| 主源 | BQ `ttpos_product_bom` + `related_material` | BOM 结构 + 消耗量 | 第一 |
+| 定价 | ERPNext `Item Price` | 物料单价（按 UOM 优先级） | 第一 |
+| Fallback | 客户提供的 Excel/表格 | BOM 补充（当 BQ BOM 为空壳时） | 第二 |
+| 映射 | 客户提供的门店列表 Excel | 门店编号 → 名称 | 参考 |
+
+### 去重规则（套餐）
+
+`ttpos_sale_order_product` 中套餐 parent（`product_type=1`）和 child（`product_type=2`）同时存在时：
+- **只保留 parent 行**聚合销量和销售额
+- child 行的 `parent_sop_uuid` 指向 parent，用于识别归属
+- 避免同一订单中套餐物料被重复计算
+
+### Excel 公式模式（推荐）
+
+把计算列交给 Excel 公式，方便客户调价格后自动重算：
+
+```python
+# L: 物品总成本 = 单价 × 消耗数量 × 销量
+ws.cell(row=r, column=12, value=f"=I{r}*J{r}*D{r}")
+
+# M: 单份总成本 = SUMPRODUCT(单价列, 消耗列)
+ws.cell(row=start, column=13, value=f"=SUMPRODUCT(I{start}:I{end},J{start}:J{end})")
+
+# N: 毛利 = 销售额 − 单份总成本×销量
+ws.cell(row=start, column=14, value=f"=F{start}-M{start}*D{start}")
+
+# O: 毛利率 = IF(销售额=0, 0, 毛利/销售额)
+ws.cell(row=start, column=15, value=f"=IF(F{start}=0,0,N{start}/F{start})")
+ws.cell(row=start, column=15).number_format = "0.00%"
+```
+
+**限制**：几万行带公式的 Excel 打开会很慢。静态值 + 公式混合策略：A-K 写值，L-O 写公式，合并单元格区域只在左上角写公式。
+
+### 多进程加速写入
+
+```python
+from multiprocessing import Process
+
+def write_sheet(sheet_name, rows, headers, output_path, sheet_index):
+    wb = load_workbook(output_path)
+    ws = wb.create_sheet(title=sheet_name, index=sheet_index)
+    # ... 写入逻辑
+    wb.save(output_path)
+
+# 每个 Sheet 一个进程
+processes = [
+    Process(target=write_sheet, args=("套餐", combo_rows, headers, output_path, 0)),
+    Process(target=write_sheet, args=("单品", single_rows, headers, output_path, 1)),
+]
+for p in processes:
+    p.start()
+for p in processes:
+    p.join()
+```
