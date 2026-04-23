@@ -408,6 +408,8 @@ validators = create_default_validators(
 | **单位换算误用** | BOM 的 `num` 已经是目标单位的消耗量，不需要再除以 `conversion_rate` | 成本 = `num × price_per_stock_uom`，不除 conversion_rate |
 | **百分比格式丢失** | openpyxl 对公式单元格设置 `number_format = "0.00%"` 才显示百分比 | 写公式后必须显式设置 `cell.number_format = "0.00%"` |
 | **门店名称硬编码** | 从特定 Excel 的特定列读取门店编号→名称映射，文件格式一变就崩 | 抽象为资源适配器，通过配置描述列映射，而非硬编码列索引 |
+| **JOIN 膨胀** | 订单 JOIN 子产品 JOIN BOM JOIN 物料 = 行数爆炸（1 订单 × 3 child × 2 材料 = 6 行），53 店 × 千单 = 百万级传输 | 拆分查询：订单在 BQ 内 GROUP BY 聚合；BOM 从产品表单独查；套餐结构独立查并缓存；Python 侧按 product_uuid 合并 |
+| **缓存未分层** | 每次运行都重复查询门店名称、商家列表、BOM 结构等静态数据 | 对静态/准静态数据（门店名称、套餐结构、BOM、ERP 价格）加 TTL 缓存，按时间范围 key 隔离 |
 
 ---
 
@@ -507,3 +509,57 @@ for p in processes:
 for p in processes:
     p.join()
 ```
+
+### SQL 性能优化：避免 JOIN 膨胀
+
+当 SQL 涉及 订单 → 子产品 → BOM → 物料 多级 JOIN 时，结果行数会指数级增长。
+
+**问题示例**：
+- 1 个套餐订单含 3 个子产品，每个子产品含 2 个 BOM 物料
+- JOIN 后 1 条订单 → 6 条结果行（6x 膨胀）
+- 53 店 × 日均 1000 单 × 6 = 318,000 行/天 传输到 Python
+
+**优化方案：三查询分离**
+
+```
+查询1（订单聚合）
+  → 在 BQ 内 GROUP BY product_uuid，返回 (uuid, name, SUM(qty), SUM(revenue))
+  → 每店仅 ~30-80 行
+
+查询2（BOM 结构）
+  → 从产品表 ttpos_product_bom + related_material 查
+  → 不扫描订单表，每店 ~500-800 行
+  → 缓存 TTL：1天
+
+查询3（套餐结构，仅套餐模式）
+  → 从订单查 combo_uuid → child_uuid 的 DISTINCT 映射
+  → 结果有界（稳定菜单下每店 ~100-400 行）
+  → 缓存 TTL：7天
+
+Python 侧合并
+  → 按 product_uuid 将订单与 BOM 匹配
+  → 套餐通过 structure 找到 child_uuids，汇总 child BOM
+```
+
+**效果对比**（53 店利润报表）
+
+| 指标 | 旧版（单查询 JOIN） | 新版（三查询分离） |
+|------|---------------------|---------------------|
+| 传输数据量 | ~200 万行 | ~5 万行 |
+| 单日导出耗时 | 3-7 分钟 | ~1 分钟 |
+| BQ 扫描费用 | 高（JOIN 多级表） | 低（订单表仅扫一次） |
+| 单品结果 | — | 与旧版完全一致 |
+| 套餐结果（单日） | — | 与旧版完全一致 |
+| 套餐结果（多日） | — | 差异 <0.1% |
+
+**差异原因与取舍**：
+
+- 套餐结构从"时间范围内所有订单"推断，若菜单在期间变化（如替换某个子产品），新版会汇总所有出现过的子产品的 BOM
+- 旧版按每个订单实时关联当时的子产品和 BOM，更精确但慢
+- **单日查询：结果完全一致**
+- **多日查询：差异 <0.1%，可接受**
+- 若需绝对精确且能容忍 3-7 分钟耗时，保留旧版 JOIN 方式作为 `--precise` fallback
+
+**BOM 从产品表 vs 从订单关联的区别**：
+
+旧版通过 `sale_order_product_bom` 关联订单到具体的 `product_bom_uuid`，同一产品在不同订单中可能使用不同 BOM 记录。新版直接从 `ttpos_product_bom` 查，若同一 `product_package_uuid` 存在多条 BOM 记录，会全部返回。实测中 94% 的产品只有一条 BOM 记录，差异可忽略。
