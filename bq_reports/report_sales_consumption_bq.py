@@ -2,24 +2,14 @@
 """
 销售业绩 + 物品消耗报表 - BigQuery 版本
 
-对应原脚本: ../ttpos-n8n-scheduler/scripts/report.sh
-功能: 统计月度销售业绩（总营业额、实收金额、订单数）和物品消耗明细
-
-Usage:
-    python scripts/report_sales_consumption_bq.py --month 2026-01 --output exports/sales_2026_01.xlsx
-"""
-
-import argparse
-#!/usr/bin/env python3
-"""
-销售业绩 + 物品消耗报表 - BigQuery 版本
-
-对应原脚本: ../ttpos-n8n-scheduler/scripts/report.sh
 功能: 统计月度销售业绩（总营业额、实收金额、订单数）和物品消耗明细
 
 Usage:
     python -m bq_reports.report_sales_consumption_bq --month 2026-01 --output exports/sales_2026_01.xlsx
 """
+
+import argparse
+import sys
 
 from .utils.bq_exporter import ReportExporter
 
