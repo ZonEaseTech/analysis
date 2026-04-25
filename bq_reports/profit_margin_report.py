@@ -282,63 +282,119 @@ def _load_merchants(config: dict, store_names: dict, override_path: str = None,
 
 # 套餐订单聚合（BQ 内完成，只返回产品级汇总）
 # std_unit_price: 按销量加权的"商品标准售价"（来自 ttpos_product_bom.price）
+# 退款扣减：按 ttpos_return_order_product 商品级退款（rop.num 数量、product_total_amount 金额）
+# 时间口径：按原销售单 finish_time 在窗口内（refund 跨期也算这次销售的扣减）
 COMBO_ORDERS_SQL = """
+WITH gross AS (
+  SELECT
+    sop.product_package_uuid AS item_uuid,
+    JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS item_name,
+    SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)) AS gross_qty,
+    SUM(sop.total_price) AS gross_revenue,
+    SAFE_DIVIDE(
+      SUM(pb.price * sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)),
+      SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num))
+    ) AS std_unit_price
+  FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
+  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
+    ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
+  JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
+    ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
+  LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_bom` pb
+    ON pb.product_package_uuid = sop.product_package_uuid
+    AND IFNULL(pb.erp_code, '') = IFNULL(sop.erp_code, '')
+    AND pb.delete_time = 0
+  WHERE sop.delete_time = 0
+    AND sop.cancel_time = 0
+    AND sop.status = 1
+    AND sb.status = 1
+    AND sb.finish_time >= {start_ts}
+    AND sb.finish_time < {end_ts}
+    AND sop.product_type = 1
+  GROUP BY item_uuid, item_name
+),
+refunds AS (
+  SELECT
+    rop.product_package_uuid AS item_uuid,
+    SUM(rop.num) AS refund_qty,
+    SUM(rop.product_total_amount) AS refund_amount
+  FROM `{project}`.`{dataset}`.`ttpos_return_order_product` rop
+  JOIN `{project}`.`{dataset}`.`ttpos_sale_order_product` orig_sop
+    ON orig_sop.uuid = rop.sale_order_product_uuid AND orig_sop.delete_time = 0
+  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` orig_sb
+    ON orig_sb.uuid = orig_sop.sale_bill_uuid AND orig_sb.delete_time = 0
+  WHERE rop.delete_time = 0
+    AND rop.product_type = 1
+    AND orig_sb.status = 1
+    AND orig_sb.finish_time >= {start_ts}
+    AND orig_sb.finish_time < {end_ts}
+  GROUP BY item_uuid
+)
 SELECT
-  sop.product_package_uuid AS item_uuid,
-  JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS item_name,
-  SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)) AS qty,
-  SUM(sop.total_price) AS revenue,
-  SAFE_DIVIDE(
-    SUM(pb.price * sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)),
-    SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num))
-  ) AS std_unit_price
-FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
-JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
-  ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
-JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
-  ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
-LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_bom` pb
-  ON pb.product_package_uuid = sop.product_package_uuid
-  AND IFNULL(pb.erp_code, '') = IFNULL(sop.erp_code, '')
-  AND pb.delete_time = 0
-WHERE sop.delete_time = 0
-  AND sop.cancel_time = 0
-  AND sop.status = 1
-  AND sb.status = 1
-  AND sb.finish_time >= {start_ts}
-  AND sb.finish_time < {end_ts}
-  AND sop.product_type = 1
-GROUP BY item_uuid, item_name
+  g.item_uuid,
+  g.item_name,
+  g.gross_qty - IFNULL(r.refund_qty, 0) AS qty,
+  g.gross_revenue - IFNULL(r.refund_amount, 0) AS revenue,
+  g.std_unit_price
+FROM gross g
+LEFT JOIN refunds r ON r.item_uuid = g.item_uuid
 """
 
-# 单品订单聚合
+# 单品订单聚合（同样扣减商品级退款，rop.product_type = 0）
 SINGLE_ORDERS_SQL = """
+WITH gross AS (
+  SELECT
+    sop.product_package_uuid AS item_uuid,
+    JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS item_name,
+    SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)) AS gross_qty,
+    SUM(sop.total_price) AS gross_revenue,
+    SAFE_DIVIDE(
+      SUM(pb.price * sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)),
+      SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num))
+    ) AS std_unit_price
+  FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
+  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
+    ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
+  JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
+    ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
+  LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_bom` pb
+    ON pb.product_package_uuid = sop.product_package_uuid
+    AND IFNULL(pb.erp_code, '') = IFNULL(sop.erp_code, '')
+    AND pb.delete_time = 0
+  WHERE sop.delete_time = 0
+    AND sop.cancel_time = 0
+    AND sop.status = 1
+    AND sb.status = 1
+    AND sb.finish_time >= {start_ts}
+    AND sb.finish_time < {end_ts}
+    AND sop.product_type = 0
+  GROUP BY item_uuid, item_name
+),
+refunds AS (
+  SELECT
+    rop.product_package_uuid AS item_uuid,
+    SUM(rop.num) AS refund_qty,
+    SUM(rop.product_total_amount) AS refund_amount
+  FROM `{project}`.`{dataset}`.`ttpos_return_order_product` rop
+  JOIN `{project}`.`{dataset}`.`ttpos_sale_order_product` orig_sop
+    ON orig_sop.uuid = rop.sale_order_product_uuid AND orig_sop.delete_time = 0
+  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` orig_sb
+    ON orig_sb.uuid = orig_sop.sale_bill_uuid AND orig_sb.delete_time = 0
+  WHERE rop.delete_time = 0
+    AND rop.product_type = 0
+    AND orig_sb.status = 1
+    AND orig_sb.finish_time >= {start_ts}
+    AND orig_sb.finish_time < {end_ts}
+  GROUP BY item_uuid
+)
 SELECT
-  sop.product_package_uuid AS item_uuid,
-  JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS item_name,
-  SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)) AS qty,
-  SUM(sop.total_price) AS revenue,
-  SAFE_DIVIDE(
-    SUM(pb.price * sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)),
-    SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num))
-  ) AS std_unit_price
-FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
-JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
-  ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
-JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
-  ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
-LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_bom` pb
-  ON pb.product_package_uuid = sop.product_package_uuid
-  AND IFNULL(pb.erp_code, '') = IFNULL(sop.erp_code, '')
-  AND pb.delete_time = 0
-WHERE sop.delete_time = 0
-  AND sop.cancel_time = 0
-  AND sop.status = 1
-  AND sb.status = 1
-  AND sb.finish_time >= {start_ts}
-  AND sb.finish_time < {end_ts}
-  AND sop.product_type = 0
-GROUP BY item_uuid, item_name
+  g.item_uuid,
+  g.item_name,
+  g.gross_qty - IFNULL(r.refund_qty, 0) AS qty,
+  g.gross_revenue - IFNULL(r.refund_amount, 0) AS revenue,
+  g.std_unit_price
+FROM gross g
+LEFT JOIN refunds r ON r.item_uuid = g.item_uuid
 """
 
 # 产品 BOM 结构（不关联订单表，纯产品级数据）
