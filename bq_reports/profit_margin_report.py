@@ -176,13 +176,49 @@ def _match_fallback_bom(item_name, fallback_boms):
 # 商家列表加载（适配器 + 缓存）
 # ============================================================================
 
-def _load_merchants(config: dict, store_names: dict, override_path: str = None):
-    """从配置加载商家列表。支持缓存。"""
+def _fetch_store_names_from_bq(uuids, project_id):
+    """并发查每个 dataset 的 ttpos_setting 拿 store_code/store_name。"""
+    from concurrent.futures import ThreadPoolExecutor
+    from bq_reports.utils.bq_client import get_bq_client
+
+    def _query(uuid_str):
+        try:
+            client = get_bq_client(project_id)
+            sql = f"""
+            SELECT
+              JSON_EXTRACT_SCALAR(`values`, '$.store_code') AS code,
+              JSON_EXTRACT_SCALAR(`values`, '$.store_name') AS name
+            FROM `{project_id}`.`shop{uuid_str}`.`ttpos_setting`
+            WHERE `key` = 'store' AND delete_time = 0
+            LIMIT 1
+            """
+            rows = list(client.query(sql).result())
+            if not rows:
+                return uuid_str, None, None
+            r = rows[0]
+            return uuid_str, (r.code or None), (r.name or None)
+        except Exception as e:
+            print(f"[警告] 查询 shop{uuid_str} 的 store_name 失败: {e}")
+            return uuid_str, None, None
+
+    result = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for uuid_str, code, name in ex.map(_query, uuids):
+            result[uuid_str] = (code, name)
+    return result
+
+
+def _load_merchants(config: dict, store_names: dict, override_path: str = None,
+                    project_id: str = None):
+    """加载商家列表。门店名优先从 BQ ttpos_setting 实时取，
+    fallback 到 store_names Excel 映射，再 fallback 到 "-"。
+    门店编号同样优先 BQ store_code，否则用 admin-XXX 解析出的数字。"""
     merchant_cfg = config.get("merchant_list")
     if merchant_cfg:
         cache_ttl = config.get("cache", {}).get("merchant_list_ttl", 86400)
-        # v2: 修门店编号归一化匹配，旧缓存格式可能是 "-"
-        key = cache_key("merchants_v2", {"path": merchant_cfg.get("path", "")})
+        # v3: 接入 BQ 实时门店名
+        key = cache_key("merchants_v3", {"path": merchant_cfg.get("path", ""),
+                                          "project": project_id or ""})
         cached = get_cache(key, ttl_seconds=cache_ttl)
         if cached is not None:
             print(f"[Merchants] 缓存命中: {len(cached)} 个")
@@ -190,21 +226,35 @@ def _load_merchants(config: dict, store_names: dict, override_path: str = None):
 
         adapter = get_adapter(merchant_cfg["adapter"])
         records = adapter.load(merchant_cfg)
-        merchants = []
+        raw = []
         for r in records:
             account = r.get("account")
             uuid_str = r.get("uuid")
-            if account and uuid_str:
-                account = str(account).strip()
-                uuid_str = str(uuid_str).strip()
-                m = re.search(r'admin-(\d+)@', account)
-                store_num = m.group(1) if m else account
-                # 同时尝试原值与去前导 0 的归一化版本
-                store_name = store_names.get(store_num)
-                if not store_name and store_num.isdigit():
-                    store_name = store_names.get(str(int(store_num)))
-                store_name = store_name or "-"
-                merchants.append((account, uuid_str, store_num, store_name))
+            if not account or not uuid_str:
+                continue
+            account = str(account).strip()
+            uuid_str = str(uuid_str).strip()
+            m = re.search(r'admin-(\d+)@', account)
+            store_num_excel = m.group(1) if m else account
+            raw.append((account, uuid_str, store_num_excel))
+
+        # 从 BQ 拉真实门店名（覆盖 Excel 映射）
+        bq_names = {}
+        if project_id and raw:
+            print(f"[Merchants] 从 BQ 查询 {len(raw)} 个门店的 store_code/store_name...")
+            bq_names = _fetch_store_names_from_bq([r[1] for r in raw], project_id)
+
+        merchants = []
+        for account, uuid_str, store_num_excel in raw:
+            bq_code, bq_name = bq_names.get(uuid_str, (None, None))
+            store_num = bq_code or store_num_excel
+            store_name = bq_name
+            if not store_name:
+                store_name = store_names.get(store_num_excel)
+                if not store_name and store_num_excel.isdigit():
+                    store_name = store_names.get(str(int(store_num_excel)))
+            store_name = store_name or "-"
+            merchants.append((account, uuid_str, store_num, store_name))
         set_cache(key, merchants)
         return merchants
     else:
@@ -689,7 +739,8 @@ def main():
     store_names = _load_store_names(config)
 
     # 加载商家列表
-    merchants = _load_merchants(config, store_names, override_path=args.merchants)
+    merchants = _load_merchants(config, store_names, override_path=args.merchants,
+                                  project_id=args.project)
 
     range_desc = args.month if args.month else f"{args.start_date} ~ {args.end_date}"
     print(f"模式: {args.mode}, 时间: {range_desc}")
