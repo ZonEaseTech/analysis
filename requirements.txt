@@ -3,7 +3,8 @@ google-cloud-bigquery>=3.0.0
 google-auth>=2.0.0
 
 # Excel 处理
-openpyxl>=3.0.0
+openpyxl>=3.0.0    # 读输入 xlsx
+xlsxwriter>=3.0.0  # 写输出 xlsx（比 openpyxl 写快 5-10×）
 
 # 数据处理
 pandas>=1.5.0

@@ -36,11 +36,11 @@ Usage:
     # 4. 加载列配置（YAML）
     sheet_cfg = engine.load_sheet_config("resources/reports/profit_margin.yaml", "套餐")
 
-    # 5. 写入 Excel
-    wb = Workbook()
-    ws = wb.create_sheet("套餐")
-    engine.write_sheet(ws, sheet_cfg, rows)
-    wb.save("output.xlsx")
+    # 5. 写入 Excel（xlsxwriter 流式，open → write → close）
+    import xlsxwriter
+    wb = xlsxwriter.Workbook("output.xlsx")
+    engine.write_sheet(wb, "套餐", sheet_cfg, rows)
+    wb.close()
 """
 
 import os
@@ -49,9 +49,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-from openpyxl.utils import get_column_letter
+# 写出口用 xlsxwriter（流式、比 openpyxl 写快 5-10×）；读输入仍走 openpyxl。
+import xlsxwriter
 
 from utils.cache import get_cache, set_cache, cache_key
 from utils.resource_adapter import get_adapter
@@ -86,18 +85,35 @@ class SheetConfig:
 
 
 # ───────────────────────────────────────────────────────────────
-# Excel 样式常量
+# Excel 样式（xlsxwriter format dict，缓存创建）
 # ───────────────────────────────────────────────────────────────
 
-HEADER_FILL = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-HEADER_FONT = Font(bold=True, size=11, color="FFFFFF")
-RED_FONT = Font(color="FF0000")
-THIN_BORDER = Border(
-    left=Side(style="thin", color="D9D9D9"),
-    right=Side(style="thin", color="D9D9D9"),
-    top=Side(style="thin", color="D9D9D9"),
-    bottom=Side(style="thin", color="D9D9D9"),
-)
+_BORDER_COLOR = "#D9D9D9"
+_HEADER_BG = "#4472C4"
+
+
+class _FormatCache:
+    """缓存 xlsxwriter Format 对象，避免重复创建（同样的 dict → 同一个 Format）。"""
+    def __init__(self, workbook):
+        self._wb = workbook
+        self._cache = {}
+
+    def get(self, **kwargs):
+        # 标准化 + 缓存（dict 是 unhashable，转 frozenset of items）
+        key = frozenset(kwargs.items())
+        if key not in self._cache:
+            self._cache[key] = self._wb.add_format(dict(kwargs))
+        return self._cache[key]
+
+
+def _xl_col_letter(col_idx_1based: int) -> str:
+    """1-based col index → A, B, ..., Z, AA, AB, ..."""
+    s = ""
+    n = col_idx_1based
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 
 # ───────────────────────────────────────────────────────────────
@@ -240,115 +256,168 @@ def _resolve_formula(template: str, row: int, block_start: int, block_end: int, 
     )
 
 
-def write_configured_sheet(ws, sheet_config: SheetConfig, rows: List[List]):
+def write_configured_sheet(workbook, sheet_name: str, sheet_config: SheetConfig, rows: List[List]):
     """
-    按配置写入 Sheet。
+    按配置写入 Sheet（xlsxwriter 实现）。
 
     Args:
-        ws: openpyxl Worksheet
+        workbook: xlsxwriter.Workbook 对象
+        sheet_name: 工作表名称
         sheet_config: SheetConfig（列定义、合并规则、公式规则）
         rows: 扁平数据行，每个内层列表长度 ≥ max(field_index) + 1
     """
     columns = sheet_config.columns
     merge_key_indices = sheet_config.merge_key_indices
+    cache = _FormatCache(workbook)
 
-    # 1. 表头
-    for col_idx, col_cfg in enumerate(columns, 1):
-        cell = ws.cell(row=1, column=col_idx, value=col_cfg.name)
-        cell.font = HEADER_FONT
-        cell.fill = HEADER_FILL
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = THIN_BORDER
+    ws = workbook.add_worksheet(sheet_name)
+
+    # 1. 表头（xlsxwriter row/col 全 0-based）
+    hdr_fmt = cache.get(
+        bold=True, bg_color=_HEADER_BG, font_color="white",
+        align="center", valign="vcenter",
+        border=1, border_color=_BORDER_COLOR,
+    )
+    for col_idx, col_cfg in enumerate(columns):
+        ws.write(0, col_idx, col_cfg.name, hdr_fmt)
 
     if not rows:
+        ws.set_column(0, max(0, len(columns) - 1), 15)
+        # 冻结首行
+        if sheet_config.freeze_panes:
+            ws.freeze_panes(1, 0)
         return
 
-    # 2. 检测 block
+    # 2. 列宽（必须在 set_column 阶段，写完不能改）
+    for col_idx, col_cfg in enumerate(columns):
+        try:
+            data_max = max(
+                (len(str(rows[r][col_cfg.field_index] or "")) for r in range(len(rows))
+                 if col_cfg.field_index < len(rows[r])),
+                default=0,
+            )
+        except Exception:
+            data_max = 0
+        width = min(max(data_max, len(col_cfg.name)) + 4, 50)
+        ws.set_column(col_idx, col_idx, width)
+
+    # 3. 检测 block
     blocks = _detect_blocks(rows, merge_key_indices)
+    merge_col_set = {i for i, c in enumerate(columns) if c.merge} if merge_key_indices else set()
 
-    # 3. 写入 value / formula 列
-    for block_start_idx, block_end_idx in blocks:
-        excel_start = block_start_idx + 2
-        excel_end = block_end_idx + 2
+    # 4. 写"非 merge"列（value / formula / block_formula）。merge 列稍后专门处理
+    #    — xlsxwriter 的 merge_range 不能在已 write 过的 cell 上调用
+    for block_start, block_end in blocks:
+        excel_first = block_start + 2  # 公式里的 1-based 行号
+        excel_last = block_end + 2
 
-        for data_idx in range(block_start_idx, block_end_idx + 1):
+        for data_idx in range(block_start, block_end + 1):
+            xl_row = data_idx + 1  # xlsxwriter 0-based: header=0, data 从 1 开始
             excel_row = data_idx + 2
 
-            for col_idx, col_cfg in enumerate(columns, 1):
+            for col_idx, col_cfg in enumerate(columns):
+                if col_idx in merge_col_set:
+                    continue  # merge 列稍后处理
                 field_idx = col_cfg.field_index
 
                 if col_cfg.col_type == "value":
                     value = rows[data_idx][field_idx] if field_idx < len(rows[data_idx]) else None
-                    cell = ws.cell(row=excel_row, column=col_idx, value=value)
-                    cell.border = THIN_BORDER
-
-                    if isinstance(value, (int, float)) and value is not None:
-                        cell.alignment = Alignment(horizontal="right")
+                    fmt_args = {"border": 1, "border_color": _BORDER_COLOR, "valign": "vcenter"}
+                    if isinstance(value, (int, float)):
+                        fmt_args["align"] = "right"
                         if col_cfg.format_str:
-                            cell.number_format = col_cfg.format_str
+                            fmt_args["num_format"] = col_cfg.format_str
                     else:
-                        cell.alignment = Alignment(horizontal="left", vertical="center")
+                        fmt_args["align"] = "left"
+                    fmt = cache.get(**fmt_args)
+                    if value is None:
+                        ws.write_blank(xl_row, col_idx, None, fmt)
+                    else:
+                        ws.write(xl_row, col_idx, value, fmt)
 
                 elif col_cfg.col_type == "formula":
-                    col_letter = get_column_letter(col_idx)
+                    col_letter = _xl_col_letter(col_idx + 1)
                     formula = _resolve_formula(
-                        col_cfg.formula_template, excel_row, excel_start, excel_end, col_letter
+                        col_cfg.formula_template, excel_row, excel_first, excel_last, col_letter
                     )
-                    cell = ws.cell(row=excel_row, column=col_idx, value=formula)
-                    cell.border = THIN_BORDER
-                    cell.alignment = Alignment(horizontal="right")
+                    fmt_args = {"border": 1, "border_color": _BORDER_COLOR,
+                                "align": "right", "valign": "vcenter"}
                     if col_cfg.format_str:
-                        cell.number_format = col_cfg.format_str
+                        fmt_args["num_format"] = col_cfg.format_str
+                    fmt = cache.get(**fmt_args)
+                    ws.write_formula(xl_row, col_idx, formula, fmt)
 
-        # 4. block_formula 列（只在 block 第一行写）
-        for col_idx, col_cfg in enumerate(columns, 1):
+        # block_formula 在 block 第一行（也要避开 merge 列；merge 列下面统一处理）
+        for col_idx, col_cfg in enumerate(columns):
+            if col_idx in merge_col_set:
+                continue
             if col_cfg.col_type != "block_formula":
                 continue
-
-            field_idx = col_cfg.field_index
-            col_letter = get_column_letter(col_idx)
+            col_letter = _xl_col_letter(col_idx + 1)
             formula = _resolve_formula(
-                col_cfg.formula_template, excel_start, excel_start, excel_end, col_letter
+                col_cfg.formula_template, excel_first, excel_first, excel_last, col_letter
             )
-            cell = ws.cell(row=excel_start, column=col_idx, value=formula)
-            cell.border = THIN_BORDER
-            cell.alignment = Alignment(horizontal="center", vertical="center")
+            fmt_args = {"border": 1, "border_color": _BORDER_COLOR,
+                        "align": "center", "valign": "vcenter"}
             if col_cfg.format_str:
-                cell.number_format = col_cfg.format_str
-
-            # 负值标红（基于预计算值）
+                fmt_args["num_format"] = col_cfg.format_str
             if col_cfg.negative_red:
-                precomputed = rows[block_start_idx][field_idx] if field_idx < len(rows[block_start_idx]) else None
-                if isinstance(precomputed, (int, float)) and precomputed < 0:
-                    cell.font = RED_FONT
+                pre = rows[block_start][col_cfg.field_index] if col_cfg.field_index < len(rows[block_start]) else None
+                if isinstance(pre, (int, float)) and pre < 0:
+                    fmt_args["font_color"] = "#FF0000"
+            fmt = cache.get(**fmt_args)
+            xl_first = block_start + 1
+            ws.write_formula(xl_first, col_idx, formula, fmt)
 
-    # 5. 合并单元格
-    if merge_key_indices:
-        merge_col_indices = [i + 1 for i, c in enumerate(columns) if c.merge]
-        for block_start_idx, block_end_idx in blocks:
-            if block_start_idx == block_end_idx:
-                continue
-            excel_start = block_start_idx + 2
-            excel_end = block_end_idx + 2
-            for col_idx in merge_col_indices:
-                ws.merge_cells(start_row=excel_start, start_column=col_idx,
-                               end_row=excel_end, end_column=col_idx)
-                ws.cell(row=excel_start, column=col_idx).alignment = Alignment(
-                    horizontal="center", vertical="center"
+    # 5. merge 列（按 block 处理，单行不 merge 直接 write）
+    for col_idx in sorted(merge_col_set):
+        col_cfg = columns[col_idx]
+        for block_start, block_end in blocks:
+            xl_first = block_start + 1
+            xl_last = block_end + 1
+            excel_first = block_start + 2
+            excel_last = block_end + 2
+
+            # 准备值/公式 + 格式
+            fmt_args = {"border": 1, "border_color": _BORDER_COLOR,
+                        "align": "center", "valign": "vcenter"}
+            if col_cfg.format_str:
+                fmt_args["num_format"] = col_cfg.format_str
+            if col_cfg.negative_red and col_cfg.col_type == "block_formula":
+                pre = rows[block_start][col_cfg.field_index] if col_cfg.field_index < len(rows[block_start]) else None
+                if isinstance(pre, (int, float)) and pre < 0:
+                    fmt_args["font_color"] = "#FF0000"
+
+            if col_cfg.col_type == "value":
+                val = rows[block_start][col_cfg.field_index] if col_cfg.field_index < len(rows[block_start]) else None
+                if isinstance(val, (int, float)):
+                    fmt_args["align"] = "right"
+                fmt = cache.get(**fmt_args)
+                if xl_first == xl_last:
+                    if val is None:
+                        ws.write_blank(xl_first, col_idx, None, fmt)
+                    else:
+                        ws.write(xl_first, col_idx, val, fmt)
+                else:
+                    ws.merge_range(xl_first, col_idx, xl_last, col_idx, val, fmt)
+            else:
+                # formula / block_formula：合并区域只在第一行写公式
+                col_letter = _xl_col_letter(col_idx + 1)
+                # row 参考 = excel_first（block 起始行）
+                formula = _resolve_formula(
+                    col_cfg.formula_template, excel_first, excel_first, excel_last, col_letter
                 )
+                fmt = cache.get(**fmt_args)
+                if xl_first == xl_last:
+                    ws.write_formula(xl_first, col_idx, formula, fmt)
+                else:
+                    ws.merge_range(xl_first, col_idx, xl_last, col_idx, "", fmt)
+                    ws.write_formula(xl_first, col_idx, formula, fmt)
 
-    # 6. 自动列宽
-    for col_idx, col_cfg in enumerate(columns, 1):
-        max_len = max(
-            (len(str(rows[r][col_cfg.field_index] or "")) for r in range(len(rows)) if col_cfg.field_index < len(rows[r])),
-            default=0
-        )
-        header_len = len(col_cfg.name)
-        max_len = max(max_len, header_len)
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 50)
-
-    # 7. 冻结首行
-    ws.freeze_panes = sheet_config.freeze_panes
+    # 6. 冻结首行
+    if sheet_config.freeze_panes:
+        # freeze_panes 的字符串 'A2' 转 (row=1, col=0)
+        ws.freeze_panes(1, 0)
 
 
 # ───────────────────────────────────────────────────────────────
@@ -407,9 +476,16 @@ class ReportEngine:
         """加载外部资源。"""
         return load_resources(configs)
 
-    def write_sheet(self, ws, sheet_config: SheetConfig, rows: List[List]):
-        """按配置写入 Sheet。"""
-        return write_configured_sheet(ws, sheet_config, rows)
+    def write_sheet(self, workbook, sheet_name: str, sheet_config: SheetConfig, rows: List[List]):
+        """按配置写入 Sheet（xlsxwriter）。
+
+        Args:
+            workbook: xlsxwriter.Workbook
+            sheet_name: 工作表名称（也是 add_worksheet 的名字）
+            sheet_config: SheetConfig
+            rows: 扁平数据行
+        """
+        return write_configured_sheet(workbook, sheet_name, sheet_config, rows)
 
     def load_sheet_config(self, yaml_path: str, sheet_name: str) -> SheetConfig:
         """从 YAML 加载配置。"""

@@ -41,19 +41,34 @@ WHERE delete_time = 0
 """
 
 # 综合销售业绩（POS + 外卖平台）
+# 退款扣减口径：amount（营业额）保留原值；payment_amount（实收）扣减
+#   payment.sh 一致：实收 = SUM(po.amount - IFNULL(refund.amount, 0))
 COMPREHENSIVE_SALES_SQL = """
-WITH 
+WITH
+pos_refund_per_bill AS (
+  SELECT
+    so.sale_bill_uuid AS bill_uuid,
+    SUM(roa.amount) AS refund_amount
+  FROM `{project}.{dataset}.ttpos_return_order_amount` roa
+  JOIN `{project}.{dataset}.ttpos_payment_order` po
+    ON po.uuid = roa.payment_order_uuid AND po.delete_time = 0
+  JOIN `{project}.{dataset}.ttpos_sale_order` so
+    ON so.uuid = po.related_uuid AND po.related_type = 0 AND so.delete_time = 0
+  WHERE roa.delete_time = 0 AND roa.refund_status = 1
+  GROUP BY bill_uuid
+),
 pos_sales AS (
-  SELECT 
-    ROUND(SUM(amount), 2) AS turnover,
-    ROUND(SUM(payment_amount), 2) AS received,
+  SELECT
+    ROUND(SUM(sb.amount), 2) AS turnover,
+    ROUND(SUM(sb.payment_amount - IFNULL(rf.refund_amount, 0)), 2) AS received,
     COUNT(*) AS cnt
-  FROM `{project}.{dataset}.ttpos_sale_bill`
-  WHERE delete_time = 0 AND status = 1
-    AND finish_time >= {start_ts} AND finish_time < {end_ts}
+  FROM `{project}.{dataset}.ttpos_sale_bill` sb
+  LEFT JOIN pos_refund_per_bill rf ON rf.bill_uuid = sb.uuid
+  WHERE sb.delete_time = 0 AND sb.status = 1
+    AND sb.finish_time >= {start_ts} AND sb.finish_time < {end_ts}
 ),
 takeout_sales AS (
-  SELECT 
+  SELECT
     ROUND(SUM(subtotal), 2) AS turnover,
     ROUND(SUM(platform_total), 2) AS received,
     COUNT(*) AS cnt
