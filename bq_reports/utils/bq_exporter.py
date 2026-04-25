@@ -617,50 +617,64 @@ class ReportExporter(MultiShopExporter):
         
         sales_sql = get_template('comprehensive_sales')
         consumption_sql = get_template('material_consumption')
-        
-        for idx, (account, uuid_str) in enumerate(self.merchants, 1):
+
+        # 并发查询：53 门店 × 2 查询，串行 BQ 调用太慢
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _query_sales(account, uuid_str):
             dataset = f"shop{uuid_str}"
-            
-            # 查询销售业绩
-            try:
-                sql = sales_sql.format(
-                    project=self.project_id,
-                    dataset=dataset,
-                    start_ts=start_ts,
-                    end_ts=end_ts
-                )
-                rows = list(self.client.query(sql).result())
-                if rows:
-                    row = rows[0]
-                    sales_results.append({
-                        "账号": account,
-                        "门店名称": row.store_name or "",
-                        "总营业额": float(row.total_turnover or 0),
-                        "实收金额": float(row.total_received or 0),
-                        "订单数": int(row.total_orders or 0)
-                    })
-            except Exception as e:
-                errors.append({"account": account, "type": "sales", "error": str(e)})
-            
-            # 查询物品消耗
-            try:
-                sql = consumption_sql.format(
-                    project=self.project_id,
-                    dataset=dataset,
-                    start_ts=start_ts,
-                    end_ts=end_ts
-                )
-                rows = list(self.client.query(sql).result())
-                for row in rows:
-                    consumption_results.append({
-                        "账号": account,
-                        "门店名称": row.store_name or "",
-                        "原料名称": row.material_name or "",
-                        "消耗量": float(row.total_num or 0),
-                        "单位": row.unit_name or ""
-                    })
-            except Exception as e:
-                errors.append({"account": account, "type": "consumption", "error": str(e)})
+            sql = sales_sql.format(project=self.project_id, dataset=dataset,
+                                    start_ts=start_ts, end_ts=end_ts)
+            rows = list(self.client.query(sql).result())
+            if not rows:
+                return account, None
+            row = rows[0]
+            return account, {
+                "账号": account,
+                "门店名称": row.store_name or "",
+                "总营业额": float(row.total_turnover or 0),
+                "实收金额": float(row.total_received or 0),
+                "订单数": int(row.total_orders or 0),
+            }
+
+        def _query_consumption(account, uuid_str):
+            dataset = f"shop{uuid_str}"
+            sql = consumption_sql.format(project=self.project_id, dataset=dataset,
+                                          start_ts=start_ts, end_ts=end_ts)
+            rows = list(self.client.query(sql).result())
+            return account, [{
+                "账号": account,
+                "门店名称": row.store_name or "",
+                "原料名称": row.material_name or "",
+                "消耗量": float(row.total_num or 0),
+                "单位": row.unit_name or "",
+            } for row in rows]
+
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            sales_futures = {
+                ex.submit(_query_sales, account, uuid_str): account
+                for account, uuid_str in self.merchants
+            }
+            for fut in as_completed(sales_futures):
+                account = sales_futures[fut]
+                try:
+                    _, data = fut.result()
+                    if data:
+                        sales_results.append(data)
+                except Exception as e:
+                    errors.append({"account": account, "type": "sales", "error": str(e)})
+
+            consumption_futures = {
+                ex.submit(_query_consumption, account, uuid_str): account
+                for account, uuid_str in self.merchants
+            }
+            for fut in as_completed(consumption_futures):
+                account = consumption_futures[fut]
+                try:
+                    _, items = fut.result()
+                    consumption_results.extend(items)
+                except Exception as e:
+                    errors.append({"account": account, "type": "consumption", "error": str(e)})
         
         # 写入 Excel（双 sheet）
         output_path = output_path or self.output_path
