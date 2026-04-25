@@ -50,8 +50,14 @@ exports/*
 !exports/.gitkeep
 
 # Resources directory (input data files)
+# 数据文件 ignore，但配置 YAML / reports 子目录跟着代码一起走
 resources/*
 !resources/.gitkeep
+!resources/reports/
+!resources/reports/**
+!resources/wallace.*/
+resources/wallace.*/*
+!resources/wallace.*/config.yaml
 
 # Logs
 *.log
