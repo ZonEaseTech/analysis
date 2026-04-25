@@ -160,15 +160,58 @@ def _load_fallback_boms(config: dict = None):
 
 
 def _match_fallback_bom(item_name, fallback_boms):
-    """用 BQ 商品名匹配 fallback BOM 中的商品名。"""
+    """用 BQ 商品名匹配 fallback BOM 中的商品名。
+
+    优先级（从严到宽）：
+      1. fallback key 整字符串与 item_name 精确相等
+      2. key 的中文段（"/" 首段）与 item_name 精确相等
+      3. 中文段以 item_name 开头（如 item="鸡块"，zh="鸡块（中）"）
+      4. 中文段包含 item_name（如 item="鸡肉芝士球"，zh="周一特惠 - 鸡肉芝士球 2 盒 69"）
+      5. 长前缀模糊（item ≥5 字符，前 10 字符出现在 zh 里）
+    多个候选时取**中文段最短**的（最接近原始商品名）。
+
+    历史 bug：旧逻辑遍历 dict 直接 `item_name in key` 会优先命中长 key，
+    导致"鸡肉芝士球"被错误匹配到"周一特惠 - 鸡肉芝士球 2 盒 69"，
+    成本按 2 盒装算（虚高一倍）。
+    """
     if not item_name or not fallback_boms:
         return None
-    for key in fallback_boms:
-        if item_name in key or key.startswith(item_name):
-            return fallback_boms[key]
-    for key in fallback_boms:
-        if len(item_name) >= 5 and item_name[:10] in key:
-            return fallback_boms[key]
+    name = item_name.strip()
+    if not name:
+        return None
+
+    # 1. 整 key 精确
+    if name in fallback_boms:
+        return fallback_boms[name]
+
+    # 预提取中文首段
+    keys_zh = [(k, k.split(" / ")[0].strip()) for k in fallback_boms]
+
+    # 2. 中文段精确
+    for k, zh in keys_zh:
+        if zh == name:
+            return fallback_boms[k]
+
+    # 3. 中文段以 item_name 开头
+    starts = [(k, zh) for k, zh in keys_zh if zh.startswith(name) and zh != name]
+    if starts:
+        starts.sort(key=lambda x: len(x[1]))
+        return fallback_boms[starts[0][0]]
+
+    # 4. 中文段包含 item_name
+    contains = [(k, zh) for k, zh in keys_zh if name in zh]
+    if contains:
+        contains.sort(key=lambda x: len(x[1]))
+        return fallback_boms[contains[0][0]]
+
+    # 5. 长前缀模糊
+    if len(name) >= 5:
+        prefix = name[:10]
+        loose = [(k, zh) for k, zh in keys_zh if prefix in zh]
+        if loose:
+            loose.sort(key=lambda x: len(x[1]))
+            return fallback_boms[loose[0][0]]
+
     return None
 
 
