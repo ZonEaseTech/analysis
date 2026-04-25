@@ -37,7 +37,8 @@ def _load_store_names(config: dict = None):
         return {}
 
     cache_ttl = cfg.get("cache", {}).get("store_names_ttl", 604800)
-    key = cache_key("store_names", {"path": mapping_config.get("path", "")})
+    # v2: 同时存原值与去前导 0 的归一化 key（"001" 与 "1" 都能匹配）
+    key = cache_key("store_names_v2", {"path": mapping_config.get("path", "")})
     cached = get_cache(key, ttl_seconds=cache_ttl)
     if cached is not None:
         print(f"[Store Names] 缓存命中: {len(cached)} 个")
@@ -50,10 +51,22 @@ def _load_store_names(config: dict = None):
         for r in records:
             num = r.get("store_number")
             name = r.get("store_name")
-            if num is not None and name:
-                mapping[str(num).strip()] = str(name).strip()
+            if num is None or not name:
+                continue
+            s = str(num).strip()
+            if not s:
+                continue
+            clean_name = str(name).strip()
+            mapping[s] = clean_name
+            # 数字编号同时存归一化版本，避免 "001" / "1" 互不匹配
+            try:
+                mapping[str(int(s))] = clean_name
+            except ValueError:
+                pass
         set_cache(key, mapping)
-        print(f"[Store Names] 加载 {len(mapping)} 个门店名称")
+        # 用去重数计真实门店数
+        unique_names = len(set(mapping.values()))
+        print(f"[Store Names] 加载 {unique_names} 个门店名称（{len(mapping)} 个 key）")
         return mapping
     except Exception as e:
         print(f"[警告] 加载门店名称失败: {e}")
@@ -168,7 +181,8 @@ def _load_merchants(config: dict, store_names: dict, override_path: str = None):
     merchant_cfg = config.get("merchant_list")
     if merchant_cfg:
         cache_ttl = config.get("cache", {}).get("merchant_list_ttl", 86400)
-        key = cache_key("merchants", {"path": merchant_cfg.get("path", "")})
+        # v2: 修门店编号归一化匹配，旧缓存格式可能是 "-"
+        key = cache_key("merchants_v2", {"path": merchant_cfg.get("path", "")})
         cached = get_cache(key, ttl_seconds=cache_ttl)
         if cached is not None:
             print(f"[Merchants] 缓存命中: {len(cached)} 个")
@@ -185,7 +199,11 @@ def _load_merchants(config: dict, store_names: dict, override_path: str = None):
                 uuid_str = str(uuid_str).strip()
                 m = re.search(r'admin-(\d+)@', account)
                 store_num = m.group(1) if m else account
-                store_name = store_names.get(store_num, "-")
+                # 同时尝试原值与去前导 0 的归一化版本
+                store_name = store_names.get(store_num)
+                if not store_name and store_num.isdigit():
+                    store_name = store_names.get(str(int(store_num)))
+                store_name = store_name or "-"
                 merchants.append((account, uuid_str, store_num, store_name))
         set_cache(key, merchants)
         return merchants
@@ -213,17 +231,26 @@ def _load_merchants(config: dict, store_names: dict, override_path: str = None):
 # ============================================================================
 
 # 套餐订单聚合（BQ 内完成，只返回产品级汇总）
+# std_unit_price: 按销量加权的"商品标准售价"（来自 ttpos_product_bom.price）
 COMBO_ORDERS_SQL = """
 SELECT
   sop.product_package_uuid AS item_uuid,
   JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS item_name,
   SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)) AS qty,
-  SUM(sop.total_price) AS revenue
+  SUM(sop.total_price) AS revenue,
+  SAFE_DIVIDE(
+    SUM(pb.price * sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)),
+    SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num))
+  ) AS std_unit_price
 FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
 JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
   ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
 JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
   ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
+LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_bom` pb
+  ON pb.product_package_uuid = sop.product_package_uuid
+  AND IFNULL(pb.erp_code, '') = IFNULL(sop.erp_code, '')
+  AND pb.delete_time = 0
 WHERE sop.delete_time = 0
   AND sop.cancel_time = 0
   AND sop.status = 1
@@ -240,12 +267,20 @@ SELECT
   sop.product_package_uuid AS item_uuid,
   JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS item_name,
   SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)) AS qty,
-  SUM(sop.total_price) AS revenue
+  SUM(sop.total_price) AS revenue,
+  SAFE_DIVIDE(
+    SUM(pb.price * sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)),
+    SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num))
+  ) AS std_unit_price
 FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
 JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
   ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
 JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
   ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
+LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_bom` pb
+  ON pb.product_package_uuid = sop.product_package_uuid
+  AND IFNULL(pb.erp_code, '') = IFNULL(sop.erp_code, '')
+  AND pb.delete_time = 0
 WHERE sop.delete_time = 0
   AND sop.cancel_time = 0
   AND sop.status = 1
@@ -257,13 +292,20 @@ GROUP BY item_uuid, item_name
 """
 
 # 产品 BOM 结构（不关联订单表，纯产品级数据）
+# bom_unit / conversion_rate 来自 ttpos 配方录入，用于把 ERP 基准单位价换算到配方单位价
 BOM_SQL = """
 SELECT
   pb.product_package_uuid AS item_uuid,
   m.code AS material_code,
   JSON_EXTRACT_SCALAR(m.name, '$.zh') AS material_name,
   rm.num AS bom_num,
-  rm_base.base_unit_conversion_rate AS material_conversion_rate,
+  COALESCE(
+    JSON_EXTRACT_SCALAR(rm.unit_name, '$.zh'),
+    JSON_EXTRACT_SCALAR(rm.unit_name, '$.en'),
+    JSON_EXTRACT_SCALAR(rm.base_unit_name, '$.zh'),
+    JSON_EXTRACT_SCALAR(rm.base_unit_name, '$.en')
+  ) AS bom_unit,
+  rm.base_unit_conversion_rate AS conversion_rate,
   m.price AS material_bq_price
 FROM `{project}`.`{dataset}`.`ttpos_product_bom` pb
 LEFT JOIN `{project}`.`{dataset}`.`ttpos_related_material` rm
@@ -274,12 +316,6 @@ LEFT JOIN `{project}`.`{dataset}`.`ttpos_related_material` rm
   AND rm.delete_time = 0
 LEFT JOIN `{project}`.`{dataset}`.`ttpos_material` m
   ON m.uuid = rm.material_uuid AND m.delete_time = 0
-LEFT JOIN (
-  SELECT material_uuid, MAX(base_unit_conversion_rate) AS base_unit_conversion_rate
-  FROM `{project}`.`{dataset}`.`ttpos_related_material`
-  WHERE delete_time = 0
-  GROUP BY material_uuid
-) rm_base ON rm_base.material_uuid = m.uuid
 WHERE pb.delete_time = 0
 """
 
@@ -311,19 +347,19 @@ BOM_UNIT_CORRECTIONS = {
 }
 
 
-def _resolve_price(material_code, bq_price, erp_prices):
-    """用 ERPNext 价格替换 BQ 价格，并处理已知的单位不匹配。"""
+def _resolve_base_unit_price(material_code, bq_price, erp_prices):
+    """返回物料在基准单位下的单价（ERP Item Price 优先，否则用 BQ 缺省价）。"""
     if not erp_prices or not material_code:
-        return float(bq_price or 0), ""
+        return float(bq_price or 0)
     for key in (material_code, material_code.upper(), material_code.lower()):
         if key in erp_prices:
-            price, uom = erp_prices[key]
+            price, _uom = erp_prices[key]
             for corr_key in (material_code, material_code.upper(), material_code.lower()):
                 if corr_key in BOM_UNIT_CORRECTIONS:
                     price = price / BOM_UNIT_CORRECTIONS[corr_key]
                     break
-            return price, uom
-    return float(bq_price or 0), ""
+            return price
+    return float(bq_price or 0)
 
 
 # ============================================================================
@@ -382,11 +418,12 @@ def _load_combo_structures(engine, merchants, start_ts, end_ts, config: dict = N
 def _load_boms(engine, merchants, config: dict = None):
     """
     查询并缓存每个门店的产品 BOM。
-    返回: {store_num: {item_uuid: [(material_code, material_name, bom_num, conv_rate, bq_price), ...]}}
+    返回: {store_num: {item_uuid: [(material_code, material_name, bom_num, bom_unit, conv_rate, bq_price), ...]}}
     """
     cfg = config or {}
     cache_ttl = cfg.get("cache", {}).get("bom_ttl", 86400)  # 1天
-    key = cache_key("boms", {"count": len(merchants)})
+    # v2: 增加 bom_unit / conversion_rate 字段，旧缓存格式不兼容
+    key = cache_key("boms_v2", {"count": len(merchants)})
     cached = get_cache(key, ttl_seconds=cache_ttl)
     if cached is not None:
         print(f"[BOM] 缓存命中: {len(cached)} 个门店")
@@ -420,7 +457,8 @@ def _load_boms(engine, merchants, config: dict = None):
                 str(material_code),
                 row.material_name or "",
                 float(row.bom_num or 0),
-                float(row.material_conversion_rate or 1),
+                (row.bom_unit or "").strip() or "-",
+                float(row.conversion_rate or 1),
                 float(row.material_bq_price or 0),
             ))
 
@@ -452,12 +490,19 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
         item_name = row.item_name
         qty = float(row.qty or 0)
         revenue = float(row.revenue or 0)
+        std_price = float(getattr(row, "std_unit_price", None) or 0)
 
         key = (store_num, store_name, item_uuid, item_name)
         if key not in data:
-            data[key] = {"qty": 0.0, "revenue": 0.0, "bom": {}}
+            data[key] = {
+                "qty": 0.0,
+                "revenue": 0.0,
+                "std_price_weighted": 0.0,  # SUM(std_price * qty)，最后再除一次
+                "bom": {},
+            }
         data[key]["qty"] += qty
         data[key]["revenue"] += revenue
+        data[key]["std_price_weighted"] += std_price * qty
 
     # 为每个 item 匹配 BOM
     for key, val in data.items():
@@ -470,30 +515,35 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
             child_uuids = store_struct.get(item_uuid, [])
             for child_uuid in child_uuids:
                 child_bom = store_boms.get(child_uuid, [])
-                for material_code, material_name, bom_num, conv_rate, bq_price in child_bom:
+                for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in child_bom:
                     if not material_code:
                         continue
                     if material_code not in val["bom"]:
-                        unit_price, uom = _resolve_price(material_code, bq_price, erp_prices)
+                        base_price = _resolve_base_unit_price(material_code, bq_price, erp_prices)
+                        # 把基准单位价换算到配方单位价（ttpos rm.unit_name 维度）
+                        unit_price = base_price * (conv_rate or 1)
                         cost_per_unit = bom_num * unit_price
-                        val["bom"][material_code] = (material_name, bom_num, unit_price, uom, cost_per_unit)
+                        val["bom"][material_code] = (material_name, bom_num, unit_price, bom_unit, cost_per_unit)
         else:
             # 单品：直接匹配 BOM
             item_bom = store_boms.get(item_uuid, [])
-            for material_code, material_name, bom_num, conv_rate, bq_price in item_bom:
+            for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in item_bom:
                 if not material_code:
                     continue
                 if material_code not in val["bom"]:
-                    unit_price, uom = _resolve_price(material_code, bq_price, erp_prices)
+                    base_price = _resolve_base_unit_price(material_code, bq_price, erp_prices)
+                    unit_price = base_price * (conv_rate or 1)
                     cost_per_unit = bom_num * unit_price
-                    val["bom"][material_code] = (material_name, bom_num, unit_price, uom, cost_per_unit)
+                    val["bom"][material_code] = (material_name, bom_num, unit_price, bom_unit, cost_per_unit)
 
     # 转换为列表格式（与旧版兼容）
     result = {}
     for key, val in data.items():
+        std_unit_price = val["std_price_weighted"] / val["qty"] if val["qty"] > 0 else 0.0
         result[key] = {
             "qty": val["qty"],
             "revenue": val["revenue"],
+            "std_unit_price": std_unit_price,
             "bom": [
                 (code, name, bom_num, price, uom, cost)
                 for code, (name, bom_num, price, uom, cost) in val["bom"].items()
@@ -515,20 +565,19 @@ def _build_rows(agg_data, mode, fallback_boms=None, erp_prices=None):
     for (store_num, store_name, item_uuid, item_name), data in sorted(agg_data.items()):
         qty = data["qty"]
         revenue = data["revenue"]
-        item_unit_price = round(revenue / qty, 2) if qty > 0 else 0
+        # 单价取 ttpos 商品标准售价（按销量加权，来自 ttpos_product_bom.price）
+        item_unit_price = round(data.get("std_unit_price", 0) or 0, 2)
         bom_list = data["bom"]
 
-        # Fallback BOM 补充
+        # Fallback BOM 补充（fallback 数据按基准单位录入，conv_rate 视为 1）
         if not bom_list and fallback_boms:
             matched = _match_fallback_bom(item_name, fallback_boms)
             if matched:
                 bom_list = []
                 for code, name, bom_num, uom in matched:
-                    unit_price, resolved_uom = _resolve_price(code, 0, erp_prices)
-                    if not resolved_uom and uom:
-                        resolved_uom = uom
+                    unit_price = _resolve_base_unit_price(code, 0, erp_prices)
                     cost_per_unit = bom_num * unit_price
-                    bom_list.append((code, name, bom_num, unit_price, resolved_uom, cost_per_unit))
+                    bom_list.append((code, name, bom_num, unit_price, uom or "-", cost_per_unit))
                 print(f"  [Fallback] {item_name}: 补充 {len(bom_list)} 个物料")
 
         if not bom_list:
