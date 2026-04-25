@@ -33,10 +33,14 @@ fallback_bom:
   mapping:
     product_name: "商品名称"
     material_code:
-      primary: "物料编码"
-      fallback: "编码"        # 编码列名可能不同版本
-    material_name: "物料名称"
-    qty: "消耗数量"
+      primary: "物品编号"      # 当前 Excel 实际列名
+      fallback: "物料编码"     # 旧文件兼容
+    material_name:
+      primary: "物品名称"      # 当前 Excel
+      fallback: "物料名称"     # 旧文件
+    qty:
+      primary: "单耗"          # 当前 Excel
+      fallback: "消耗数量"     # 旧文件
     unit: "单位"
 
 # ───────────────────────────────────────────────
