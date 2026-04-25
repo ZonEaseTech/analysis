@@ -31,14 +31,20 @@ sheets:
       - {name: "物品单个成本",field_index: 8,  type: value, format: "0.00", width: 12}
       - {name: "消耗数量",    field_index: 9,  type: value, format: "0.00", width: 10}
       - {name: "单位",        field_index: 10, width: 8}
+      # 按 market 描述 L = I*J（per 份，不乘销量）
       - {name: "物品总成本",  field_index: 11, type: formula,      format: "0.00",
-          formula: "=I{row}*J{row}*D{block_start}"}
+          formula: "=I{row}*J{row}"}
+      # 按 market 描述：套餐单份总成本 = L 列 BOM 加和
       - {name: "套餐单份总成本", field_index: 12, type: block_formula, format: "0.00", merge: true,
-          formula: "=SUMPRODUCT(I{block_start}:I{block_end},J{block_start}:J{block_end})"}
-      - {name: "毛利",        field_index: 13, type: block_formula, format: "0.00", merge: true, negative_red: true,
-          formula: "=F{block_start}-M{block_start}*D{block_start}"}
-      - {name: "毛利率",      field_index: 14, type: block_formula, format: "0.00%", merge: true, negative_red: true,
-          formula: "=IF(F{block_start}=0,0,N{block_start}/F{block_start})"}
+          formula: "=SUM(L{block_start}:L{block_end})"}
+      # 单品毛利 = 单价(E) - 套餐单份总成本(M)，每份套餐的标准利润
+      - {name: "单品毛利",    field_index: 13, type: block_formula, format: "0.00", merge: true, negative_red: true,
+          formula: "=E{block_start}-M{block_start}"}
+      # 总毛利 = 销量(D) × 单品毛利(N) = 销售数量 × 单品毛利（按 market 要求硬算）
+      - {name: "总毛利",      field_index: 14, type: block_formula, format: "0.00", merge: true, negative_red: true,
+          formula: "=D{block_start}*N{block_start}"}
+      - {name: "毛利率",      field_index: 15, type: block_formula, format: "0.00%", merge: true, negative_red: true,
+          formula: "=IF(F{block_start}=0,0,O{block_start}/F{block_start})"}
 
   单品:
     merge_key_indices: [0, 1, 2]
@@ -54,11 +60,17 @@ sheets:
       - {name: "物品单个成本",field_index: 8,  type: value, format: "0.00", width: 12}
       - {name: "消耗数量",    field_index: 9,  type: value, format: "0.00", width: 10}
       - {name: "单位",        field_index: 10, width: 8}
+      # 按 market 描述 L = I*J（per 份，不乘销量）
       - {name: "物品总成本",  field_index: 11, type: formula,      format: "0.00",
-          formula: "=I{row}*J{row}*D{block_start}"}
+          formula: "=I{row}*J{row}"}
+      # 按 market 描述：单品单份总成本 = L 列 BOM 加和
       - {name: "单品单份总成本", field_index: 12, type: block_formula, format: "0.00", merge: true,
-          formula: "=SUMPRODUCT(I{block_start}:I{block_end},J{block_start}:J{block_end})"}
-      - {name: "毛利",        field_index: 13, type: block_formula, format: "0.00", merge: true, negative_red: true,
-          formula: "=F{block_start}-M{block_start}*D{block_start}"}
-      - {name: "毛利率",      field_index: 14, type: block_formula, format: "0.00%", merge: true, negative_red: true,
-          formula: "=IF(F{block_start}=0,0,N{block_start}/F{block_start})"}
+          formula: "=SUM(L{block_start}:L{block_end})"}
+      # 单品毛利 = 单价(E) - 单品单份总成本(M)
+      - {name: "单品毛利",    field_index: 13, type: block_formula, format: "0.00", merge: true, negative_red: true,
+          formula: "=E{block_start}-M{block_start}"}
+      # 总毛利 = 销量(D) × 单品毛利(N) = 销售数量 × 单品毛利（按 market 要求硬算）
+      - {name: "总毛利",      field_index: 14, type: block_formula, format: "0.00", merge: true, negative_red: true,
+          formula: "=D{block_start}*N{block_start}"}
+      - {name: "毛利率",      field_index: 15, type: block_formula, format: "0.00%", merge: true, negative_red: true,
+          formula: "=IF(F{block_start}=0,0,O{block_start}/F{block_start})"}
