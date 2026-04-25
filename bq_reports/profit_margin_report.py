@@ -473,7 +473,8 @@ def _load_boms(engine, merchants, config: dict = None):
     cfg = config or {}
     cache_ttl = cfg.get("cache", {}).get("bom_ttl", 86400)  # 1天
     # v2: 增加 bom_unit / conversion_rate 字段，旧缓存格式不兼容
-    key = cache_key("boms_v2", {"count": len(merchants)})
+    # v3: BOM 加载层去重 (store, item, material)，旧缓存有重复行
+    key = cache_key("boms_v3", {"count": len(merchants)})
     cached = get_cache(key, ttl_seconds=cache_ttl)
     if cached is not None:
         print(f"[BOM] 缓存命中: {len(cached)} 个门店")
@@ -494,23 +495,32 @@ def _load_boms(engine, merchants, config: dict = None):
     )
 
     boms = {}
+    # ttpos 多规格商品的 product_bom × related_material JOIN 会让同一 material
+    # 在同 (store, item) 内重复出现 N 次。在加载层去重，让套餐子商品共用物料的
+    # 跨 child 累加逻辑安全（不会被 intra-item 冗余污染）。
+    seen_keys = {}
     for row in raw_rows:
         store_num = row.store_num
+        item_uuid = str(row.item_uuid)
+        material_code = row.material_code
+        if not material_code:
+            continue
+        dedup_key = (store_num, item_uuid, str(material_code))
+        if dedup_key in seen_keys:
+            continue
+        seen_keys[dedup_key] = True
         if store_num not in boms:
             boms[store_num] = {}
-        item_uuid = str(row.item_uuid)
         if item_uuid not in boms[store_num]:
             boms[store_num][item_uuid] = []
-        material_code = row.material_code
-        if material_code:
-            boms[store_num][item_uuid].append((
-                str(material_code),
-                row.material_name or "",
-                float(row.bom_num or 0),
-                (row.bom_unit or "").strip() or "-",
-                float(row.conversion_rate or 1),
-                float(row.material_bq_price or 0),
-            ))
+        boms[store_num][item_uuid].append((
+            str(material_code),
+            row.material_name or "",
+            float(row.bom_num or 0),
+            (row.bom_unit or "").strip() or "-",
+            float(row.conversion_rate or 1),
+            float(row.material_bq_price or 0),
+        ))
 
     set_cache(key, boms)
     total_items = sum(len(v) for v in boms.values())
@@ -560,7 +570,7 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
         store_boms = bom_data.get(store_num, {})
 
         if mode == "combo":
-            # 套餐：获取子产品，合并它们的 BOM
+            # 套餐：合并所有子产品的 BOM。同一物料被多个子商品共用时累加 num/cost。
             store_struct = combo_structure.get(store_num, {})
             child_uuids = store_struct.get(item_uuid, [])
             for child_uuid in child_uuids:
@@ -568,14 +578,23 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
                 for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in child_bom:
                     if not material_code:
                         continue
-                    if material_code not in val["bom"]:
-                        base_price = _resolve_base_unit_price(material_code, bq_price, erp_prices)
-                        # 把基准单位价换算到配方单位价（ttpos rm.unit_name 维度）
-                        unit_price = base_price * (conv_rate or 1)
-                        cost_per_unit = bom_num * unit_price
-                        val["bom"][material_code] = (material_name, bom_num, unit_price, bom_unit, cost_per_unit)
+                    base_price = _resolve_base_unit_price(material_code, bq_price, erp_prices)
+                    unit_price = base_price * (conv_rate or 1)
+                    delta_cost = bom_num * unit_price
+                    if material_code in val["bom"]:
+                        prev_name, prev_num, prev_up, prev_unit, prev_cost = val["bom"][material_code]
+                        val["bom"][material_code] = (
+                            prev_name or material_name,
+                            prev_num + bom_num,
+                            unit_price,                  # 同物料同单位价不变
+                            prev_unit or bom_unit,
+                            prev_cost + delta_cost,
+                        )
+                    else:
+                        val["bom"][material_code] = (material_name, bom_num, unit_price, bom_unit, delta_cost)
         else:
-            # 单品：直接匹配 BOM
+            # 单品：直接匹配 BOM。同一商品多个 product_bom（不同 flavor/sauce 但共用 bom_card）
+            # 会重复返回相同 material_code，按 dedup 处理（避免 N 倍虚增）。
             item_bom = store_boms.get(item_uuid, [])
             for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in item_bom:
                 if not material_code:
