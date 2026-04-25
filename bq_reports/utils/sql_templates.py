@@ -119,13 +119,16 @@ takeout_consumption AS (
     AND tko.completed_time < {end_ts}
   GROUP BY m.uuid
 )
-SELECT 
+SELECT
+  c.name AS store_name,
   pc.material_uuid,
   COALESCE(pc.name_zh, pc.name_en, pc.name_th, '未知') AS material_name,
   ROUND(pc.num + IFNULL(tc.num, 0), 2) AS total_num,
   pc.unit_name
 FROM pos_consumption pc
 LEFT JOIN takeout_consumption tc ON tc.material_uuid = pc.material_uuid
+CROSS JOIN `{project}.{dataset}.ttpos_company` c
+WHERE c.delete_time = 0
 ORDER BY total_num DESC
 """
 
