@@ -634,7 +634,7 @@ class ReportExporter(MultiShopExporter):
                 return account, None
             row = rows[0]
             return account, {
-                "账号": account,
+                "门店编号": row.store_code or "",
                 "门店名称": row.store_name or "",
                 "总营业额": float(row.total_turnover or 0),
                 "实收金额": float(row.total_received or 0),
@@ -647,7 +647,7 @@ class ReportExporter(MultiShopExporter):
                                           start_ts=start_ts, end_ts=end_ts)
             rows = list(self.client.query(sql).result())
             return account, [{
-                "账号": account,
+                "门店编号": row.store_code or "",
                 "门店名称": row.store_name or "",
                 "原料名称": row.material_name or "",
                 "消耗量": float(row.total_num or 0),
@@ -715,13 +715,27 @@ class ReportExporter(MultiShopExporter):
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # 并发查询导致 results 是 as_completed 顺序，需要按门店编号排序
+        # 物品消耗 / BOM 销量在同一门店内按销量降序（更易看 top 物料/商品）
+        def _store_key(rec):
+            code = rec.get("门店编号", "")
+            try:
+                return (0, int(code))   # 数字类编号正常排序
+            except (TypeError, ValueError):
+                return (1, str(code))   # 非数字（admin-xxx 之类）排在后面
+
+        sales_results.sort(key=_store_key)
+        consumption_results.sort(key=lambda r: (_store_key(r), -float(r.get("消耗量", 0) or 0)))
+        bom_yes_results.sort(key=lambda r: (_store_key(r), -float(r.get("销量", 0) or 0)))
+        bom_no_results.sort(key=lambda r: (_store_key(r), -float(r.get("销量", 0) or 0)))
+
         import xlsxwriter
         wb = xlsxwriter.Workbook(str(output_path))
         try:
             self._write_data_sheet_xw(wb, "销售业绩", sales_results,
-                ["账号", "门店名称", "总营业额", "实收金额", "订单数"])
+                ["门店编号", "门店名称", "总营业额", "实收金额", "订单数"])
             self._write_data_sheet_xw(wb, "物品消耗", consumption_results,
-                ["账号", "门店名称", "原料名称", "消耗量", "单位"])
+                ["门店编号", "门店名称", "原料名称", "消耗量", "单位"])
             self._write_data_sheet_xw(wb, "已设置bom商品销量", bom_yes_results,
                 ["门店编号", "门店名称", "商品名称", "销量"])
             self._write_data_sheet_xw(wb, "未设置bom商品销量", bom_no_results,

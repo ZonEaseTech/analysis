@@ -753,13 +753,17 @@ def _build_rows(agg_data, mode, fallback_boms=None, erp_prices=None):
                 store_num, store_name, item_name,
                 round(qty, 2), item_unit_price, round(revenue, 2),
                 "-", "-", 0, 0, "-", 0,
-                0, 0, 0,
+                0,                          # 12 单份总成本
+                round(item_unit_price, 2),  # 13 单品毛利 = 单价 - 0
+                round(revenue, 2),          # 14 总毛利 = 销售额 - 0
+                1.0 if revenue > 0 else 0,  # 15 毛利率
             ])
             continue
 
         per_unit_bom_cost = sum(cost for _, _, _, _, _, cost in bom_list)
-        total_bom_cost = per_unit_bom_cost * qty
-        gross_profit = revenue - total_bom_cost
+        unit_profit = item_unit_price - per_unit_bom_cost   # 单品毛利
+        # 总毛利按 market 要求 = 销量 × 单品毛利（不再用 F - M*D）
+        gross_profit = qty * unit_profit
         gross_margin = gross_profit / revenue if revenue > 0 else 0
 
         for code, name, bom_num, mat_price, uom, cost in bom_list:
@@ -767,7 +771,10 @@ def _build_rows(agg_data, mode, fallback_boms=None, erp_prices=None):
                 store_num, store_name, item_name,
                 round(qty, 2), item_unit_price, round(revenue, 2),
                 name, code, round(mat_price, 4), round(bom_num, 4), uom or "-", round(cost * qty, 2),
-                round(per_unit_bom_cost, 2), round(gross_profit, 2), round(gross_margin, 4),
+                round(per_unit_bom_cost, 2),
+                round(unit_profit, 2),         # 13 单品毛利
+                round(gross_profit, 2),        # 14 总毛利（原毛利）
+                round(gross_margin, 4),        # 15 毛利率
             ])
 
     return rows
@@ -925,10 +932,14 @@ def main():
         sheet_cfg = engine.load_sheet_config(args.column_config, item_label)
         engine.write_sheet(wb, item_label, sheet_cfg, flat_rows)
 
-        negative_count = sum(1 for r in flat_rows if r[13] is not None and r[13] < 0)
+        # field 13 = 单品毛利, field 14 = 总毛利
+        neg_unit = sum(1 for r in flat_rows if r[13] is not None and r[13] < 0)
+        neg_total = sum(1 for r in flat_rows if r[14] is not None and r[14] < 0)
         print(f"\n[{item_label}] 总明细行数: {len(flat_rows)} 行")
-        if negative_count > 0:
-            print(f"[{item_label}] 负毛利率: {negative_count} 行")
+        if neg_unit > 0:
+            print(f"[{item_label}] 单品毛利<0: {neg_unit} 行（标价 < 单份成本，赔本商品）")
+        if neg_total > 0:
+            print(f"[{item_label}] 总毛利<0: {neg_total} 行（实收 < 总成本，含折扣损失）")
 
     wb.close()
     print(f"\n输出文件: {output_path}")

@@ -78,6 +78,11 @@ takeout_sales AS (
     AND completed_time >= {start_ts} AND completed_time < {end_ts}
 )
 SELECT
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_code')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0
+     LIMIT 1), '') AS store_code,
   c.name AS store_name,
   IFNULL(ps.turnover, 0) + IFNULL(ts.turnover, 0) AS total_turnover,
   IFNULL(ps.received, 0) + IFNULL(ts.received, 0) AS total_received,
@@ -135,6 +140,11 @@ takeout_consumption AS (
   GROUP BY m.uuid
 )
 SELECT
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_code')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0
+     LIMIT 1), '') AS store_code,
   c.name AS store_name,
   pc.material_uuid,
   COALESCE(pc.name_zh, pc.name_en, pc.name_th, '未知') AS material_name,
@@ -241,19 +251,27 @@ product_sales AS (
     AND sop.product_type IN (0, 2)
 )
 SELECT
-  IFNULL(JSON_EXTRACT_SCALAR(st.`values`, '$.store_code'), '') AS store_code,
-  IFNULL(JSON_EXTRACT_SCALAR(st.`values`, '$.store_name'), c.name) AS store_name,
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_code')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0
+     LIMIT 1),
+    ''
+  ) AS store_code,
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_name')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0
+     LIMIT 1),
+    (SELECT name FROM `{project}.{dataset}.ttpos_company` WHERE delete_time = 0 LIMIT 1)
+  ) AS store_name,
   ps.product_package_uuid,
   COALESCE(ps.product_name_zh, ps.product_name_en, ps.product_name_th, '未知') AS product_name,
   ROUND(SUM(ps.qty), 2) AS total_qty,
   ps.has_bom
 FROM product_sales ps
-CROSS JOIN `{project}.{dataset}.ttpos_company` c
-LEFT JOIN `{project}.{dataset}.ttpos_setting` st
-  ON st.`key` = 'store' AND st.delete_time = 0
-WHERE c.delete_time = 0
-GROUP BY store_code, store_name, ps.product_package_uuid,
-         ps.product_name_zh, ps.product_name_en, ps.product_name_th, ps.has_bom
+GROUP BY ps.product_package_uuid, ps.product_name_zh, ps.product_name_en,
+         ps.product_name_th, ps.has_bom
 HAVING total_qty > 0
 ORDER BY has_bom DESC, total_qty DESC
 """
