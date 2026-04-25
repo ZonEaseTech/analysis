@@ -847,9 +847,8 @@ def main():
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    from openpyxl import Workbook
-    wb = Workbook()
-    wb.remove(wb.active)
+    import xlsxwriter
+    wb = xlsxwriter.Workbook(str(output_path))
 
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
@@ -881,15 +880,14 @@ def main():
 
         # 加载列配置并写入 Excel
         sheet_cfg = engine.load_sheet_config(args.column_config, item_label)
-        ws = wb.create_sheet(title=item_label)
-        engine.write_sheet(ws, sheet_cfg, flat_rows)
+        engine.write_sheet(wb, item_label, sheet_cfg, flat_rows)
 
         negative_count = sum(1 for r in flat_rows if r[13] is not None and r[13] < 0)
         print(f"\n[{item_label}] 总明细行数: {len(flat_rows)} 行")
         if negative_count > 0:
             print(f"[{item_label}] 负毛利率: {negative_count} 行")
 
-    wb.save(output_path)
+    wb.close()
     print(f"\n输出文件: {output_path}")
     return 0
 
