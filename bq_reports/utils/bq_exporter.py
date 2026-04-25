@@ -617,8 +617,12 @@ class ReportExporter(MultiShopExporter):
         
         sales_sql = get_template('comprehensive_sales')
         consumption_sql = get_template('material_consumption')
+        bom_sales_sql = get_template('bom_product_sales')
 
-        # 并发查询：53 门店 × 2 查询，串行 BQ 调用太慢
+        bom_yes_results = []  # 已设置 BOM 的商品销量
+        bom_no_results = []   # 未设置 BOM 的商品销量
+
+        # 并发查询：53 门店 × 3 查询，串行 BQ 调用太慢
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         def _query_sales(account, uuid_str):
@@ -650,11 +654,36 @@ class ReportExporter(MultiShopExporter):
                 "单位": row.unit_name or "",
             } for row in rows]
 
+        def _query_bom_sales(account, uuid_str):
+            dataset = f"shop{uuid_str}"
+            sql = bom_sales_sql.format(project=self.project_id, dataset=dataset,
+                                        start_ts=start_ts, end_ts=end_ts)
+            rows = list(self.client.query(sql).result())
+            yes_rows, no_rows = [], []
+            for row in rows:
+                rec = {
+                    "门店编号": row.store_code or "",
+                    "门店名称": row.store_name or "",
+                    "商品名称": row.product_name or "",
+                    "销量": float(row.total_qty or 0),
+                }
+                (yes_rows if row.has_bom == 1 else no_rows).append(rec)
+            return account, yes_rows, no_rows
+
         with ThreadPoolExecutor(max_workers=10) as ex:
             sales_futures = {
                 ex.submit(_query_sales, account, uuid_str): account
                 for account, uuid_str in self.merchants
             }
+            consumption_futures = {
+                ex.submit(_query_consumption, account, uuid_str): account
+                for account, uuid_str in self.merchants
+            }
+            bom_futures = {
+                ex.submit(_query_bom_sales, account, uuid_str): account
+                for account, uuid_str in self.merchants
+            }
+
             for fut in as_completed(sales_futures):
                 account = sales_futures[fut]
                 try:
@@ -664,10 +693,6 @@ class ReportExporter(MultiShopExporter):
                 except Exception as e:
                     errors.append({"account": account, "type": "sales", "error": str(e)})
 
-            consumption_futures = {
-                ex.submit(_query_consumption, account, uuid_str): account
-                for account, uuid_str in self.merchants
-            }
             for fut in as_completed(consumption_futures):
                 account = consumption_futures[fut]
                 try:
@@ -675,6 +700,15 @@ class ReportExporter(MultiShopExporter):
                     consumption_results.extend(items)
                 except Exception as e:
                     errors.append({"account": account, "type": "consumption", "error": str(e)})
+
+            for fut in as_completed(bom_futures):
+                account = bom_futures[fut]
+                try:
+                    _, yes_rows, no_rows = fut.result()
+                    bom_yes_results.extend(yes_rows)
+                    bom_no_results.extend(no_rows)
+                except Exception as e:
+                    errors.append({"account": account, "type": "bom_sales", "error": str(e)})
         
         # 写入 Excel（双 sheet）
         output_path = output_path or self.output_path
@@ -687,11 +721,19 @@ class ReportExporter(MultiShopExporter):
         ws1 = wb.active
         ws1.title = "销售业绩"
         self._write_data_to_sheet(ws1, sales_results, ["账号", "门店名称", "总营业额", "实收金额", "订单数"])
-        
+
         # Sheet 2: 物品消耗
         ws2 = wb.create_sheet(title="物品消耗")
         self._write_data_to_sheet(ws2, consumption_results, ["账号", "门店名称", "原料名称", "消耗量", "单位"])
-        
+
+        # Sheet 3: 已设置BOM 商品销量
+        ws3 = wb.create_sheet(title="已设置bom商品销量")
+        self._write_data_to_sheet(ws3, bom_yes_results, ["门店编号", "门店名称", "商品名称", "销量"])
+
+        # Sheet 4: 未设置BOM 商品销量
+        ws4 = wb.create_sheet(title="未设置bom商品销量")
+        self._write_data_to_sheet(ws4, bom_no_results, ["门店编号", "门店名称", "商品名称", "销量"])
+
         wb.save(output_path)
         
         return ExportResult(

@@ -225,13 +225,20 @@ product_sales AS (
     AND sb.finish_time < {end_ts}
     AND sop.product_type IN (0, 2)
 )
-SELECT 
-  product_package_uuid,
-  COALESCE(product_name_zh, product_name_en, product_name_th, '未知') AS product_name,
-  ROUND(SUM(qty), 2) AS total_qty,
-  has_bom
-FROM product_sales
-GROUP BY product_package_uuid, product_name_zh, product_name_en, product_name_th, has_bom
+SELECT
+  IFNULL(JSON_EXTRACT_SCALAR(st.`values`, '$.store_code'), '') AS store_code,
+  IFNULL(JSON_EXTRACT_SCALAR(st.`values`, '$.store_name'), c.name) AS store_name,
+  ps.product_package_uuid,
+  COALESCE(ps.product_name_zh, ps.product_name_en, ps.product_name_th, '未知') AS product_name,
+  ROUND(SUM(ps.qty), 2) AS total_qty,
+  ps.has_bom
+FROM product_sales ps
+CROSS JOIN `{project}.{dataset}.ttpos_company` c
+LEFT JOIN `{project}.{dataset}.ttpos_setting` st
+  ON st.`key` = 'store' AND st.delete_time = 0
+WHERE c.delete_time = 0
+GROUP BY store_code, store_name, ps.product_package_uuid,
+         ps.product_name_zh, ps.product_name_en, ps.product_name_th, ps.has_bom
 HAVING total_qty > 0
 ORDER BY has_bom DESC, total_qty DESC
 """
