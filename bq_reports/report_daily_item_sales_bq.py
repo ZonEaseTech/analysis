@@ -56,8 +56,11 @@ def log(msg: str):
 
 
 def setup_proxy():
+    proxy_url = os.environ.get("BQ_PROXY")
+    if not proxy_url:
+        return
     for k in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
-        os.environ[k] = "http://127.0.0.1:7897"
+        os.environ[k] = proxy_url
 
 
 def get_creds():

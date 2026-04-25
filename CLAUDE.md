@@ -70,5 +70,11 @@ def aggregate(raw_rows):
 
 ### 5. 代理设置
 
-所有脚本已内置代理：`http://127.0.0.1:7897`
-不需要额外设置环境变量。
+默认不设代理（当前机器在海外，直连 BigQuery / ERPNext）。
+如需代理，设置 `BQ_PROXY` 环境变量：
+
+```bash
+BQ_PROXY=http://127.0.0.1:7897 venv/bin/python -m bq_reports.profit_margin_report ...
+```
+
+`bq_client.setup_proxy()` 和各报表脚本里的同名函数都会读 `BQ_PROXY`，未设置时为 no-op。

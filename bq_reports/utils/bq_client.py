@@ -19,12 +19,16 @@ PROJECT_ID = "diyl-407103"
 
 
 def setup_proxy():
-    """设置代理环境变量"""
-    proxy_url = "http://127.0.0.1:7897"
-    os.environ["HTTP_PROXY"] = proxy_url
-    os.environ["HTTPS_PROXY"] = proxy_url
-    os.environ["http_proxy"] = proxy_url
-    os.environ["https_proxy"] = proxy_url
+    """按需设置代理环境变量。
+
+    默认不设置任何代理（海外机器直连）。仅当环境变量 BQ_PROXY 存在时才应用。
+    例如: BQ_PROXY=http://127.0.0.1:7897 venv/bin/python ...
+    """
+    proxy_url = os.environ.get("BQ_PROXY")
+    if not proxy_url:
+        return
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        os.environ[k] = proxy_url
 
 
 def get_gcloud_credentials():

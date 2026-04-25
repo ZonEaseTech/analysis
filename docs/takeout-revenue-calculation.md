@@ -5,16 +5,26 @@
 | 版本 | 日期 | 修改内容 | 作者 |
 |------|------|----------|------|
 | 1.0 | 2026-04-10 | 初始版本，基于 bash 脚本 payment.sh 和 BQ 查询验证 | - |
+| 2.0 | 2026-04-25 | 收窄口径：仅按支付方式判定，与 payment.sh 完全一致；删除条件 2/3（dining_method / bill_type / order_source） | - |
 
 ---
 
-## 概述
+## 当前口径（v2.0，2026-04-25 起生效）
 
-本文档定义华莱士门店**外卖营业额**的统计口径，用于统一报表计算逻辑。
+外卖订单判定为**唯一条件**：账单存在已支付记录、且支付方式名匹配 `robinhood|grab|lineman|shopee`。
+
+外卖营业额 = `SUM(IF(is_takeout, sb.amount, 0))` + `takeout_order` 平台 subtotal
+外卖实收  = `SUM(IF(is_takeout, sb.payment_amount, 0))` + `takeout_order` 平台 platform_total
+
+平台侧（`takeout_order`）：`platform IN ('grab','lineman','shopee')` 且 `order_state = 40`。
+
+> **为什么收窄**：旧口径把 `dining_method=1`（堂食打包带走）/`bill_type=2`/`order_source_uuid>0` 都判为外卖，导致外卖营业额每店虚高 20 万~60 万。客户实际定义的"外卖"等价于 payment.sh 里的窄口径——只看是不是 4 大外卖支付方式。
 
 ---
 
-## 外卖订单判定标准
+## 历史口径（v1.0，已废弃，仅供对账历史报表用）
+
+> ⚠️ 以下条件 2/3 在 v2.0 已删除。当时的输出比真实外卖虚高，遇到旧报表对账时按此处文字理解即可。
 
 外卖订单需**满足以下任一条件**（同一订单满足多个条件时去重）：
 

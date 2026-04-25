@@ -381,21 +381,18 @@ WHERE sop.delete_time = 0
 
 # ==================== 6. 外卖营业额相关 ====================
 
-# 外卖营业额统计（POS侧 + 外卖平台侧）
-# 外卖订单判定（满足任一即计入，同一账单只算一次）：
-#   条件1：该账单下任一销售订单存在已支付记录，且 payment_method_name 去空格、小写后匹配 robinhood|grab|lineman|shopee
-#   条件2：order_source_uuid>0 且（订单来源多语言名 或 order_source_name JSON 快照）含 Grab / LINE MAN（lineman、line man 等）
-#   条件3：bill_type=2（会员外送）或 order_source_uuid>0（外卖渠道）或 dining_method=1（打包/外带）
+# 外卖营业额统计（POS 侧 + 外卖平台侧）
+# 与 payment.sh 口径一致：
+#   - POS 侧：账单中至少有一笔已支付记录的支付方式名匹配 robinhood|grab|lineman|shopee
+#   - 平台侧：takeout_order 中 platform IN ('grab','lineman','shopee') 且 order_state=40
+# 注：旧版本曾把 dining_method=1（打包）/ bill_type=2 / order_source_uuid>0 都算外卖，
+#     会把堂食打包带走的订单虚增到外卖里。现已收窄到只看支付方式。
 TAKEOUT_REVENUE_SQL = """
 WITH finished_bills AS (
   SELECT
     sb.uuid AS bill_uuid,
     sb.amount AS bill_amount,
-    sb.payment_amount AS bill_payment_amount,
-    sb.bill_type,
-    sb.dining_method,
-    sb.order_source_uuid,
-    sb.order_source_name
+    sb.payment_amount AS bill_payment_amount
   FROM `{project}`.`{dataset}`.`ttpos_sale_bill` AS sb
   WHERE sb.delete_time = 0
     AND sb.status = 1
@@ -406,60 +403,20 @@ WITH finished_bills AS (
 bill_takeout AS (
   SELECT
     fb.bill_uuid,
-    (
-      -- 条件1：支付方式
-      EXISTS (
-        SELECT 1
-        FROM `{project}`.`{dataset}`.`ttpos_payment_order` AS po
-        INNER JOIN `{project}`.`{dataset}`.`ttpos_sale_order` AS so
-          ON so.uuid = po.related_uuid
-          AND po.related_type = 0
-          AND so.delete_time = 0
-        WHERE so.sale_bill_uuid = fb.bill_uuid
-          AND po.delete_time = 0
-          AND po.status = 1
-          AND REGEXP_CONTAINS(
-            LOWER(REPLACE(po.payment_method_name, ' ', '')),
-            r'robinhood|grab|lineman|shopee'
-          )
-      )
-      -- 条件2：Grab / LINE MAN 渠道（名称匹配，不区分大小写；空格已压缩）
-      OR (
-        fb.order_source_uuid > 0
-        AND (
-          EXISTS (
-            SELECT 1
-            FROM `{project}`.`{dataset}`.`ttpos_order_source` AS os
-            LEFT JOIN `{project}`.`{dataset}`.`ttpos_multi_language_name` AS mln
-              ON mln.uuid = os.multi_language_name_uuid
-              AND mln.delete_time = 0
-            WHERE os.uuid = fb.order_source_uuid
-              AND os.delete_time = 0
-              AND (
-                REGEXP_CONTAINS(
-                  LOWER(REPLACE(CONCAT(
-                    IFNULL(mln.zh_name, ''),
-                    IFNULL(mln.th_name, ''),
-                    IFNULL(mln.en_name, '')
-                  ), ' ', '')),
-                  r'grab|lineman'
-                )
-              )
-          )
-          OR REGEXP_CONTAINS(
-            LOWER(REPLACE(CONCAT(
-              IFNULL(JSON_EXTRACT_SCALAR(fb.order_source_name, '$.zh'), ''),
-              IFNULL(JSON_EXTRACT_SCALAR(fb.order_source_name, '$.th'), ''),
-              IFNULL(JSON_EXTRACT_SCALAR(fb.order_source_name, '$.en'), '')
-            ), ' ', '')),
-            r'grab|lineman'
-          )
+    EXISTS (
+      SELECT 1
+      FROM `{project}`.`{dataset}`.`ttpos_payment_order` AS po
+      INNER JOIN `{project}`.`{dataset}`.`ttpos_sale_order` AS so
+        ON so.uuid = po.related_uuid
+        AND po.related_type = 0
+        AND so.delete_time = 0
+      WHERE so.sale_bill_uuid = fb.bill_uuid
+        AND po.delete_time = 0
+        AND po.status = 1
+        AND REGEXP_CONTAINS(
+          LOWER(REPLACE(IFNULL(po.payment_method_name, ''), ' ', '')),
+          r'robinhood|grab|lineman|shopee'
         )
-      )
-      -- 条件3：外卖/外送/打包
-      OR fb.bill_type = 2
-      OR fb.order_source_uuid > 0
-      OR fb.dining_method = 1
     ) AS is_takeout
   FROM finished_bills AS fb
 ),
