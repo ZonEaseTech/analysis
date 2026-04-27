@@ -17,6 +17,9 @@ import re
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+
+# 跟 ttpos 业务时区对齐（曼谷 +07:00），月份边界以 BKK 时间为准
+BKK_TZ = timezone(timedelta(hours=7))
 from pathlib import Path
 
 from bq_reports.utils.bq_client import setup_proxy
@@ -105,7 +108,8 @@ def _load_fallback_boms(config: dict = None):
     if not bom_config:
         return {}
 
-    key = cache_key("fallback_boms", {"path": bom_config.get("path", "")})
+    # v2: 应用市场 BOM 替换/删除规则
+    key = cache_key("fallback_boms_v2", {"path": bom_config.get("path", "")})
     cached = get_cache(key, ttl_seconds=cache_ttl)
     if cached is not None:
         print(f"[Fallback BOM] 缓存命中: {len(cached)} 个商品")
@@ -149,6 +153,19 @@ def _load_fallback_boms(config: dict = None):
                     num_val,
                     std_uom,
                 ))
+
+        # 对 fallback BOM 应用相同的替换/删除规则（统一口径）
+        fb_drop = 0
+        fb_replace = 0
+        for product_name, recs in list(boms.items()):
+            wrapped = [(c, n, num, u, 1.0, 0.0) for c, n, num, u in recs]
+            new_wrapped = _apply_bom_overrides(wrapped)
+            old_codes = {r[0] for r in recs}
+            fb_drop += len(old_codes & BOM_DROP_CODES)
+            fb_replace += len(old_codes & set(BOM_REPLACEMENTS.keys()))
+            boms[product_name] = [(c, n, num, u) for c, n, num, u, _, _ in new_wrapped]
+        if fb_drop or fb_replace:
+            print(f"[Fallback BOM] 市场规则: 替换 {fb_replace} 处, 删除 {fb_drop} 处")
 
         set_cache(key, boms)
         print(f"[Fallback BOM] 加载 {len(boms)} 个商品的补充 BOM")
@@ -323,122 +340,96 @@ def _load_merchants(config: dict, store_names: dict, override_path: str = None,
 # SQL 模板（聚合优化版）
 # ============================================================================
 
-# 套餐订单聚合（BQ 内完成，只返回产品级汇总）
-# std_unit_price: 按销量加权的"商品标准售价"（来自 ttpos_product_bom.price）
-# 退款扣减：按 ttpos_return_order_product 商品级退款（rop.num 数量、product_total_amount 金额）
-# 时间口径：按原销售单 finish_time 在窗口内（refund 跨期也算这次销售的扣减）
-COMBO_ORDERS_SQL = """
-WITH gross AS (
+# 套餐 / 单品订单聚合 — 按 ttpos `CountProductSale` 算法（statistics_product + takeout_order_item）
+#
+# ttpos 源码: ttpos-server-go/main/app/repository/statistics.go:1933-2143 (CountProductSale)
+#
+# Shop (statistics_product):
+#   sale_num   = SUM(product_num)
+#   sale_amount(actual) = SUM(IF(free_num>0 OR give_num>0, 0,
+#                  product_final_price * (product_num - refund_num)))
+# Takeout (takeout_order_item + takeout_order):
+#   sale_num   = SUM(quantity)
+#   sale_amount(actual) = SUM(IF(order_state=60, 0, price * quantity))
+#   order_state IN (10,20,30,40,60), accepted_time > 0
+# 合并：按 product_package_uuid FULL OUTER JOIN
+#
+# 注意:
+#   1. ttpos 不展开 套餐子商品（无 copy_num × unit_num 乘子）— 跟我们之前实现差异大
+#   2. cancelled (state=60) 订单 sale_num 计入但 amount 计 0（ttpos 设计，争议）
+#   3. 赠品 (free_num/give_num) amount 直接归零
+#   4. shop 端退款通过 (product_num - refund_num) 反映
+#   5. std_unit_price 保留我们的算法（按销量加权 product_bom.price），ttpos 没有这个概念
+
+_PROFIT_SALES_TPL = """
+WITH
+shop_sales AS (
+  -- ttpos 源码: ttpos-server-go/main/app/repository/statistics.go:1980-2046 (CountProductSale - ExportProductSales 接口真实算法)
+  --   GET /statistics/product_sales/export 路由 → service/business.go:845 ExportProductSales
+  -- 注意: 不能用 RankProduct (statistics.go:1245) 的 refund_time=0 过滤 —— 那是 top10 排行，跟导出算法不一样
+  --   actual_sale_amount = SUM(IF(free|give, 0, final_price * (num - refund_num)))
+  --   时间字段: buildCountOpts 默认走 complete_time
   SELECT
-    sop.product_package_uuid AS item_uuid,
-    JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS item_name,
-    SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)) AS gross_qty,
-    SUM(sop.total_price) AS gross_revenue,
-    SAFE_DIVIDE(
-      SUM(pb.price * sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)),
-      SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num))
-    ) AS std_unit_price
-  FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
-  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
-    ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
-  JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
-    ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
-  LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_bom` pb
-    ON pb.product_package_uuid = sop.product_package_uuid
-    AND IFNULL(pb.erp_code, '') = IFNULL(sop.erp_code, '')
-    AND pb.delete_time = 0
-  WHERE sop.delete_time = 0
-    AND sop.cancel_time = 0
-    AND sop.status = 1
-    AND sb.status = 1
-    AND sb.finish_time >= {start_ts}
-    AND sb.finish_time < {end_ts}
-    AND sop.product_type = 1
-  GROUP BY item_uuid, item_name
-),
-refunds AS (
-  SELECT
-    rop.product_package_uuid AS item_uuid,
-    SUM(rop.num) AS refund_qty,
-    SUM(rop.product_total_amount) AS refund_amount
-  FROM `{project}`.`{dataset}`.`ttpos_return_order_product` rop
-  JOIN `{project}`.`{dataset}`.`ttpos_sale_order_product` orig_sop
-    ON orig_sop.uuid = rop.sale_order_product_uuid AND orig_sop.delete_time = 0
-  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` orig_sb
-    ON orig_sb.uuid = orig_sop.sale_bill_uuid AND orig_sb.delete_time = 0
-  WHERE rop.delete_time = 0
-    AND rop.product_type = 1
-    AND orig_sb.status = 1
-    AND orig_sb.finish_time >= {start_ts}
-    AND orig_sb.finish_time < {end_ts}
+    sp.product_package_uuid AS item_uuid,
+    SUM(sp.product_num) AS qty,
+    SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,
+           sp.product_final_price * (sp.product_num - sp.refund_num))) AS revenue
+  FROM `{project}`.`{dataset}`.`ttpos_statistics_product` sp
+  WHERE sp.complete_time >= {start_ts}
+    AND sp.complete_time < {end_ts}
   GROUP BY item_uuid
+),
+takeout_sales AS (
+  -- ttpos 源码: ttpos-server-go/main/app/repository/statistics_takeout.go:451-502 (RankTakeoutProduct)
+  -- 时间过滤是 dynamic time condition: state=40 用 completed_time, 其他用 accepted_time
+  -- 营业额只算 state IN (10,20,30,40)，state=60 取消订单计 0
+  SELECT
+    toi.ttpos_product_package_uuid AS item_uuid,
+    SUM(toi.quantity) AS qty,
+    SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) AS revenue
+  FROM `{project}`.`{dataset}`.`ttpos_takeout_order_item` toi
+  JOIN `{project}`.`{dataset}`.`ttpos_takeout_order` t
+    ON t.uuid = toi.takeout_order_uuid AND t.delete_time = 0
+  WHERE toi.delete_time = 0
+    AND toi.ttpos_product_package_uuid > 0
+    AND t.order_state IN (10, 20, 30, 40, 60)
+    AND t.accepted_time > 0
+    AND (
+      (t.order_state = 40 AND t.completed_time >= {start_ts} AND t.completed_time < {end_ts})
+      OR (t.order_state != 40 AND t.accepted_time >= {start_ts} AND t.accepted_time < {end_ts})
+    )
+  GROUP BY item_uuid
+),
+merged AS (
+  SELECT
+    COALESCE(s.item_uuid, t.item_uuid) AS item_uuid,
+    IFNULL(s.qty, 0) + IFNULL(t.qty, 0) AS qty,
+    IFNULL(s.revenue, 0) + IFNULL(t.revenue, 0) AS revenue
+  FROM shop_sales s
+  FULL OUTER JOIN takeout_sales t USING (item_uuid)
 )
 SELECT
-  g.item_uuid,
-  g.item_name,
-  g.gross_qty - IFNULL(r.refund_qty, 0) AS qty,
-  g.gross_revenue - IFNULL(r.refund_amount, 0) AS revenue,
-  g.std_unit_price
-FROM gross g
-LEFT JOIN refunds r ON r.item_uuid = g.item_uuid
+  m.item_uuid,
+  COALESCE(
+    JSON_EXTRACT_SCALAR(pp.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(pp.name, '$.en'),
+    '未知'
+  ) AS item_name,
+  m.qty AS qty,
+  m.revenue AS revenue,
+  -- 单价取 Shop 商品管理标价 ttpos_product_package.price
+  IFNULL(pp.price, 0) AS list_price
+FROM merged m
+-- ttpos 导出用 LEFT JOIN，不过滤 pp.delete_time（已删除的商品也算销售）
+-- 但本报表必须按 product_type 区分套餐/单品 sheet，所以仍 INNER JOIN，去掉 delete_time 过滤
+JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
+  ON pp.uuid = m.item_uuid
+WHERE pp.product_type = {product_type}
+  AND m.qty > 0
 """
 
-# 单品订单聚合（同样扣减商品级退款，rop.product_type = 0）
-SINGLE_ORDERS_SQL = """
-WITH gross AS (
-  SELECT
-    sop.product_package_uuid AS item_uuid,
-    JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS item_name,
-    SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)) AS gross_qty,
-    SUM(sop.total_price) AS gross_revenue,
-    SAFE_DIVIDE(
-      SUM(pb.price * sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)),
-      SUM(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num))
-    ) AS std_unit_price
-  FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
-  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
-    ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
-  JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
-    ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
-  LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_bom` pb
-    ON pb.product_package_uuid = sop.product_package_uuid
-    AND IFNULL(pb.erp_code, '') = IFNULL(sop.erp_code, '')
-    AND pb.delete_time = 0
-  WHERE sop.delete_time = 0
-    AND sop.cancel_time = 0
-    AND sop.status = 1
-    AND sb.status = 1
-    AND sb.finish_time >= {start_ts}
-    AND sb.finish_time < {end_ts}
-    AND sop.product_type = 0
-  GROUP BY item_uuid, item_name
-),
-refunds AS (
-  SELECT
-    rop.product_package_uuid AS item_uuid,
-    SUM(rop.num) AS refund_qty,
-    SUM(rop.product_total_amount) AS refund_amount
-  FROM `{project}`.`{dataset}`.`ttpos_return_order_product` rop
-  JOIN `{project}`.`{dataset}`.`ttpos_sale_order_product` orig_sop
-    ON orig_sop.uuid = rop.sale_order_product_uuid AND orig_sop.delete_time = 0
-  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` orig_sb
-    ON orig_sb.uuid = orig_sop.sale_bill_uuid AND orig_sb.delete_time = 0
-  WHERE rop.delete_time = 0
-    AND rop.product_type = 0
-    AND orig_sb.status = 1
-    AND orig_sb.finish_time >= {start_ts}
-    AND orig_sb.finish_time < {end_ts}
-  GROUP BY item_uuid
-)
-SELECT
-  g.item_uuid,
-  g.item_name,
-  g.gross_qty - IFNULL(r.refund_qty, 0) AS qty,
-  g.gross_revenue - IFNULL(r.refund_amount, 0) AS revenue,
-  g.std_unit_price
-FROM gross g
-LEFT JOIN refunds r ON r.item_uuid = g.item_uuid
-"""
+COMBO_ORDERS_SQL = _PROFIT_SALES_TPL.replace("{product_type}", "1")
+SINGLE_ORDERS_SQL = _PROFIT_SALES_TPL.replace("{product_type}", "0")
 
 # 产品 BOM 结构（不关联订单表，纯产品级数据）
 # bom_unit / conversion_rate 来自 ttpos 配方录入，用于把 ERP 基准单位价换算到配方单位价
@@ -494,6 +485,54 @@ WHERE parent_sop.product_type = 1
 BOM_UNIT_CORRECTIONS = {
     "MK01018": 50,
 }
+
+# 市场要求的 BOM 物料替换/删除规则（套餐和单品都生效）
+# value 为 None 时保留旧 material_name；指定字符串时覆盖名称。
+BOM_REPLACEMENTS = {
+    "FR01008": ("FR02001", None),
+    "VE01001": ("MK01018", None),
+}
+BOM_DROP_CODES = {"TL99008"}
+
+
+def _apply_bom_overrides(bom_records):
+    """对单个 (store, item) 的 BOM 列表应用替换/删除规则。
+
+    record 元组顺序: (material_code, material_name, bom_num, bom_unit, conv_rate, bq_price)
+
+    两轮合并：先收录所有未被替换的物料（元数据权威），再把被替换的并入 —
+    若目标 code 已存在则只累加 bom_num，保留真实物料的 name/unit/conv/price。
+    """
+    merged = {}
+    deferred = []
+    for code, name, bom_num, bom_unit, conv_rate, bq_price in bom_records:
+        if code in BOM_DROP_CODES:
+            continue
+        if code in BOM_REPLACEMENTS:
+            new_code, new_name = BOM_REPLACEMENTS[code]
+            override_name = new_name if new_name is not None else name
+            deferred.append((new_code, override_name, bom_num, bom_unit, conv_rate, bq_price))
+            continue
+        if code in merged:
+            prev_name, prev_num, prev_unit, prev_conv, prev_price = merged[code]
+            merged[code] = (
+                prev_name or name,
+                prev_num + bom_num,
+                prev_unit or bom_unit,
+                prev_conv,
+                prev_price,
+            )
+        else:
+            merged[code] = (name, bom_num, bom_unit, conv_rate, bq_price)
+
+    for code, name, bom_num, bom_unit, conv_rate, bq_price in deferred:
+        if code in merged:
+            prev_name, prev_num, prev_unit, prev_conv, prev_price = merged[code]
+            merged[code] = (prev_name, prev_num + bom_num, prev_unit, prev_conv, prev_price)
+        else:
+            merged[code] = (name, bom_num, bom_unit, conv_rate, bq_price)
+
+    return [(c, n, bn, bu, cr, bp) for c, (n, bn, bu, cr, bp) in merged.items()]
 
 
 def _resolve_base_unit_price(material_code, bq_price, erp_prices):
@@ -573,7 +612,8 @@ def _load_boms(engine, merchants, config: dict = None):
     cache_ttl = cfg.get("cache", {}).get("bom_ttl", 86400)  # 1天
     # v2: 增加 bom_unit / conversion_rate 字段，旧缓存格式不兼容
     # v3: BOM 加载层去重 (store, item, material)，旧缓存有重复行
-    key = cache_key("boms_v3", {"count": len(merchants)})
+    # v4: 应用市场 BOM 替换/删除规则 (FR01008→FR02001, VE01001→MK01018, drop TL99008)
+    key = cache_key("boms_v4", {"count": len(merchants)})
     cached = get_cache(key, ttl_seconds=cache_ttl)
     if cached is not None:
         print(f"[BOM] 缓存命中: {len(cached)} 个门店")
@@ -621,6 +661,20 @@ def _load_boms(engine, merchants, config: dict = None):
             float(row.material_bq_price or 0),
         ))
 
+    # 应用市场 BOM 替换/删除规则
+    drop_count = 0
+    replace_count = 0
+    for store_num, items in boms.items():
+        for item_uuid, records in list(items.items()):
+            new_records = _apply_bom_overrides(records)
+            old_codes = {r[0] for r in records}
+            new_codes = {r[0] for r in new_records}
+            drop_count += len(old_codes & BOM_DROP_CODES)
+            replace_count += len(old_codes & set(BOM_REPLACEMENTS.keys()))
+            items[item_uuid] = new_records
+    if drop_count or replace_count:
+        print(f"[BOM] 市场规则: 替换 {replace_count} 处, 删除 {drop_count} 处")
+
     set_cache(key, boms)
     total_items = sum(len(v) for v in boms.values())
     print(f"[BOM] 加载 {len(boms)} 个门店，共 {total_items} 个产品的 BOM")
@@ -649,19 +703,18 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
         item_name = row.item_name
         qty = float(row.qty or 0)
         revenue = float(row.revenue or 0)
-        std_price = float(getattr(row, "std_unit_price", None) or 0)
+        list_price = float(getattr(row, "list_price", None) or 0)
 
         key = (store_num, store_name, item_uuid, item_name)
         if key not in data:
             data[key] = {
                 "qty": 0.0,
                 "revenue": 0.0,
-                "std_price_weighted": 0.0,  # SUM(std_price * qty)，最后再除一次
+                "list_price": list_price,  # ttpos_product_package.price，每个 item 唯一
                 "bom": {},
             }
         data[key]["qty"] += qty
         data[key]["revenue"] += revenue
-        data[key]["std_price_weighted"] += std_price * qty
 
     # 为每个 item 匹配 BOM
     for key, val in data.items():
@@ -707,11 +760,10 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
     # 转换为列表格式（与旧版兼容）
     result = {}
     for key, val in data.items():
-        std_unit_price = val["std_price_weighted"] / val["qty"] if val["qty"] > 0 else 0.0
         result[key] = {
             "qty": val["qty"],
             "revenue": val["revenue"],
-            "std_unit_price": std_unit_price,
+            "list_price": val["list_price"],
             "bom": [
                 (code, name, bom_num, price, uom, cost)
                 for code, (name, bom_num, price, uom, cost) in val["bom"].items()
@@ -733,8 +785,8 @@ def _build_rows(agg_data, mode, fallback_boms=None, erp_prices=None):
     for (store_num, store_name, item_uuid, item_name), data in sorted(agg_data.items()):
         qty = data["qty"]
         revenue = data["revenue"]
-        # 单价取 ttpos 商品标准售价（按销量加权，来自 ttpos_product_bom.price）
-        item_unit_price = round(data.get("std_unit_price", 0) or 0, 2)
+        # 单价取 Shop 商品管理标价 ttpos_product_package.price
+        item_unit_price = round(data.get("list_price", 0) or 0, 2)
         bom_list = data["bom"]
 
         # Fallback BOM 补充（fallback 数据按基准单位录入，conv_rate 视为 1）
@@ -825,15 +877,15 @@ def main():
 
     if args.month:
         year, mon = int(args.month[:4]), int(args.month[5:7])
-        start_dt = datetime(year, mon, 1, tzinfo=timezone.utc)
+        start_dt = datetime(year, mon, 1, tzinfo=BKK_TZ)
         if mon == 12:
-            end_dt = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+            end_dt = datetime(year + 1, 1, 1, tzinfo=BKK_TZ)
         else:
-            end_dt = datetime(year, mon + 1, 1, tzinfo=timezone.utc)
+            end_dt = datetime(year, mon + 1, 1, tzinfo=BKK_TZ)
         range_label = args.month.replace("-", "")
     elif args.start_date and args.end_date:
-        start_dt = datetime.strptime(args.start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        end_dt = datetime.strptime(args.end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+        start_dt = datetime.strptime(args.start_date, "%Y-%m-%d").replace(tzinfo=BKK_TZ)
+        end_dt = datetime.strptime(args.end_date, "%Y-%m-%d").replace(tzinfo=BKK_TZ) + timedelta(days=1)
         range_label = f"{args.start_date.replace('-', '')}_{args.end_date.replace('-', '')}"
     else:
         print("[错误] 必须指定 --month 或 --start-date + --end-date")
