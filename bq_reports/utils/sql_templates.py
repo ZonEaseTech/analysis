@@ -206,12 +206,13 @@ SELECT
     ''
   ) AS unit_name
 FROM consumption c
-JOIN `{project}.{dataset}.ttpos_material` m
-  ON m.uuid = c.material_uuid AND m.delete_time = 0
+-- 软删物料的历史消耗也要显示名字（BQ uuid 唯一，软删后只 1 行）
+LEFT JOIN `{project}.{dataset}.ttpos_material` m
+  ON m.uuid = c.material_uuid
 LEFT JOIN `{project}.{dataset}.ttpos_material_unit` mu
-  ON mu.material_uuid = m.uuid AND mu.is_default = 1 AND mu.delete_time = 0
+  ON mu.material_uuid = m.uuid AND mu.is_default = 1
 LEFT JOIN `{project}.{dataset}.ttpos_product_unit` pu
-  ON pu.uuid = mu.unit_uuid AND pu.delete_time = 0
+  ON pu.uuid = mu.unit_uuid
 ORDER BY total_num DESC
 """
 
@@ -361,12 +362,13 @@ SELECT
     ''
   ) AS unit_name
 FROM consumption c
-JOIN `{project}.{dataset}.ttpos_material` m
-  ON m.uuid = c.material_uuid AND m.delete_time = 0
+-- 软删物料的 BOM 推算也要显示名字（BQ uuid 唯一）
+LEFT JOIN `{project}.{dataset}.ttpos_material` m
+  ON m.uuid = c.material_uuid
 LEFT JOIN `{project}.{dataset}.ttpos_material_unit` mu
-  ON mu.material_uuid = m.uuid AND mu.is_default = 1 AND mu.delete_time = 0
+  ON mu.material_uuid = m.uuid AND mu.is_default = 1
 LEFT JOIN `{project}.{dataset}.ttpos_product_unit` pu
-  ON pu.uuid = mu.unit_uuid AND pu.delete_time = 0
+  ON pu.uuid = mu.unit_uuid
 WHERE c.total_num > 0
 ORDER BY total_num DESC
 """
@@ -560,14 +562,17 @@ SELECT
     ELSE IF(b.pb_uuid IS NOT NULL, 1, 0)
   END AS has_bom
 FROM merged m
+-- 名称 JOIN 不过滤 delete_time：软删商品的历史销售也要能正常显示名字
+-- (BQ uuid 唯一，软删后表里仍只有 1 行，不会重复)
 LEFT JOIN `{project}.{dataset}.ttpos_product_package` pp
-  ON pp.uuid = m.product_package_uuid AND pp.delete_time = 0
+  ON pp.uuid = m.product_package_uuid
 LEFT JOIN `{project}.{dataset}.ttpos_product_bom` pb
-  ON pb.uuid = m.product_bom_uuid AND pb.delete_time = 0
+  ON pb.uuid = m.product_bom_uuid
 LEFT JOIN `{project}.{dataset}.ttpos_product_flavor` pf
-  ON pf.uuid = pb.product_flavor_uuid AND pf.delete_time = 0
+  ON pf.uuid = pb.product_flavor_uuid
 LEFT JOIN `{project}.{dataset}.ttpos_product_sauce` ps
-  ON ps.uuid = pb.product_sauce_uuid AND ps.delete_time = 0
+  ON ps.uuid = pb.product_sauce_uuid
+-- has_bom 判定保留 delete_time=0：软删的 bom 算 "未设置 BOM"
 LEFT JOIN bom_set b
   ON b.pb_uuid = m.product_bom_uuid
 LEFT JOIN package_has_bom phb

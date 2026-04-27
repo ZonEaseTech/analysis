@@ -889,10 +889,15 @@ class ReportExporter(MultiShopExporter):
     @staticmethod
     def _build_bom_sales_rows(raw_rows: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
         """
-        商品销量后处理：
+        商品销量后处理：把按 (package_uuid, bom_uuid) 拆出的细行聚合到用户视角的"商品名"。
+
         - 同店 + 同 package_uuid 下若有多个 bom_uuid (规格行) → 显示 "包名(规格名)"
         - 否则只显示 "包名"
-        - 外卖部分（bom_uuid=0）规格名设为空，会显示纯包名
+        - 同店 + 同显示名 → **合并销量**（覆盖以下 3 种情况）：
+            (a) 同 package 的堂食(有 bom_uuid) + 外卖(bom_uuid=0)
+            (b) 商家重复创建同名 package（不同 uuid，软删/活跃混合）
+            (c) 同 package 同显示名的多个 bom_uuid（如规格名都是 "pc"）
+        - has_bom 判定：组内任意一行 has_bom=1 → 整组归到"已设置"
 
         返回 (已设置 BOM 行, 未设置 BOM 行)
         """
@@ -905,23 +910,32 @@ class ReportExporter(MultiShopExporter):
             if r["bom_uuid"] > 0:
                 spec_groups[(r["门店编号"], r["package_uuid"])].add(r["bom_uuid"])
 
-        yes_rows: List[Dict[str, Any]] = []
-        no_rows: List[Dict[str, Any]] = []
+        # 第一遍：算每行的显示名 + 聚合
+        # key: (店编号, 店名, 显示商品名) → {qty, has_bom}
+        agg: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         for r in raw_rows:
-            key = (r["门店编号"], r["package_uuid"])
-            multi_spec = len(spec_groups[key]) > 1
+            multi_spec = len(spec_groups[(r["门店编号"], r["package_uuid"])]) > 1
             spec = r["spec_name"]
             if multi_spec and spec:
                 name = f"{r['package_name']}({spec})"
             else:
                 name = r["package_name"]
+            key = (r["门店编号"], r["门店名称"], name)
+            cur = agg.setdefault(key, {"qty": 0.0, "has_bom": 0})
+            cur["qty"] += r["销量"]
+            if r["has_bom"] == 1:
+                cur["has_bom"] = 1
+
+        yes_rows: List[Dict[str, Any]] = []
+        no_rows: List[Dict[str, Any]] = []
+        for (code, store_name, name), v in agg.items():
             rec = {
-                "门店编号": r["门店编号"],
-                "门店名称": r["门店名称"],
+                "门店编号": code,
+                "门店名称": store_name,
                 "商品名称": name,
-                "销量": r["销量"],
+                "销量": v["qty"],
             }
-            (yes_rows if r["has_bom"] == 1 else no_rows).append(rec)
+            (yes_rows if v["has_bom"] == 1 else no_rows).append(rec)
         return yes_rows, no_rows
 
     def _write_data_sheet_xw(self, workbook, sheet_name: str,
