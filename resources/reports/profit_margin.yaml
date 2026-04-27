@@ -18,7 +18,7 @@
 
 sheets:
   套餐:
-    merge_key_indices: [0, 1, 2]   # 门店编号、门店名称、套餐名称相同则合并
+    merge_key_indices: [0, 1, 2, 16]   # 门店编号、门店名称、商品名称、隐藏 item_uuid（防同名不同 SKU 错合并）
     columns:
       - {name: "门店编号",    field_index: 0,  merge: true,  width: 10}
       - {name: "门店名称",    field_index: 1,  merge: true,  width: 30}
@@ -47,7 +47,7 @@ sheets:
           formula: "=IF(F{block_start}=0,0,O{block_start}/F{block_start})"}
 
   单品:
-    merge_key_indices: [0, 1, 2]
+    merge_key_indices: [0, 1, 2, 16]   # 门店编号、门店名称、商品名称、隐藏 item_uuid（防同名不同 SKU 错合并）
     columns:
       - {name: "门店编号",    field_index: 0,  merge: true,  width: 10}
       - {name: "门店名称",    field_index: 1,  merge: true,  width: 30}

@@ -410,11 +410,13 @@ merged AS (
 )
 SELECT
   m.item_uuid,
-  COALESCE(
+  -- 部分商品名末尾带回车/换行/制表符等不可见字符（前端 trim 显示无异，但 BQ 取出来会带）
+  -- 用 REGEXP_REPLACE 去掉首尾不可见字符，避免渲染成 _x000D_ 看似两个不同商品
+  REGEXP_REPLACE(COALESCE(
     JSON_EXTRACT_SCALAR(pp.name, '$.zh'),
     JSON_EXTRACT_SCALAR(pp.name, '$.en'),
     '未知'
-  ) AS item_name,
+  ), r'^\\s+|\\s+$', '') AS item_name,
   m.qty AS qty,
   m.revenue AS revenue,
   -- 单价取 Shop 商品管理标价 ttpos_product_package.price
@@ -797,7 +799,9 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
 def _build_rows(agg_data, mode, fallback_boms=None, erp_prices=None):
     """
     将聚合数据扁平化为引擎可消费的 list[list]。
-    每行 15 个元素，顺序与 YAML 配置中的 field_index 对应。
+    每行 15 个展示列 + 第 16 列隐藏 item_uuid（用作 merge_key，避免同名不同 uuid
+    被错合并 —— 例如「合艾炸鸡（中翅 8块）」¥79/¥99 两个 SKU 共名，
+    若不带 uuid 区分会被 ReportEngine block 检测合并掉，第二个 SKU 销量被吞）。
     """
     rows = []
     for (store_num, store_name, item_uuid, item_name), data in sorted(agg_data.items()):
@@ -827,6 +831,7 @@ def _build_rows(agg_data, mode, fallback_boms=None, erp_prices=None):
                 round(item_unit_price, 2),  # 13 单品毛利 = 单价 - 0
                 round(revenue, 2),          # 14 总毛利 = 销售额 - 0
                 1.0 if revenue > 0 else 0,  # 15 毛利率
+                str(item_uuid),             # 16 隐藏 merge_key
             ])
             continue
 
@@ -845,6 +850,7 @@ def _build_rows(agg_data, mode, fallback_boms=None, erp_prices=None):
                 round(unit_profit, 2),         # 13 单品毛利
                 round(gross_profit, 2),        # 14 总毛利（原毛利）
                 round(gross_margin, 4),        # 15 毛利率
+                str(item_uuid),                # 16 隐藏 merge_key
             ])
 
     return rows
