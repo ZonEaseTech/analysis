@@ -594,92 +594,185 @@ class ReportExporter(MultiShopExporter):
             - 物品消耗: 各原料消耗明细
         """
         from .sql_templates import get_template
-        
-        # 计算月份时间范围
-        from datetime import datetime, timezone
+
+        # 计算月份时间范围（按 BKK 时区，跟 ttpos 业务对齐）
+        from datetime import datetime, timezone, timedelta
+        BKK = timezone(timedelta(hours=7))
         year, mon = int(month[:4]), int(month[5:7])
-        start_date = f"{month}-01"
-        start_ts = int(datetime(year, mon, 1, tzinfo=timezone.utc).timestamp())
-        
+        start_ts = int(datetime(year, mon, 1, tzinfo=BKK).timestamp())
+
         # 计算下月1日
         if mon == 12:
             end_year, end_mon = year + 1, 1
         else:
             end_year, end_mon = year, mon + 1
-        end_ts = int(datetime(end_year, end_mon, 1, tzinfo=timezone.utc).timestamp())
+        end_ts = int(datetime(end_year, end_mon, 1, tzinfo=BKK).timestamp())
         
         # 加载商家列表
         self.load_merchants(merchant_xlsx)
         
         sales_results = []
-        consumption_results = []
+        # 物品消耗：(店编号, material_uuid) → {仓库出库, BOM 推算}
+        consumption_map: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        # 商品销量原始行（按规格拆，含 package_uuid/bom_uuid，待 Python 层后处理决定是否显示规格）
+        bom_sales_raw: List[Dict[str, Any]] = []
         errors = []
-        
+
         sales_sql = get_template('comprehensive_sales')
         consumption_sql = get_template('material_consumption')
+        bom_consumption_sql = get_template('material_bom_consumption')
         bom_sales_sql = get_template('bom_product_sales')
 
-        bom_yes_results = []  # 已设置 BOM 的商品销量
-        bom_no_results = []   # 未设置 BOM 的商品销量
+        # 探测哪些店有 ttpos_business_status_period 表（测试营业时段需要排除，对齐 ttpos UI）
+        # 一次 UNION ALL 查 INFORMATION_SCHEMA，避免 53 次串行 RTT
+        union_parts = [
+            f"SELECT '{uuid_str}' AS uuid, COUNT(*) AS has_table "
+            f"FROM `{self.project_id}.shop{uuid_str}.INFORMATION_SCHEMA.TABLES` "
+            f"WHERE table_name = 'ttpos_business_status_period'"
+            for _, uuid_str in self.merchants
+        ]
+        check_sql = " UNION ALL ".join(union_parts)
+        has_test_period_table = {
+            r.uuid for r in self.client.query(check_sql).result() if r.has_table > 0
+        }
 
-        # 并发查询：53 门店 × 3 查询，串行 BQ 调用太慢
+        def _build_exclude_test_business(uuid_str: str, field: str) -> str:
+            """ttpos ExcludeTestBusinessByBillSQL 的 BQ 等价：测试时段内创建的 bill 不算入统计。
+
+            field: 调用方指定字段名（statistics_sale 用 'sale_bill_uuid'，sale_bill 直接用 'uuid'）
+            """
+            if uuid_str not in has_test_period_table:
+                return ""
+            return (
+                f"AND {field} NOT IN ("
+                f"  SELECT _sb.uuid "
+                f"  FROM `{self.project_id}.shop{uuid_str}.ttpos_sale_bill` _sb "
+                f"  JOIN `{self.project_id}.shop{uuid_str}.ttpos_business_status_period` _bsp "
+                f"    ON _bsp.delete_time = 0 "
+                f"    AND _sb.create_time >= _bsp.start_time "
+                f"    AND (_bsp.end_time = 0 OR _sb.create_time <= _bsp.end_time) "
+                f"  WHERE _sb.delete_time = 0"
+                f")"
+            )
+
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        from threading import Lock
+        merge_lock = Lock()
 
         def _query_sales(account, uuid_str):
             dataset = f"shop{uuid_str}"
-            sql = sales_sql.format(project=self.project_id, dataset=dataset,
-                                    start_ts=start_ts, end_ts=end_ts)
+            sql = sales_sql.format(
+                project=self.project_id, dataset=dataset,
+                start_ts=start_ts, end_ts=end_ts,
+                exclude_test_business_ss=_build_exclude_test_business(uuid_str, 'sale_bill_uuid'),
+                exclude_test_business_sb=_build_exclude_test_business(uuid_str, 'uuid'),
+            )
             rows = list(self.client.query(sql).result())
             if not rows:
                 return account, None
             row = rows[0]
+            store_name = (row.store_name or "").replace("\r", "").replace("\n", " ").strip()
             return account, {
                 "门店编号": row.store_code or "",
-                "门店名称": row.store_name or "",
+                "门店名称": store_name,
                 "总营业额": float(row.total_turnover or 0),
                 "实收金额": float(row.total_received or 0),
                 "订单数": int(row.total_orders or 0),
             }
 
-        def _query_consumption(account, uuid_str):
+        def _clean_consumption(s):
+            if not s:
+                return ""
+            return s.replace("\r", "").replace("\n", " ").strip()
+
+        def _query_consumption_warehouse(account, uuid_str):
             dataset = f"shop{uuid_str}"
             sql = consumption_sql.format(project=self.project_id, dataset=dataset,
                                           start_ts=start_ts, end_ts=end_ts)
             rows = list(self.client.query(sql).result())
-            return account, [{
-                "门店编号": row.store_code or "",
-                "门店名称": row.store_name or "",
-                "原料名称": row.material_name or "",
-                "消耗量": float(row.total_num or 0),
-                "单位": row.unit_name or "",
-            } for row in rows]
+            with merge_lock:
+                for row in rows:
+                    key = (row.store_code or "", int(row.material_uuid))
+                    rec = consumption_map.get(key)
+                    if rec is None:
+                        rec = {
+                            "门店编号": row.store_code or "",
+                            "门店名称": _clean_consumption(row.store_name),
+                            "物品名称": _clean_consumption(row.material_name),
+                            "消耗量(仓库出库)": 0.0,
+                            "消耗量(BOM推算)": 0.0,
+                            "单位": _clean_consumption(row.unit_name),
+                        }
+                        consumption_map[key] = rec
+                    rec["消耗量(仓库出库)"] = float(row.total_num or 0)
+                    if not rec["物品名称"]:
+                        rec["物品名称"] = _clean_consumption(row.material_name)
+                    if not rec["单位"]:
+                        rec["单位"] = _clean_consumption(row.unit_name)
+            return account
+
+        def _query_consumption_bom(account, uuid_str):
+            dataset = f"shop{uuid_str}"
+            sql = bom_consumption_sql.format(project=self.project_id, dataset=dataset,
+                                              start_ts=start_ts, end_ts=end_ts)
+            rows = list(self.client.query(sql).result())
+            with merge_lock:
+                for row in rows:
+                    key = (row.store_code or "", int(row.material_uuid))
+                    rec = consumption_map.get(key)
+                    if rec is None:
+                        rec = {
+                            "门店编号": row.store_code or "",
+                            "门店名称": _clean_consumption(row.store_name),
+                            "物品名称": _clean_consumption(row.material_name),
+                            "消耗量(仓库出库)": 0.0,
+                            "消耗量(BOM推算)": 0.0,
+                            "单位": _clean_consumption(row.unit_name),
+                        }
+                        consumption_map[key] = rec
+                    rec["消耗量(BOM推算)"] = float(row.total_num or 0)
+                    if not rec["物品名称"]:
+                        rec["物品名称"] = _clean_consumption(row.material_name)
+                    if not rec["单位"]:
+                        rec["单位"] = _clean_consumption(row.unit_name)
+            return account
+
+        def _clean(s: Optional[str]) -> str:
+            if not s:
+                return ""
+            return s.replace("\r", "").replace("\n", " ").strip()
 
         def _query_bom_sales(account, uuid_str):
             dataset = f"shop{uuid_str}"
             sql = bom_sales_sql.format(project=self.project_id, dataset=dataset,
                                         start_ts=start_ts, end_ts=end_ts)
             rows = list(self.client.query(sql).result())
-            yes_rows, no_rows = [], []
-            for row in rows:
-                rec = {
-                    "门店编号": row.store_code or "",
-                    "门店名称": row.store_name or "",
-                    "商品名称": row.product_name or "",
-                    "销量": float(row.total_qty or 0),
-                }
-                (yes_rows if row.has_bom == 1 else no_rows).append(rec)
-            return account, yes_rows, no_rows
+            return account, [{
+                "门店编号": row.store_code or "",
+                "门店名称": _clean(row.store_name),
+                "package_uuid": int(row.product_package_uuid or 0),
+                "bom_uuid": int(row.product_bom_uuid or 0),
+                "package_name": _clean(row.package_name),
+                "spec_name": _clean(row.spec_name),
+                "bom_type": int(row.bom_type or 0),
+                "销量": float(row.total_qty or 0),
+                "has_bom": int(row.has_bom or 0),
+            } for row in rows]
 
         with ThreadPoolExecutor(max_workers=10) as ex:
             sales_futures = {
                 ex.submit(_query_sales, account, uuid_str): account
                 for account, uuid_str in self.merchants
             }
-            consumption_futures = {
-                ex.submit(_query_consumption, account, uuid_str): account
+            cons_wh_futures = {
+                ex.submit(_query_consumption_warehouse, account, uuid_str): account
                 for account, uuid_str in self.merchants
             }
-            bom_futures = {
+            cons_bom_futures = {
+                ex.submit(_query_consumption_bom, account, uuid_str): account
+                for account, uuid_str in self.merchants
+            }
+            bom_sales_futures = {
                 ex.submit(_query_bom_sales, account, uuid_str): account
                 for account, uuid_str in self.merchants
             }
@@ -693,39 +786,49 @@ class ReportExporter(MultiShopExporter):
                 except Exception as e:
                     errors.append({"account": account, "type": "sales", "error": str(e)})
 
-            for fut in as_completed(consumption_futures):
-                account = consumption_futures[fut]
+            for fut in as_completed(cons_wh_futures):
+                account = cons_wh_futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    errors.append({"account": account, "type": "consumption_wh", "error": str(e)})
+
+            for fut in as_completed(cons_bom_futures):
+                account = cons_bom_futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    errors.append({"account": account, "type": "consumption_bom", "error": str(e)})
+
+            for fut in as_completed(bom_sales_futures):
+                account = bom_sales_futures[fut]
                 try:
                     _, items = fut.result()
-                    consumption_results.extend(items)
-                except Exception as e:
-                    errors.append({"account": account, "type": "consumption", "error": str(e)})
-
-            for fut in as_completed(bom_futures):
-                account = bom_futures[fut]
-                try:
-                    _, yes_rows, no_rows = fut.result()
-                    bom_yes_results.extend(yes_rows)
-                    bom_no_results.extend(no_rows)
+                    bom_sales_raw.extend(items)
                 except Exception as e:
                     errors.append({"account": account, "type": "bom_sales", "error": str(e)})
-        
+
+        # ===== Python 层后处理 =====
+        # 1. 商品销量：决定每行是否显示规格后缀（同 store + 同 package 有多个 bom_uuid 才带规格）
+        bom_yes_results, bom_no_results = self._build_bom_sales_rows(bom_sales_raw)
+
+        # 2. 物品消耗：dict → list，并按 (店, 仓库出库量降序) 排序
+        consumption_results = list(consumption_map.values())
+
         # 写入 Excel（4 sheet，xlsxwriter 流式写）
         output_path = output_path or self.output_path
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 并发查询导致 results 是 as_completed 顺序，需要按门店编号排序
-        # 物品消耗 / BOM 销量在同一门店内按销量降序（更易看 top 物料/商品）
         def _store_key(rec):
             code = rec.get("门店编号", "")
             try:
-                return (0, int(code))   # 数字类编号正常排序
+                return (0, int(code))
             except (TypeError, ValueError):
-                return (1, str(code))   # 非数字（admin-xxx 之类）排在后面
+                return (1, str(code))
 
         sales_results.sort(key=_store_key)
-        consumption_results.sort(key=lambda r: (_store_key(r), -float(r.get("消耗量", 0) or 0)))
+        consumption_results.sort(key=lambda r: (_store_key(r), -float(r.get("消耗量(仓库出库)", 0) or 0)))
         bom_yes_results.sort(key=lambda r: (_store_key(r), -float(r.get("销量", 0) or 0)))
         bom_no_results.sort(key=lambda r: (_store_key(r), -float(r.get("销量", 0) or 0)))
 
@@ -735,10 +838,10 @@ class ReportExporter(MultiShopExporter):
             self._write_data_sheet_xw(wb, "销售业绩", sales_results,
                 ["门店编号", "门店名称", "总营业额", "实收金额", "订单数"])
             self._write_data_sheet_xw(wb, "物品消耗", consumption_results,
-                ["门店编号", "门店名称", "原料名称", "消耗量", "单位"])
-            self._write_data_sheet_xw(wb, "已设置bom商品销量", bom_yes_results,
+                ["门店编号", "门店名称", "物品名称", "消耗量(仓库出库)", "消耗量(BOM推算)", "单位"])
+            self._write_data_sheet_xw(wb, "已设置BOM商品销量", bom_yes_results,
                 ["门店编号", "门店名称", "商品名称", "销量"])
-            self._write_data_sheet_xw(wb, "未设置bom商品销量", bom_no_results,
+            self._write_data_sheet_xw(wb, "未设置BOM商品销量", bom_no_results,
                 ["门店编号", "门店名称", "商品名称", "销量"])
         finally:
             wb.close()
@@ -782,6 +885,44 @@ class ReportExporter(MultiShopExporter):
                 if val is not None:
                     max_len = max(max_len, len(str(val)))
             ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 50)
+
+    @staticmethod
+    def _build_bom_sales_rows(raw_rows: List[Dict[str, Any]]) -> Tuple[List[Dict], List[Dict]]:
+        """
+        商品销量后处理：
+        - 同店 + 同 package_uuid 下若有多个 bom_uuid (规格行) → 显示 "包名(规格名)"
+        - 否则只显示 "包名"
+        - 外卖部分（bom_uuid=0）规格名设为空，会显示纯包名
+
+        返回 (已设置 BOM 行, 未设置 BOM 行)
+        """
+        from collections import defaultdict
+
+        # (店编号, package_uuid) → set(堂食 bom_uuid)
+        # 外卖行 bom_uuid=0 不算"规格"维度，避免误判 multi_spec
+        spec_groups: Dict[Tuple[str, int], set] = defaultdict(set)
+        for r in raw_rows:
+            if r["bom_uuid"] > 0:
+                spec_groups[(r["门店编号"], r["package_uuid"])].add(r["bom_uuid"])
+
+        yes_rows: List[Dict[str, Any]] = []
+        no_rows: List[Dict[str, Any]] = []
+        for r in raw_rows:
+            key = (r["门店编号"], r["package_uuid"])
+            multi_spec = len(spec_groups[key]) > 1
+            spec = r["spec_name"]
+            if multi_spec and spec:
+                name = f"{r['package_name']}({spec})"
+            else:
+                name = r["package_name"]
+            rec = {
+                "门店编号": r["门店编号"],
+                "门店名称": r["门店名称"],
+                "商品名称": name,
+                "销量": r["销量"],
+            }
+            (yes_rows if r["has_bom"] == 1 else no_rows).append(rec)
+        return yes_rows, no_rows
 
     def _write_data_sheet_xw(self, workbook, sheet_name: str,
                               data: List[Dict], headers: List[str]):

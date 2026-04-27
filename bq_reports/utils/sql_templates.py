@@ -40,42 +40,89 @@ WHERE delete_time = 0
   AND completed_time < {end_ts}
 """
 
-# 综合销售业绩（POS + 外卖平台）
-# 退款扣减口径：amount（营业额）保留原值；payment_amount（实收）扣减
-#   payment.sh 一致：实收 = SUM(po.amount - IFNULL(refund.amount, 0))
+# 综合销售业绩（POS + 外卖平台） — 严格对齐 ttpos UI 销售业绩面板
+#
+# ttpos 源码:
+#   - 子查询字段: ttpos-server-go/main/app/repository/statistics.go:84-128
+#       sale_amount     = SUM(product_price + product_tax + service_fee + service_tax + payment_fee + extend_price)
+#       received_amount = SUM(payment_amount - refund_amount - payment_balance)
+#       business_amount = SUM(payment_amount - refund_amount - refund_payment_balance - product_tax - service_tax + refund_tax)
+#   - 主查询聚合: ttpos-server-go/main/app/repository/statistics.go:130-182
+#       total_sale_amount     = SUM(sale_amount)        UI「总销售额」 ← 本报表「营业额」对齐此口径
+#       total_received_amount = SUM(received_amount)    UI「总实收」
+#       total_order_num       = SUM(IF(is_meger=0,1,0)) 排除合单
+#   - 测试营业时段排除: ttpos-server-go/main/app/repository/common.go:836-842 (ExcludeTestBusinessByBillSQL)
+#   - UI 字段绑定:    ttpos-server-go/main/app/service/business.go:160-173
+#       TotalSales = total_sale_amount
+#
+# 注意:
+#   1. statistics_sale 已包含堂食 (is_takeout=0) + 自有外卖 (is_takeout=1)
+#      第三方外卖 (grab/lineman/shopee) 不在 statistics_sale，仍走 takeout_order
+#   2. takeout_order 字段用 platform_total（顾客实付，跟 ttpos statistics_takeout 后端一致）
+#   3. 取消订单 state=60 算入 takeout 营业额（对齐 ttpos 后端，统一算法）
 COMPREHENSIVE_SALES_SQL = """
 WITH
-pos_refund_per_bill AS (
+pos_bill_agg AS (
+  -- 营业额/实收：按 sale_bill_uuid 聚合 statistics_sale
+  -- 测试营业时段排除（{exclude_test_business_ss} 仅当该店有 business_status_period 表时填充）
   SELECT
-    so.sale_bill_uuid AS bill_uuid,
-    SUM(roa.amount) AS refund_amount
-  FROM `{project}.{dataset}.ttpos_return_order_amount` roa
-  JOIN `{project}.{dataset}.ttpos_payment_order` po
-    ON po.uuid = roa.payment_order_uuid AND po.delete_time = 0
-  JOIN `{project}.{dataset}.ttpos_sale_order` so
-    ON so.uuid = po.related_uuid AND po.related_type = 0 AND so.delete_time = 0
-  WHERE roa.delete_time = 0 AND roa.refund_status = 1
-  GROUP BY bill_uuid
+    sale_bill_uuid,
+    is_meger,
+    SUM(product_price + product_tax + service_fee + service_tax + payment_fee + extend_price) AS sale_amount,
+    SUM(payment_amount - refund_amount - payment_balance) AS received_amount
+  FROM `{project}.{dataset}.ttpos_statistics_sale`
+  WHERE delete_time = 0
+    AND complete_time >= {start_ts} AND complete_time < {end_ts}
+    {exclude_test_business_ss}
+  GROUP BY sale_bill_uuid, is_meger
 ),
-pos_sales AS (
+pos_amount AS (
   SELECT
-    ROUND(SUM(sb.amount), 2) AS turnover,
-    ROUND(SUM(sb.payment_amount - IFNULL(rf.refund_amount, 0)), 2) AS received,
-    COUNT(*) AS cnt
-  FROM `{project}.{dataset}.ttpos_sale_bill` sb
-  LEFT JOIN pos_refund_per_bill rf ON rf.bill_uuid = sb.uuid
-  WHERE sb.delete_time = 0 AND sb.status = 1
-    AND sb.finish_time >= {start_ts} AND sb.finish_time < {end_ts}
+    ROUND(SUM(sale_amount), 2) AS turnover,
+    ROUND(SUM(received_amount), 2) AS received
+  FROM pos_bill_agg
 ),
+pos_order_count AS (
+  -- 订单数：直接用 sale_bill 计数（不用 statistics_sale 的 SUM(IF(is_meger=0,1,0))）
+  -- 原因：ttpos 后端有时异步生成 statistics_sale 失败 → 订单"消失"。sale_bill 是事实数据源，
+  -- delete_time=0 已经天然过滤被合单吞并的 bill，等价于 is_meger=0 口径。
+  -- 跟 ttpos UI 可能差几单（ttpos UI 也用 statistics_sale），但跟实际成交订单数一致。
+  SELECT COUNT(*) AS cnt
+  FROM `{project}.{dataset}.ttpos_sale_bill`
+  WHERE delete_time = 0
+    AND status = 1
+    AND finish_time >= {start_ts} AND finish_time < {end_ts}
+    {exclude_test_business_sb}
+),
+-- 第三方外卖 (grab/lineman/shopee) — 对齐 ttpos statistics_takeout
+-- ttpos-server-go/main/app/repository/statistics_takeout.go:434
+--   动态时间: state=40 已完成用 completed_time, 其他状态用 accepted_time
+-- ttpos-server-go/main/app/repository/statistics_takeout.go:241
+--   total_order_num = COUNT(DISTINCT uuid IF state IN (10,20,30,40,60))  含取消
+-- 营业额: state IN (10,20,30,40,60) 含取消 — platform_total
+-- 实收:   state IN (10,20,30,40)    不含取消 — platform_total
 takeout_sales AS (
   SELECT
-    ROUND(SUM(subtotal), 2) AS turnover,
-    ROUND(SUM(platform_total), 2) AS received,
-    COUNT(*) AS cnt
+    ROUND(SUM(IF(order_state IN (10,20,30,40,60), platform_total, 0)), 2) AS turnover,
+    ROUND(SUM(IF(order_state IN (10,20,30,40), platform_total, 0)), 2) AS received,
+    COUNT(DISTINCT uuid) AS cnt
   FROM `{project}.{dataset}.ttpos_takeout_order`
-  WHERE delete_time = 0 AND order_state = 40
+  WHERE delete_time = 0
+    AND order_state IN (10, 20, 30, 40, 60)
     AND platform IN ('grab', 'lineman', 'shopee')
-    AND completed_time >= {start_ts} AND completed_time < {end_ts}
+    AND accepted_time > 0
+    AND (
+      CASE
+        WHEN order_state = 40 AND completed_time > 0 THEN completed_time
+        ELSE accepted_time
+      END
+    ) >= {start_ts}
+    AND (
+      CASE
+        WHEN order_state = 40 AND completed_time > 0 THEN completed_time
+        ELSE accepted_time
+      END
+    ) < {end_ts}
 )
 SELECT
   IFNULL(
@@ -84,10 +131,11 @@ SELECT
      WHERE `key` = 'store' AND delete_time = 0
      LIMIT 1), '') AS store_code,
   c.name AS store_name,
-  IFNULL(ps.turnover, 0) + IFNULL(ts.turnover, 0) AS total_turnover,
-  IFNULL(ps.received, 0) + IFNULL(ts.received, 0) AS total_received,
-  IFNULL(ps.cnt, 0) + IFNULL(ts.cnt, 0) AS total_orders
-FROM pos_sales ps
+  IFNULL(pa.turnover, 0) + IFNULL(ts.turnover, 0) AS total_turnover,
+  IFNULL(pa.received, 0) + IFNULL(ts.received, 0) AS total_received,
+  IFNULL(poc.cnt, 0) + IFNULL(ts.cnt, 0) AS total_orders
+FROM pos_amount pa
+CROSS JOIN pos_order_count poc
 CROSS JOIN takeout_sales ts
 CROSS JOIN `{project}.{dataset}.ttpos_company` c
 WHERE c.delete_time = 0
@@ -97,47 +145,39 @@ LIMIT 1
 
 # ==================== 2. 物品消耗相关 ====================
 
-# 物品消耗统计（sale_order_material + takeout_order_material）
+# 物品消耗统计 — 跟 ttpos UI 一致，用 warehouse_out_form_item（销售出库单明细）
+#
+# ttpos 源码:
+#   - 出库单 scene 枚举: ttpos-server-go/main/app/constant/warehouse.go:4-10
+#       WarehouseOutFormSceneSales = 0   销售出库
+#       WarehouseOutFormSceneAdjust = 1  调整出库
+#       WarehouseOutFormSceneLoss = 2    损耗出库
+#       WarehouseOutFormSceneLost = 3    丢失出库
+#       WarehouseOutFormSceneDelete = 4  删除出库
+#   - 物品消耗服务: ttpos-server-go/main/app/service/material.go:4179-4266
+#
+# 注意:
+#   1. 是 `ttpos_warehouse_out_form_item`（出库表），不是 `ttpos_warehouse_form_item`
+#      （那是入库表，scene 枚举完全不同：0 采购入库、1 添加入库、2 调整入库、3 退菜入库）。
+#   2. revoke_time 在 item 表上，不需要 JOIN form 主表。
+#   3. ttpos 实时报表会用 staff_shift_log 限定当前班次；月度报表无班次过滤。
+#   4. 数据语义跟订单消耗 (sale_order_material) 不同：
+#      - warehouse_out_form_item: 实际出库（含手工试餐/损耗/调整出库 但 scene=0 已过滤为纯销售）
+#      - sale_order_material: 订单 BOM 自动展开（不含手工调整）
+#      实测两者差异 +10~17%（warehouse_out 偏高，含数据修正出库）。
 MATERIAL_CONSUMPTION_SQL = """
-WITH 
-pos_consumption AS (
-  SELECT 
-    m.uuid AS material_uuid,
-    JSON_EXTRACT_SCALAR(m.name, '$.zh') AS name_zh,
-    JSON_EXTRACT_SCALAR(m.name, '$.en') AS name_en,
-    JSON_EXTRACT_SCALAR(m.name, '$.th') AS name_th,
-    SUM(som.num) AS num,
-    JSON_EXTRACT_SCALAR(pu.name, '$.zh') AS unit_name
-  FROM `{project}.{dataset}.ttpos_sale_order_material` som
-  JOIN `{project}.{dataset}.ttpos_material` m 
-    ON m.uuid = som.material_uuid AND m.delete_time = 0
-  JOIN `{project}.{dataset}.ttpos_sale_bill` sb 
-    ON sb.uuid = som.sale_bill_uuid AND sb.delete_time = 0
-  LEFT JOIN `{project}.{dataset}.ttpos_material_unit` mu 
-    ON mu.material_uuid = m.uuid AND mu.is_default = 1 AND mu.delete_time = 0
-  LEFT JOIN `{project}.{dataset}.ttpos_product_unit` pu 
-    ON pu.uuid = mu.unit_uuid AND pu.delete_time = 0
-  WHERE som.delete_time = 0
-    AND sb.status = 1
-    AND sb.finish_time >= {start_ts} 
-    AND sb.finish_time < {end_ts}
-  GROUP BY m.uuid, m.name, pu.name
-),
-takeout_consumption AS (
-  SELECT 
-    m.uuid AS material_uuid,
-    SUM(tom.num) AS num
-  FROM `{project}.{dataset}.ttpos_takeout_order_material` tom
-  JOIN `{project}.{dataset}.ttpos_material` m 
-    ON m.uuid = tom.material_uuid AND m.delete_time = 0
-  JOIN `{project}.{dataset}.ttpos_takeout_order` tko 
-    ON tko.uuid = tom.takeout_order_uuid AND tko.delete_time = 0
-  WHERE tom.delete_time = 0
-    AND tko.order_state = 40
-    AND tko.completed_time > 0
-    AND tko.completed_time >= {start_ts} 
-    AND tko.completed_time < {end_ts}
-  GROUP BY m.uuid
+WITH consumption AS (
+  SELECT
+    wfi.material_uuid,
+    SUM(wfi.num) AS total_num
+  FROM `{project}.{dataset}.ttpos_warehouse_out_form_item` wfi
+  WHERE wfi.delete_time = 0
+    AND wfi.revoke_time = 0
+    AND wfi.scene = 0
+    AND wfi.material_uuid != 0
+    AND wfi.create_time >= {start_ts}
+    AND wfi.create_time < {end_ts}
+  GROUP BY wfi.material_uuid
 )
 SELECT
   IFNULL(
@@ -145,17 +185,192 @@ SELECT
      FROM `{project}.{dataset}.ttpos_setting`
      WHERE `key` = 'store' AND delete_time = 0
      LIMIT 1), '') AS store_code,
-  c.name AS store_name,
-  pc.material_uuid,
-  COALESCE(pc.name_zh, pc.name_en, pc.name_th, '未知') AS material_name,
-  ROUND(pc.num + IFNULL(tc.num, 0), 2) AS total_num,
-  pc.unit_name
-FROM pos_consumption pc
-LEFT JOIN takeout_consumption tc ON tc.material_uuid = pc.material_uuid
-CROSS JOIN `{project}.{dataset}.ttpos_company` c
-WHERE c.delete_time = 0
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_name')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0
+     LIMIT 1),
+    (SELECT name FROM `{project}.{dataset}.ttpos_company` WHERE delete_time = 0 LIMIT 1)
+  ) AS store_name,
+  c.material_uuid,
+  COALESCE(
+    JSON_EXTRACT_SCALAR(m.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(m.name, '$.en'),
+    JSON_EXTRACT_SCALAR(m.name, '$.th'),
+    '未知'
+  ) AS material_name,
+  ROUND(c.total_num, 2) AS total_num,
+  COALESCE(
+    JSON_EXTRACT_SCALAR(pu.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(pu.name, '$.en'),
+    ''
+  ) AS unit_name
+FROM consumption c
+JOIN `{project}.{dataset}.ttpos_material` m
+  ON m.uuid = c.material_uuid AND m.delete_time = 0
+LEFT JOIN `{project}.{dataset}.ttpos_material_unit` mu
+  ON mu.material_uuid = m.uuid AND mu.is_default = 1 AND mu.delete_time = 0
+LEFT JOIN `{project}.{dataset}.ttpos_product_unit` pu
+  ON pu.uuid = mu.unit_uuid AND pu.delete_time = 0
 ORDER BY total_num DESC
 """
+
+# BOM 推算的物品消耗（销量 × BOM 配方展开 → 物料）
+#
+# 语义：跟 ttpos UI 实时仓库的"销售出库"不同 — 这是按 BOM 理论推算
+#       每销售 1 份商品规格 = 该规格 product_bom 关联 related_material 的 num
+#       不含人工调整出库 / 损耗调整 / 试餐
+#
+# related_material 字段已经存的是基础单位的量（unit_uom == base_unit_uom），无需换算
+#
+# 销量口径与 BOM_PRODUCT_SALES_SQL 一致：
+#   POS:    statistics_product where refund_time=0
+#   外卖:   takeout_order_item + order_state IN (10,20,30,40,60), accepted_time 落在区间
+#
+# 物料展开两条路径（合并不去重，按总数加和）:
+#   (a) related_material 直挂 product_bom（related_uuid = pb.uuid）
+#   (b) product_bom 关联成本卡（pb.product_bom_card_uuid > 0），related_material 挂在卡上
+MATERIAL_BOM_CONSUMPTION_SQL = """
+WITH
+shop_sales AS (
+  -- 堂食销量按 (package, bom_uuid) 拆
+  SELECT
+    sp.product_package_uuid,
+    sp.product_bom_uuid,
+    SUM(sp.product_num) AS sale_num
+  FROM `{project}.{dataset}.ttpos_statistics_product` sp
+  WHERE sp.delete_time = 0
+    AND sp.refund_time = 0
+    AND sp.product_bom_uuid > 0
+    AND sp.complete_time >= {start_ts}
+    AND sp.complete_time < {end_ts}
+  GROUP BY sp.product_package_uuid, sp.product_bom_uuid
+),
+takeout_pkg_sales AS (
+  -- 外卖销量只到 package 级（数据模型限制）
+  SELECT
+    toi.ttpos_product_package_uuid AS product_package_uuid,
+    SUM(toi.quantity) AS sale_num
+  FROM `{project}.{dataset}.ttpos_takeout_order_item` toi
+  JOIN `{project}.{dataset}.ttpos_takeout_order` t
+    ON t.uuid = toi.takeout_order_uuid AND t.delete_time = 0
+  WHERE toi.delete_time = 0
+    AND toi.ttpos_product_package_uuid > 0
+    AND t.order_state IN (10, 20, 30, 40, 60)
+    AND t.accepted_time > 0
+    AND t.accepted_time >= {start_ts}
+    AND t.accepted_time < {end_ts}
+  GROUP BY product_package_uuid
+),
+shop_pkg_total AS (
+  -- 每个 package 的堂食总销量（用于按堂食规格销量比例分摊外卖销量）
+  SELECT
+    product_package_uuid,
+    SUM(sale_num) AS pkg_total
+  FROM shop_sales
+  GROUP BY product_package_uuid
+),
+takeout_allocated AS (
+  -- 把外卖销量按"堂食各规格销量占比"分摊到每个 product_bom_uuid
+  -- weight = shop_sales.sale_num / shop_pkg_total.pkg_total
+  -- 边缘 case：package 只有外卖没堂食 → 没法分摊，丢失（数据上很罕见）
+  SELECT
+    s.product_bom_uuid,
+    SUM(t.sale_num * s.sale_num / pt.pkg_total) AS sale_num
+  FROM shop_sales s
+  JOIN shop_pkg_total pt USING (product_package_uuid)
+  JOIN takeout_pkg_sales t USING (product_package_uuid)
+  WHERE pt.pkg_total > 0
+  GROUP BY s.product_bom_uuid
+),
+shop_sales_by_bom AS (
+  SELECT product_bom_uuid, SUM(sale_num) AS sale_num
+  FROM shop_sales
+  GROUP BY product_bom_uuid
+),
+sales AS (
+  -- 合并堂食实际销量 + 外卖分摊销量
+  SELECT
+    COALESCE(s.product_bom_uuid, ta.product_bom_uuid) AS product_bom_uuid,
+    IFNULL(s.sale_num, 0) + IFNULL(ta.sale_num, 0) AS total_qty
+  FROM shop_sales_by_bom s
+  FULL OUTER JOIN takeout_allocated ta USING (product_bom_uuid)
+),
+-- (a) related_material 直挂 product_bom
+direct_bom AS (
+  SELECT
+    pb.uuid AS product_bom_uuid,
+    rm.material_uuid,
+    rm.num AS num_per_unit
+  FROM `{project}.{dataset}.ttpos_product_bom` pb
+  JOIN `{project}.{dataset}.ttpos_related_material` rm
+    ON rm.related_uuid = pb.uuid AND rm.delete_time = 0
+  WHERE pb.delete_time = 0
+    AND rm.material_uuid > 0
+),
+-- (b) product_bom -> 成本卡 -> related_material
+card_bom AS (
+  SELECT
+    pb.uuid AS product_bom_uuid,
+    rm.material_uuid,
+    rm.num AS num_per_unit
+  FROM `{project}.{dataset}.ttpos_product_bom` pb
+  JOIN `{project}.{dataset}.ttpos_related_material` rm
+    ON rm.related_uuid = pb.product_bom_card_uuid AND rm.delete_time = 0
+  WHERE pb.delete_time = 0
+    AND pb.product_bom_card_uuid > 0
+    AND rm.material_uuid > 0
+),
+expanded AS (
+  SELECT product_bom_uuid, material_uuid, num_per_unit FROM direct_bom
+  UNION ALL
+  SELECT product_bom_uuid, material_uuid, num_per_unit FROM card_bom
+),
+consumption AS (
+  SELECT
+    e.material_uuid,
+    SUM(s.total_qty * e.num_per_unit) AS total_num
+  FROM sales s
+  JOIN expanded e USING (product_bom_uuid)
+  GROUP BY e.material_uuid
+)
+SELECT
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_code')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0
+     LIMIT 1), '') AS store_code,
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_name')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0
+     LIMIT 1),
+    (SELECT name FROM `{project}.{dataset}.ttpos_company` WHERE delete_time = 0 LIMIT 1)
+  ) AS store_name,
+  c.material_uuid,
+  COALESCE(
+    JSON_EXTRACT_SCALAR(m.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(m.name, '$.en'),
+    JSON_EXTRACT_SCALAR(m.name, '$.th'),
+    '未知'
+  ) AS material_name,
+  ROUND(c.total_num, 4) AS total_num,
+  COALESCE(
+    JSON_EXTRACT_SCALAR(pu.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(pu.name, '$.en'),
+    ''
+  ) AS unit_name
+FROM consumption c
+JOIN `{project}.{dataset}.ttpos_material` m
+  ON m.uuid = c.material_uuid AND m.delete_time = 0
+LEFT JOIN `{project}.{dataset}.ttpos_material_unit` mu
+  ON mu.material_uuid = m.uuid AND mu.is_default = 1 AND mu.delete_time = 0
+LEFT JOIN `{project}.{dataset}.ttpos_product_unit` pu
+  ON pu.uuid = mu.unit_uuid AND pu.delete_time = 0
+WHERE c.total_num > 0
+ORDER BY total_num DESC
+"""
+
 
 # 指定原料的消耗统计（按 material.code）
 SPECIFIC_MATERIAL_CONSUMPTION_SQL = """
@@ -204,51 +419,101 @@ LEFT JOIN takeout_consumption tc ON TRUE
 
 # ==================== 3. BOM商品销量相关 ====================
 
-# BOM商品销量统计（区分已设BOM和未设BOM）
+# BOM 商品销量（按规格拆） — 算法跟 ttpos RankProduct/RankTakeoutProduct 一致，
+# 但 GROUP BY 加上 product_bom_uuid（具体规格行）以便区分 "香脆鸡翅(大份)" 和 "香脆鸡翅(小份)"
+#
+# ttpos 源码:
+#   - shop:    ttpos-server-go/main/app/repository/statistics.go:1245-1253 (RankProduct)
+#              SUM(sp.product_num) AS sale_num + WHERE refund_time=0 + GROUP BY product_package_uuid
+#              （ttpos UI 是 package 级合并，本报表加 product_bom_uuid 拆出规格）
+#   - takeout: ttpos-server-go/main/app/repository/statistics.go:451-502 (RankTakeoutProduct)
+#              order_state IN (10,20,30,40,60) + accepted_time > 0
+#
+# 商品名称格式:
+#   {商品包名}(规格名)   有规格 → "香脆鸡翅(大份)"
+#   {商品包名}            无规格 → "香脆鸡翅"
+#
+# product_bom 行类型:
+#   - product_flavor_uuid > 0  规格行（大份/小份/原味/微辣）
+#   - product_sauce_uuid > 0   小料行（加芝士/加蛋）
+#   - 两者都 = 0               主行（极少数无规格商品）
+#
+# 已设/未设 BOM 判定（规格级粒度）:
+#   当前 product_bom 行 EXISTS related_material 直挂
+#   OR pb.product_bom_card_uuid > 0 AND 该卡 EXISTS related_material
+#
+# 数据来源限制:
+#   - statistics_product 有 product_bom_uuid，堂食销量可以精确到规格
+#   - takeout_order_item 只有 ttpos_product_package_uuid，无规格 uuid
+#     → 外卖销量只能聚到 package 级（bom_uuid=0），规格名留空
+#     → 报表上外卖部分会单独显示一行 "{包名}"（不带规格后缀）
 BOM_PRODUCT_SALES_SQL = """
-WITH 
-product_sales AS (
+WITH
+shop_sales AS (
+  -- 堂食销量（按规格拆，含规格行+小料行的 product_bom_uuid）
   SELECT
-    sop.product_package_uuid,
-    JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS product_name_zh,
-    JSON_EXTRACT_SCALAR(pp.name, '$.en') AS product_name_en,
-    JSON_EXTRACT_SCALAR(pp.name, '$.th') AS product_name_th,
-    CASE
-      WHEN sop.product_type = 0 THEN sop.num
-      WHEN sop.product_type = 2 THEN sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num)
-      ELSE 0
-    END AS qty,
-    IF(bom_set.pp_uuid IS NOT NULL, 1, 0) AS has_bom
-  FROM `{project}.{dataset}.ttpos_sale_order_product` sop
-  JOIN `{project}.{dataset}.ttpos_sale_bill` sb 
-    ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
-  JOIN `{project}.{dataset}.ttpos_product_package` pp 
-    ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
-  LEFT JOIN (
-    SELECT DISTINCT pb.product_package_uuid AS pp_uuid
-    FROM `{project}.{dataset}.ttpos_product_bom` pb
-    WHERE pb.delete_time = 0
-      AND (pb.product_flavor_uuid > 0 OR pb.product_sauce_uuid > 0)
-      AND (
-        EXISTS (
+    sp.product_package_uuid,
+    sp.product_bom_uuid,
+    SUM(sp.product_num) AS sale_num
+  FROM `{project}.{dataset}.ttpos_statistics_product` sp
+  WHERE sp.delete_time = 0
+    AND sp.refund_time = 0
+    AND sp.complete_time >= {start_ts}
+    AND sp.complete_time < {end_ts}
+  GROUP BY sp.product_package_uuid, sp.product_bom_uuid
+),
+takeout_sales AS (
+  -- 外卖销量：只能聚到 package（数据模型限制）→ product_bom_uuid 设为 0
+  SELECT
+    toi.ttpos_product_package_uuid AS product_package_uuid,
+    CAST(0 AS NUMERIC) AS product_bom_uuid,
+    SUM(toi.quantity) AS sale_num
+  FROM `{project}.{dataset}.ttpos_takeout_order_item` toi
+  JOIN `{project}.{dataset}.ttpos_takeout_order` t
+    ON t.uuid = toi.takeout_order_uuid AND t.delete_time = 0
+  WHERE toi.delete_time = 0
+    AND toi.ttpos_product_package_uuid > 0
+    AND t.order_state IN (10, 20, 30, 40, 60)
+    AND t.accepted_time > 0
+    AND t.accepted_time >= {start_ts}
+    AND t.accepted_time < {end_ts}
+  GROUP BY product_package_uuid
+),
+merged AS (
+  SELECT
+    COALESCE(s.product_package_uuid, t.product_package_uuid) AS product_package_uuid,
+    COALESCE(s.product_bom_uuid, t.product_bom_uuid) AS product_bom_uuid,
+    IFNULL(s.sale_num, 0) + IFNULL(t.sale_num, 0) AS total_qty
+  FROM shop_sales s
+  FULL OUTER JOIN takeout_sales t
+    USING (product_package_uuid, product_bom_uuid)
+),
+-- 规格级 has_bom 判定：当前 product_bom 行有 related_material（直挂或通过成本卡）
+bom_set AS (
+  SELECT DISTINCT pb.uuid AS pb_uuid
+  FROM `{project}.{dataset}.ttpos_product_bom` pb
+  WHERE pb.delete_time = 0
+    AND (
+      EXISTS (
+        SELECT 1 FROM `{project}.{dataset}.ttpos_related_material` rm
+        WHERE rm.related_uuid = pb.uuid AND rm.delete_time = 0
+      )
+      OR (
+        pb.product_bom_card_uuid > 0
+        AND EXISTS (
           SELECT 1 FROM `{project}.{dataset}.ttpos_related_material` rm
-          WHERE rm.related_uuid = pb.uuid AND rm.delete_time = 0
-        )
-        OR (
-          pb.product_bom_card_uuid > 0
-          AND EXISTS (
-            SELECT 1 FROM `{project}.{dataset}.ttpos_related_material` rm
-            WHERE rm.related_uuid = pb.product_bom_card_uuid AND rm.delete_time = 0
-          )
+          WHERE rm.related_uuid = pb.product_bom_card_uuid AND rm.delete_time = 0
         )
       )
-  ) bom_set ON bom_set.pp_uuid = sop.product_package_uuid
-  WHERE sop.delete_time = 0
-    AND sop.cancel_time = 0
-    AND sb.status = 1
-    AND sb.finish_time >= {start_ts}
-    AND sb.finish_time < {end_ts}
-    AND sop.product_type IN (0, 2)
+    )
+),
+-- package 级 has_bom 判定（用于外卖部分 bom_uuid=0 的行）：
+-- package 下任意一个 product_bom 行有 BOM → 视为已设置
+package_has_bom AS (
+  SELECT DISTINCT pb.product_package_uuid AS pp_uuid
+  FROM `{project}.{dataset}.ttpos_product_bom` pb
+  JOIN bom_set b ON b.pb_uuid = pb.uuid
+  WHERE pb.delete_time = 0
 )
 SELECT
   IFNULL(
@@ -265,14 +530,49 @@ SELECT
      LIMIT 1),
     (SELECT name FROM `{project}.{dataset}.ttpos_company` WHERE delete_time = 0 LIMIT 1)
   ) AS store_name,
-  ps.product_package_uuid,
-  COALESCE(ps.product_name_zh, ps.product_name_en, ps.product_name_th, '未知') AS product_name,
-  ROUND(SUM(ps.qty), 2) AS total_qty,
-  ps.has_bom
-FROM product_sales ps
-GROUP BY ps.product_package_uuid, ps.product_name_zh, ps.product_name_en,
-         ps.product_name_th, ps.has_bom
-HAVING total_qty > 0
+  m.product_package_uuid,
+  m.product_bom_uuid,
+  -- 包名（简体）
+  COALESCE(
+    JSON_EXTRACT_SCALAR(pp.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(pp.name, '$.en'),
+    JSON_EXTRACT_SCALAR(pp.name, '$.th'),
+    '未知'
+  ) AS package_name,
+  -- 规格名（仅 flavor 行；sauce 行也带名称，作为加料一并展示）
+  COALESCE(
+    JSON_EXTRACT_SCALAR(pf.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(pf.name, '$.en'),
+    JSON_EXTRACT_SCALAR(ps.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(ps.name, '$.en'),
+    ''
+  ) AS spec_name,
+  -- bom 类型：1=flavor 规格 2=sauce 小料 0=主商品（无规格无小料）
+  CASE
+    WHEN pb.product_flavor_uuid > 0 THEN 1
+    WHEN pb.product_sauce_uuid > 0 THEN 2
+    ELSE 0
+  END AS bom_type,
+  ROUND(m.total_qty, 2) AS total_qty,
+  -- 外卖（bom_uuid=0）按 package 级判定，堂食按规格级判定
+  CASE
+    WHEN m.product_bom_uuid = 0 THEN IF(phb.pp_uuid IS NOT NULL, 1, 0)
+    ELSE IF(b.pb_uuid IS NOT NULL, 1, 0)
+  END AS has_bom
+FROM merged m
+LEFT JOIN `{project}.{dataset}.ttpos_product_package` pp
+  ON pp.uuid = m.product_package_uuid AND pp.delete_time = 0
+LEFT JOIN `{project}.{dataset}.ttpos_product_bom` pb
+  ON pb.uuid = m.product_bom_uuid AND pb.delete_time = 0
+LEFT JOIN `{project}.{dataset}.ttpos_product_flavor` pf
+  ON pf.uuid = pb.product_flavor_uuid AND pf.delete_time = 0
+LEFT JOIN `{project}.{dataset}.ttpos_product_sauce` ps
+  ON ps.uuid = pb.product_sauce_uuid AND ps.delete_time = 0
+LEFT JOIN bom_set b
+  ON b.pb_uuid = m.product_bom_uuid
+LEFT JOIN package_has_bom phb
+  ON phb.pp_uuid = m.product_package_uuid
+WHERE m.total_qty > 0
 ORDER BY has_bom DESC, total_qty DESC
 """
 
@@ -548,6 +848,7 @@ SQL_TEMPLATES = {
 
     # 物品消耗
     'material_consumption': MATERIAL_CONSUMPTION_SQL,
+    'material_bom_consumption': MATERIAL_BOM_CONSUMPTION_SQL,
     'specific_material_consumption': SPECIFIC_MATERIAL_CONSUMPTION_SQL,
 
     # BOM商品
