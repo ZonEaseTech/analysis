@@ -433,7 +433,24 @@ SINGLE_ORDERS_SQL = _PROFIT_SALES_TPL.replace("{product_type}", "0")
 
 # 产品 BOM 结构（不关联订单表，纯产品级数据）
 # bom_unit / conversion_rate 来自 ttpos 配方录入，用于把 ERP 基准单位价换算到配方单位价
+#
+# 软删除处理: ttpos 商品/规格被软删后，pb.delete_time != 0，但历史销售 (statistics_product)
+# 仍引用该 product_package_uuid（例: 蜜汁手扒半鸡 4-22 软删，3 月销售仍存在）。
+# 直接 WHERE pb.delete_time = 0 会让这类商品的 BOM 全丢、被迫走 fallback Excel → 算错。
+# 用 window 函数实现"active 优先 + 没 active 才回退 deleted"：
+#   - 同一 product_package_uuid 下若存在 active 行 (delete_time=0)，只取 active
+#   - 全部已被软删时，把 deleted 行也带回来（用于已下架但有历史销售的商品）
 BOM_SQL = """
+WITH bom_with_flag AS (
+  SELECT
+    pb.uuid,
+    pb.product_package_uuid,
+    pb.product_bom_card_uuid,
+    pb.delete_time,
+    SUM(CASE WHEN pb.delete_time = 0 THEN 1 ELSE 0 END)
+      OVER (PARTITION BY pb.product_package_uuid) AS active_count
+  FROM `{project}`.`{dataset}`.`ttpos_product_bom` pb
+)
 SELECT
   pb.product_package_uuid AS item_uuid,
   m.code AS material_code,
@@ -447,7 +464,7 @@ SELECT
   ) AS bom_unit,
   rm.base_unit_conversion_rate AS conversion_rate,
   m.price AS material_bq_price
-FROM `{project}`.`{dataset}`.`ttpos_product_bom` pb
+FROM bom_with_flag pb
 LEFT JOIN `{project}`.`{dataset}`.`ttpos_related_material` rm
   ON (
     (pb.product_bom_card_uuid > 0 AND rm.related_uuid = pb.product_bom_card_uuid)
@@ -456,7 +473,7 @@ LEFT JOIN `{project}`.`{dataset}`.`ttpos_related_material` rm
   AND rm.delete_time = 0
 LEFT JOIN `{project}`.`{dataset}`.`ttpos_material` m
   ON m.uuid = rm.material_uuid AND m.delete_time = 0
-WHERE pb.delete_time = 0
+WHERE (pb.delete_time = 0 OR pb.active_count = 0)
 """
 
 # 套餐结构（combo_uuid -> child_uuid），从当前时间范围订单推断
@@ -613,7 +630,8 @@ def _load_boms(engine, merchants, config: dict = None):
     # v2: 增加 bom_unit / conversion_rate 字段，旧缓存格式不兼容
     # v3: BOM 加载层去重 (store, item, material)，旧缓存有重复行
     # v4: 应用市场 BOM 替换/删除规则 (FR01008→FR02001, VE01001→MK01018, drop TL99008)
-    key = cache_key("boms_v4", {"count": len(merchants)})
+    # v5: 软删商品的 BOM fallback —— pb.delete_time != 0 但全店无 active 时仍纳入
+    key = cache_key("boms_v5", {"count": len(merchants)})
     cached = get_cache(key, ttl_seconds=cache_ttl)
     if cached is not None:
         print(f"[BOM] 缓存命中: {len(cached)} 个门店")
