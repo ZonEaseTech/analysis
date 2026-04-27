@@ -62,37 +62,56 @@ WHERE delete_time = 0
 #   3. 取消订单 state=60 算入 takeout 营业额（对齐 ttpos 后端，统一算法）
 COMPREHENSIVE_SALES_SQL = """
 WITH
-pos_bill_agg AS (
-  -- 营业额/实收：按 sale_bill_uuid 聚合 statistics_sale
-  -- 测试营业时段排除（{exclude_test_business_ss} 仅当该店有 business_status_period 表时填充）
+-- POS 营业额/实收：per-bill COALESCE(statistics_sale, sale_bill)
+-- statistics_sale 是 ttpos UI "门店统计" 的真实数据源 → 折前营业额（含未扣折扣，行业惯例）
+-- 但 ttpos 后端有 2 类 bug，需要规避:
+--   1. 异步生成 statistics_sale 失败 → 漏单 → 这里 sale_bill 兜底
+--   2. 消息重试缺幂等 → 同 (sale_bill_uuid, sale_order_uuid, duty_no) 写 2+ 行 → 这里 ROW_NUMBER 去重
+-- 订单数仍用 sale_bill 计数（事实数据源，不漏）
+ss_dedup AS (
+  -- 去重：同 (sale_bill_uuid, sale_order_uuid, duty_no, desk_uuid) 仅保留 1 行
+  -- 不同 sale_order_uuid 是合法的拆单/多单，不算重复
+  SELECT * EXCEPT(_rn)
+  FROM (
+    SELECT
+      *,
+      ROW_NUMBER() OVER (
+        PARTITION BY sale_bill_uuid, sale_order_uuid, duty_no, desk_uuid
+        ORDER BY uuid
+      ) AS _rn
+    FROM `{project}.{dataset}.ttpos_statistics_sale`
+    WHERE delete_time = 0
+      AND complete_time >= {start_ts} AND complete_time < {end_ts}
+      {exclude_test_business_ss}
+  )
+  WHERE _rn = 1
+),
+ss_per_bill AS (
   SELECT
     sale_bill_uuid,
-    is_meger,
-    SUM(product_price + product_tax + service_fee + service_tax + payment_fee + extend_price) AS sale_amount,
-    SUM(payment_amount - refund_amount - payment_balance) AS received_amount
-  FROM `{project}.{dataset}.ttpos_statistics_sale`
-  WHERE delete_time = 0
-    AND complete_time >= {start_ts} AND complete_time < {end_ts}
-    {exclude_test_business_ss}
-  GROUP BY sale_bill_uuid, is_meger
+    SUM(product_price + product_tax + service_fee + service_tax + payment_fee + extend_price) AS ss_amount,
+    SUM(payment_amount - refund_amount - payment_balance) AS ss_received
+  FROM ss_dedup
+  GROUP BY sale_bill_uuid
 ),
-pos_amount AS (
+pos_per_bill AS (
+  -- sale_bill 是订单事实表；statistics_sale 缺时用 sale_bill 兜底
+  -- (兜底默认无退款，因为漏的单往往是 ttpos 后端 bug，未触发退款流程)
   SELECT
-    ROUND(SUM(sale_amount), 2) AS turnover,
-    ROUND(SUM(received_amount), 2) AS received
-  FROM pos_bill_agg
-),
-pos_order_count AS (
-  -- 订单数：直接用 sale_bill 计数（不用 statistics_sale 的 SUM(IF(is_meger=0,1,0))）
-  -- 原因：ttpos 后端有时异步生成 statistics_sale 失败 → 订单"消失"。sale_bill 是事实数据源，
-  -- delete_time=0 已经天然过滤被合单吞并的 bill，等价于 is_meger=0 口径。
-  -- 跟 ttpos UI 可能差几单（ttpos UI 也用 statistics_sale），但跟实际成交订单数一致。
-  SELECT COUNT(*) AS cnt
-  FROM `{project}.{dataset}.ttpos_sale_bill`
-  WHERE delete_time = 0
-    AND status = 1
-    AND finish_time >= {start_ts} AND finish_time < {end_ts}
+    COALESCE(ss.ss_amount, sb.amount) AS turnover,
+    COALESCE(ss.ss_received, sb.payment_amount) AS received
+  FROM `{project}.{dataset}.ttpos_sale_bill` sb
+  LEFT JOIN ss_per_bill ss ON ss.sale_bill_uuid = sb.uuid
+  WHERE sb.delete_time = 0 AND sb.status = 1
+    AND sb.finish_time >= {start_ts} AND sb.finish_time < {end_ts}
     {exclude_test_business_sb}
+),
+pos_summary AS (
+  SELECT
+    ROUND(SUM(turnover), 2) AS turnover,
+    ROUND(SUM(received), 2) AS received,
+    COUNT(*) AS cnt
+  FROM pos_per_bill
 ),
 -- 第三方外卖 (grab/lineman/shopee) — 对齐 ttpos statistics_takeout
 -- ttpos-server-go/main/app/repository/statistics_takeout.go:434
@@ -131,11 +150,10 @@ SELECT
      WHERE `key` = 'store' AND delete_time = 0
      LIMIT 1), '') AS store_code,
   c.name AS store_name,
-  IFNULL(pa.turnover, 0) + IFNULL(ts.turnover, 0) AS total_turnover,
-  IFNULL(pa.received, 0) + IFNULL(ts.received, 0) AS total_received,
-  IFNULL(poc.cnt, 0) + IFNULL(ts.cnt, 0) AS total_orders
-FROM pos_amount pa
-CROSS JOIN pos_order_count poc
+  IFNULL(ps.turnover, 0) + IFNULL(ts.turnover, 0) AS total_turnover,
+  IFNULL(ps.received, 0) + IFNULL(ts.received, 0) AS total_received,
+  IFNULL(ps.cnt, 0) + IFNULL(ts.cnt, 0) AS total_orders
+FROM pos_summary ps
 CROSS JOIN takeout_sales ts
 CROSS JOIN `{project}.{dataset}.ttpos_company` c
 WHERE c.delete_time = 0
