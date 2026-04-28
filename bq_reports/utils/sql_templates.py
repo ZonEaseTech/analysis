@@ -861,6 +861,230 @@ ORDER BY sb.finish_time DESC
 """
 
 
+# ==================== 8. 支付方式明细 ====================
+#
+# 按门店 × 支付方式聚合，给客户做对账（跟支付平台/银行流水核对）。
+#
+# ttpos 源码:
+#   - POS:    ttpos-server-go/main/app/repository/statistics.go:671-693 (CountPayment)
+#             表 statistics_payment, JOIN payment_method 取支付方式名
+#   - 外卖:    ttpos-server-go/main/app/repository/statistics_takeout.go:295-380 (CountTakeoutPayment)
+#             takeout_order.platform 直接当作支付方式名（'grab' → 'Grab'）
+#
+# 注意:
+#   1. statistics_payment 跟 statistics_sale 一样有偶发"消息重试 + 缺幂等" 重复行 bug,
+#      需要用 ROW_NUMBER 按 (sale_bill_uuid, sale_order_uuid, payment_method_uuid) 去重。
+#      53 店实测 1 家有 1 组重复（影响 ~0.001%），不去重会金额翻倍。
+#   2. payment_method.payment_name 是纯字符串（不是多语言 JSON），直接取。
+#   3. 外卖 platform 跟 POS payment_method 名称可能重复（如 LINE MAN 在 payment_method 表
+#      也有 source=1 的条目），但语义不同：POS 侧是顾客在 ttpos 内选 LINE MAN 收款，
+#      外卖侧是 LINE MAN 平台 API 同步过来的订单。两路数据无关联，不去重。
+#   4. 退款金额: POS 侧从 statistics_payment.refund_amount, 外卖从 platform_total[state=60]
+PAYMENT_BREAKDOWN_SQL = """
+WITH
+pos_payment_dedup AS (
+  -- 跟 ss_dedup 同思路：消息重试导致同 (bill, order, method) 写多行，去重
+  SELECT * EXCEPT(_rn)
+  FROM (
+    SELECT
+      sale_bill_uuid,
+      sale_order_uuid,
+      payment_method_uuid,
+      payment_amount,
+      refund_amount,
+      ROW_NUMBER() OVER (
+        PARTITION BY sale_bill_uuid, sale_order_uuid, payment_method_uuid
+        ORDER BY uuid
+      ) AS _rn
+    FROM `{project}.{dataset}.ttpos_statistics_payment`
+    WHERE delete_time = 0
+      AND complete_time >= {start_ts} AND complete_time < {end_ts}
+      {exclude_test_business_ss}
+  )
+  WHERE _rn = 1
+),
+pos_payment AS (
+  SELECT
+    pm.payment_name AS method_name,
+    'POS' AS channel,
+    COUNT(*) AS bill_cnt,
+    ROUND(SUM(spp.payment_amount), 2) AS total_amount,
+    ROUND(SUM(spp.refund_amount), 2) AS total_refund
+  FROM pos_payment_dedup spp
+  LEFT JOIN `{project}.{dataset}.ttpos_payment_method` pm
+    ON pm.uuid = spp.payment_method_uuid
+  GROUP BY method_name
+),
+takeout_payment AS (
+  -- 外卖平台直接收款（钱在平台手里，对账要跟平台结算单核）
+  -- 跟销售业绩 sheet 实收口径一致：只算 state IN (10,20,30,40)，不含取消订单（state=60）
+  -- 取消订单语义是"顾客下单后取消"，钱根本没结算给商家，不算"退款"
+  SELECT
+    CASE platform
+      WHEN 'grab' THEN 'Grab'
+      WHEN 'lineman' THEN 'LINE MAN'
+      WHEN 'shopee' THEN 'Shopee'
+      ELSE platform
+    END AS method_name,
+    '外卖平台' AS channel,
+    COUNT(*) AS bill_cnt,
+    ROUND(SUM(platform_total), 2) AS total_amount,
+    CAST(0 AS NUMERIC) AS total_refund
+  FROM `{project}.{dataset}.ttpos_takeout_order`
+  WHERE delete_time = 0
+    AND order_state IN (10, 20, 30, 40)
+    AND platform IN ('grab', 'lineman', 'shopee')
+    AND accepted_time > 0
+    AND (
+      CASE WHEN order_state = 40 AND completed_time > 0 THEN completed_time
+           ELSE accepted_time END
+    ) >= {start_ts}
+    AND (
+      CASE WHEN order_state = 40 AND completed_time > 0 THEN completed_time
+           ELSE accepted_time END
+    ) < {end_ts}
+  GROUP BY method_name
+),
+all_payments AS (
+  SELECT * FROM pos_payment
+  UNION ALL
+  SELECT * FROM takeout_payment
+)
+SELECT
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_code')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0 LIMIT 1), '') AS store_code,
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_name')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0 LIMIT 1),
+    (SELECT name FROM `{project}.{dataset}.ttpos_company` WHERE delete_time = 0 LIMIT 1)
+  ) AS store_name,
+  IFNULL(method_name, '未知') AS method_name,
+  channel,
+  bill_cnt,
+  total_amount,
+  total_refund,
+  ROUND(total_amount - total_refund, 2) AS net_amount
+FROM all_payments
+WHERE bill_cnt > 0 OR total_amount > 0 OR total_refund > 0
+ORDER BY channel, total_amount DESC
+"""
+
+
+# ==================== 9. 支付方式明细（按天） ====================
+#
+# 跟 PAYMENT_BREAKDOWN_SQL 同源，但按 (日期, 支付方式, 渠道) 拆开 → 给客户做日报对账。
+# 跨 sheet 校验：SUM(每店每天每方式净收) = PAYMENT_BREAKDOWN_SQL 月度净收。
+#
+# 时区: BKK (+07:00) — 跟 ttpos 业务时区对齐，月度边界 ttpos 按 BKK 算
+#
+# ttpos 源码:
+#   - POS:    ttpos-server-go/main/app/repository/statistics.go:723-797 (CountPaymentDays)
+#             去 timezone 后按 DATE 分组
+#   - 外卖:    statistics_takeout.go 同样动态时间字段 + 时区转换
+PAYMENT_BREAKDOWN_DAILY_SQL = """
+WITH
+pos_payment_dedup AS (
+  SELECT * EXCEPT(_rn)
+  FROM (
+    SELECT
+      sale_bill_uuid,
+      sale_order_uuid,
+      payment_method_uuid,
+      payment_amount,
+      refund_amount,
+      complete_time,
+      ROW_NUMBER() OVER (
+        PARTITION BY sale_bill_uuid, sale_order_uuid, payment_method_uuid
+        ORDER BY uuid
+      ) AS _rn
+    FROM `{project}.{dataset}.ttpos_statistics_payment`
+    WHERE delete_time = 0
+      AND complete_time >= {start_ts} AND complete_time < {end_ts}
+      {exclude_test_business_ss}
+  )
+  WHERE _rn = 1
+),
+pos_payment AS (
+  SELECT
+    DATE(TIMESTAMP_SECONDS(spp.complete_time), 'Asia/Bangkok') AS pay_date,
+    pm.payment_name AS method_name,
+    'POS' AS channel,
+    COUNT(*) AS bill_cnt,
+    ROUND(SUM(spp.payment_amount), 2) AS total_amount,
+    ROUND(SUM(spp.refund_amount), 2) AS total_refund
+  FROM pos_payment_dedup spp
+  LEFT JOIN `{project}.{dataset}.ttpos_payment_method` pm
+    ON pm.uuid = spp.payment_method_uuid
+  GROUP BY pay_date, method_name
+),
+takeout_payment AS (
+  -- 外卖：动态时间字段（state=40 用 completed_time，其他用 accepted_time）
+  -- 跟销售业绩 sheet 实收口径一致：只算 state IN (10,20,30,40)，不含取消订单
+  SELECT
+    DATE(
+      TIMESTAMP_SECONDS(
+        CASE WHEN order_state = 40 AND completed_time > 0 THEN completed_time
+             ELSE accepted_time END
+      ),
+      'Asia/Bangkok'
+    ) AS pay_date,
+    CASE platform
+      WHEN 'grab' THEN 'Grab'
+      WHEN 'lineman' THEN 'LINE MAN'
+      WHEN 'shopee' THEN 'Shopee'
+      ELSE platform
+    END AS method_name,
+    '外卖平台' AS channel,
+    COUNT(*) AS bill_cnt,
+    ROUND(SUM(platform_total), 2) AS total_amount,
+    CAST(0 AS NUMERIC) AS total_refund
+  FROM `{project}.{dataset}.ttpos_takeout_order`
+  WHERE delete_time = 0
+    AND order_state IN (10, 20, 30, 40)
+    AND platform IN ('grab', 'lineman', 'shopee')
+    AND accepted_time > 0
+    AND (
+      CASE WHEN order_state = 40 AND completed_time > 0 THEN completed_time
+           ELSE accepted_time END
+    ) >= {start_ts}
+    AND (
+      CASE WHEN order_state = 40 AND completed_time > 0 THEN completed_time
+           ELSE accepted_time END
+    ) < {end_ts}
+  GROUP BY pay_date, method_name
+),
+all_daily AS (
+  SELECT * FROM pos_payment
+  UNION ALL
+  SELECT * FROM takeout_payment
+)
+SELECT
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_code')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0 LIMIT 1), '') AS store_code,
+  IFNULL(
+    (SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_name')
+     FROM `{project}.{dataset}.ttpos_setting`
+     WHERE `key` = 'store' AND delete_time = 0 LIMIT 1),
+    (SELECT name FROM `{project}.{dataset}.ttpos_company` WHERE delete_time = 0 LIMIT 1)
+  ) AS store_name,
+  FORMAT_DATE('%Y-%m-%d', pay_date) AS pay_date,
+  IFNULL(method_name, '未知') AS method_name,
+  channel,
+  bill_cnt,
+  total_amount,
+  total_refund,
+  ROUND(total_amount - total_refund, 2) AS net_amount
+FROM all_daily
+WHERE bill_cnt > 0 OR total_amount > 0 OR total_refund > 0
+ORDER BY pay_date, channel, total_amount DESC
+"""
+
+
 # ==================== 模板字典（便于查找） ====================
 
 SQL_TEMPLATES = {
@@ -889,6 +1113,10 @@ SQL_TEMPLATES = {
 
     # 订单国籍
     'order_nationality': ORDER_NATIONALITY_SQL,
+
+    # 支付方式明细
+    'payment_breakdown': PAYMENT_BREAKDOWN_SQL,
+    'payment_breakdown_daily': PAYMENT_BREAKDOWN_DAILY_SQL,
 }
 
 
