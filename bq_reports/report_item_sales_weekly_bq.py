@@ -123,10 +123,15 @@ def query_shop(client, dataset_id, start_ts, end_ts):
       B. 堂食 套餐子品 → 归到「单品」：sale_order_product where product_type=2
       C. 外卖：takeout_order_item (按 ttpos_product_type 分类)
     """
-    # 多语言原始字段（从 product_package.name 拆出）
+    # 商品名多语言
     pp_zh = "JSON_EXTRACT_SCALAR(pp.name, '$.zh')"
     pp_en = "JSON_EXTRACT_SCALAR(pp.name, '$.en')"
     pp_th = "JSON_EXTRACT_SCALAR(pp.name, '$.th')"
+
+    # 分类名多语言
+    pc_zh = "JSON_EXTRACT_SCALAR(pc.name, '$.zh')"
+    pc_en = "JSON_EXTRACT_SCALAR(pc.name, '$.en')"
+    pc_th = "JSON_EXTRACT_SCALAR(pc.name, '$.th')"
 
     # sop.name 也是 JSON 快照
     sop_zh = "JSON_EXTRACT_SCALAR(sop.name, '$.zh')"
@@ -155,10 +160,15 @@ def query_shop(client, dataset_id, start_ts, end_ts):
             {pp_zh} AS name_zh,
             {pp_en} AS name_en,
             {pp_th} AS name_th,
+            {pc_zh} AS cat_zh,
+            {pc_en} AS cat_en,
+            {pc_th} AS cat_th,
             CAST(sp.product_num AS FLOAT64) AS qty
         FROM `{PROJECT_ID}.{dataset_id}.ttpos_statistics_product` sp
         LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_package` pp
             ON pp.uuid = sp.product_package_uuid AND pp.delete_time = 0
+        LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_category` pc
+            ON pc.uuid = pp.category_uuid AND pc.delete_time = 0
         WHERE sp.delete_time = 0
           AND sp.complete_time BETWEEN {start_ts} AND {end_ts}
     ),
@@ -173,6 +183,9 @@ def query_shop(client, dataset_id, start_ts, end_ts):
             COALESCE({pp_zh}, {sop_zh}) AS name_zh,
             COALESCE({pp_en}, {sop_en}) AS name_en,
             COALESCE({pp_th}, {sop_th}) AS name_th,
+            {pc_zh} AS cat_zh,
+            {pc_en} AS cat_en,
+            {pc_th} AS cat_th,
             CAST(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num) AS FLOAT64) AS qty
         FROM `{PROJECT_ID}.{dataset_id}.ttpos_sale_order_product` sop
         INNER JOIN `{PROJECT_ID}.{dataset_id}.ttpos_sale_bill` sb
@@ -181,6 +194,8 @@ def query_shop(client, dataset_id, start_ts, end_ts):
             ON so.uuid = sop.sale_order_uuid AND so.delete_time = 0
         LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_package` pp
             ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
+        LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_category` pc
+            ON pc.uuid = pp.category_uuid AND pc.delete_time = 0
         WHERE sop.delete_time = 0
           AND sop.cancel_time = 0
           AND sb.status = 1
@@ -198,12 +213,17 @@ def query_shop(client, dataset_id, start_ts, end_ts):
             {toi_zh} AS name_zh,
             {toi_en} AS name_en,
             {toi_th} AS name_th,
+            {pc_zh} AS cat_zh,
+            {pc_en} AS cat_en,
+            {pc_th} AS cat_th,
             CAST(toi.quantity AS FLOAT64) AS qty
         FROM `{PROJECT_ID}.{dataset_id}.ttpos_takeout_order_item` toi
         INNER JOIN `{PROJECT_ID}.{dataset_id}.ttpos_takeout_order` tko
             ON tko.uuid = toi.takeout_order_uuid AND tko.delete_time = 0
         LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_package` pp
             ON pp.uuid = toi.ttpos_product_package_uuid AND pp.delete_time = 0
+        LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_category` pc
+            ON pc.uuid = pp.category_uuid AND pc.delete_time = 0
         WHERE toi.delete_time = 0
           AND tko.order_state IN (10, 20, 30, 40, 60)
           AND tko.accepted_time > 0
@@ -225,6 +245,9 @@ def query_shop(client, dataset_id, start_ts, end_ts):
         MAX(name_zh) AS name_zh,
         MAX(name_en) AS name_en,
         MAX(name_th) AS name_th,
+        MAX(cat_zh) AS cat_zh,
+        MAX(cat_en) AS cat_en,
+        MAX(cat_th) AS cat_th,
         ROUND(SUM(qty), 4) AS total_qty
     FROM unioned
     WHERE qty > 0
@@ -236,7 +259,8 @@ def query_shop(client, dataset_id, start_ts, end_ts):
         result = client.query(query).result()
         return [
             (r.sale_date, r.row_type, r.product_uuid,
-             r.name_zh, r.name_en, r.name_th, r.total_qty)
+             r.name_zh, r.name_en, r.name_th,
+             r.cat_zh, r.cat_en, r.cat_th, r.total_qty)
             for r in result
         ]
     except Exception as e:
@@ -296,14 +320,14 @@ def pick_name(name_zh, name_en, name_th, prefer):
 
 def write_sheet(ws, lang, rows):
     """
-    rows: 已聚合好的列表 (store_no, store_name, sale_date, row_type, product_name, qty)
+    rows: (store_no, store_name, sale_date, row_type, category, product_name, qty)
     lang: 'zh' or 'en'
     """
     if lang == "zh":
-        headers = ["门店编号", "门店名称", "日期", "类型", "商品名称", "销量"]
+        headers = ["门店编号", "门店名称", "日期", "类型", "分类", "商品名称", "销量"]
         type_map = {"单品": "单品", "套餐": "套餐"}
     else:
-        headers = ["Store Code", "Store Name", "Date", "Type", "Product Name", "Qty"]
+        headers = ["Store Code", "Store Name", "Date", "Type", "Category", "Product Name", "Qty"]
         type_map = {"单品": "Single Item", "套餐": "Combo"}
 
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
@@ -322,52 +346,57 @@ def write_sheet(ws, lang, rows):
         c.alignment = Alignment(horizontal="center")
 
     for ri, row in enumerate(rows, 2):
-        store_no, store_name, sale_date, row_type, product_name, qty = row
+        store_no, store_name, sale_date, row_type, category, product_name, qty = row
         ws.cell(row=ri, column=1, value=store_no).border = thin
         ws.cell(row=ri, column=2, value=store_name).border = thin
         ws.cell(row=ri, column=3, value=str(sale_date)).border = thin
         ws.cell(row=ri, column=4, value=type_map.get(row_type, row_type)).border = thin
-        ws.cell(row=ri, column=5, value=product_name).border = thin
-        c = ws.cell(row=ri, column=6, value=float(qty))
+        ws.cell(row=ri, column=5, value=category).border = thin
+        ws.cell(row=ri, column=6, value=product_name).border = thin
+        c = ws.cell(row=ri, column=7, value=float(qty))
         c.border = thin
         c.number_format = "#,##0.####"
 
-    for i, w in enumerate([12, 28, 12, 10, 45, 12], 1):
+    for i, w in enumerate([12, 28, 12, 10, 18, 45, 12], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
 
 
 def aggregate_per_lang(all_data, prefer):
     """
-    all_data 行：(store_no, store_name, sale_date, row_type, product_uuid, name_zh, name_en, name_th, qty)
+    all_data 行：(store_no, store_name, sale_date, row_type, product_uuid,
+                  name_zh, name_en, name_th, cat_zh, cat_en, cat_th, qty)
     按 (store_no, store_name, sale_date, row_type, group_key) 聚合。
-      group_key = product_uuid 优先；为空则用 chosen_name 兜底。
-    输出：(store_no, store_name, sale_date, row_type, chosen_name, qty)
+    输出：(store_no, store_name, sale_date, row_type, category, chosen_name, qty)
     """
     bucket = {}
-    name_winner = {}  # key -> chosen name
+    name_winner = {}   # key -> chosen product name
+    cat_winner = {}    # key -> chosen category name
     for (store_no, store_name, sale_date, row_type,
-         product_uuid, name_zh, name_en, name_th, qty) in all_data:
+         product_uuid, name_zh, name_en, name_th,
+         cat_zh, cat_en, cat_th, qty) in all_data:
         chosen = pick_name(name_zh, name_en, name_th, prefer)
+        cat = pick_name(cat_zh, cat_en, cat_th, prefer)
         gkey = product_uuid or f"name::{chosen}"
         key = (store_no, store_name, sale_date, row_type, gkey)
         bucket[key] = bucket.get(key, 0.0) + float(qty or 0)
-        # 同一 uuid 在不同来源里语言完整度可能不同，保留首个非空
         if key not in name_winner or not name_winner[key]:
             name_winner[key] = chosen
-        elif not name_winner[key] and chosen:
-            name_winner[key] = chosen
+        if key not in cat_winner or not cat_winner[key]:
+            cat_winner[key] = cat
 
     rows = []
-    for (store_no, store_name, sale_date, row_type, _gkey), qty in bucket.items():
+    for (store_no, store_name, sale_date, row_type, gkey), qty in bucket.items():
         if qty <= 0:
             continue
+        key = (store_no, store_name, sale_date, row_type, gkey)
         rows.append((
             store_no, store_name, sale_date, row_type,
-            name_winner.get((store_no, store_name, sale_date, row_type, _gkey), ""),
+            cat_winner.get(key, ""),
+            name_winner.get(key, ""),
             round(qty, 4),
         ))
-    # 排序：门店编号(数字优先) → 日期 → 类型(套餐先) → 商品名
+    # 排序：门店编号(数字优先) → 日期 → 类型(套餐先) → 分类 → 商品名
     def sort_key(r):
         sn = r[0]
         try:
@@ -375,7 +404,7 @@ def aggregate_per_lang(all_data, prefer):
         except Exception:
             sn_n = (1, sn)
         type_order = 0 if r[3] == "套餐" else 1
-        return (sn_n, str(r[2]), type_order, r[4])
+        return (sn_n, str(r[2]), type_order, r[4], r[5])
     rows.sort(key=sort_key)
     return rows
 
@@ -446,9 +475,9 @@ def main():
     csv_path = OUTPUT_DIR / f"{file_prefix}_v{version}.csv"
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["门店编号", "门店名称", "日期", "类型", "商品名称", "销量"])
+        w.writerow(["门店编号", "门店名称", "日期", "类型", "分类", "商品名称", "销量"])
         for row in rows_zh:
-            w.writerow([row[0], row[1], str(row[2]), row[3], row[4], f"{row[5]:.4f}"])
+            w.writerow([row[0], row[1], str(row[2]), row[3], row[4], row[5], f"{row[6]:.4f}"])
     log(f"CSV: {csv_path}")
 
     # Excel：双 Sheet
