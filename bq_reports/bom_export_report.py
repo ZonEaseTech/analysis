@@ -2,24 +2,21 @@
 """
 BOM 配方导出 —— 市场需求版
 
-输出：双 sheet Excel
+输出：三 sheet Excel
   Sheet 1「BOM清单」：5 列(门店名称 | 商品名称 | BOM物品名称 | BOM消耗 | BOM单位)
-                     仅含已配置 BOM 的单品/加料
+                     已配置 BOM 的单品/加料
   Sheet 2「未配置BOM」：3 列(门店名称 | 商品类型 | 商品名称)
                        未配置 BOM 的单品 + 加料,各商品/加料 1 行
+  Sheet 3「套餐组成」：7 列(门店名称 | 套餐名称 | 分组名 | 子商品 | 数量 | 是否必选 | 加价)
+                     套餐(product_type=1)的组与子商品明细
 
 范围：
-  - 华莱士总店配置(headquarter_uuid=5080409448448000,53 家分店统一下发)
-  - 商品类型:单品 + 加料(不含套餐)
+  - 商户真实名称取自 ttpos_company.name(优先 JSON zh,回退 en,再回退原始值)
+  - 商品类型:单品 + 加料 + 套餐
     - 单品:ttpos_product_package.product_type = 0
     - 加料:ttpos_product_sauce 表(独立菜单,前端 /product/sauce/*)
-  - BOM 关联:
-    - 单品:product_bom.product_bom_card_uuid > 0 → product_bom_card → related_material
-    - 加料:product_sauce.product_bom_card_uuid → product_bom_card → related_material
-
-数据特性(写脚本时已验证):
-  - 53 家分店 product_package/sauce 完全一致,任意一家 dataset 即可
-  - 加料目前 53×6=318 条全部 product_bom_card_uuid=0,全部进 Sheet 2
+    - 套餐:ttpos_product_package.product_type = 1
+  - 53 家分店产品配置完全一致(总部下发)
 
 Usage:
     venv/bin/python -m bq_reports.bom_export_report --output exports/bom_export.xlsx
@@ -37,10 +34,22 @@ from bq_reports.utils.bq_client import get_bq_client, setup_proxy
 PROJECT_ID = "diyl-407103"
 # 任意一家分店 dataset(总部下发,配置一致)
 DEFAULT_DATASET = "shop1958987436032000"
-STORE_NAME = "华莱士总店"
 
 # 报表版本号 —— 每次正式交付前递增
-REPORT_VERSION = "v3"
+REPORT_VERSION = "v8"
+
+# 门店名称从 BQ ttpos_company 动态加载
+STORE_NAME_SQL = """
+SELECT
+  COALESCE(
+    JSON_EXTRACT_SCALAR(name, '$.zh'),
+    JSON_EXTRACT_SCALAR(name, '$.en'),
+    name
+  ) AS company_name
+FROM `{project}`.`{dataset}`.`ttpos_company`
+WHERE delete_time = 0
+LIMIT 1
+"""
 
 # 单品 BOM —— LEFT JOIN 保留无 BOM 的单品
 # 商品名后缀规则(优先级从高到低):
@@ -112,6 +121,7 @@ SELECT
     -- 默认: 原商品名
     ELSE pm.base_name
   END AS product_name,
+  pm.category_name AS category_name,
   COALESCE(JSON_EXTRACT_SCALAR(m.name, '$.zh'),
            JSON_EXTRACT_SCALAR(m.name, '$.en')) AS material_name,
   rm.num AS bom_num,
@@ -143,6 +153,7 @@ SELECT
     JSON_EXTRACT_SCALAR(ps.name, '$.en'),
     ''
   ), r'^\\s+|\\s+$', '') AS product_name,
+  '' AS category_name,
   COALESCE(JSON_EXTRACT_SCALAR(m.name, '$.zh'),
            JSON_EXTRACT_SCALAR(m.name, '$.en')) AS material_name,
   rm.num AS bom_num,
@@ -160,6 +171,41 @@ LEFT JOIN `{project}`.`{dataset}`.`ttpos_material` m
 WHERE ps.delete_time = 0
 """
 
+# 套餐组成(product_package_group + group_item)
+# group_type: 0=固定(套餐必含), 1=可选(顾客可选择)
+COMBO_SQL = """
+SELECT
+  pp.uuid AS combo_uuid,
+  REGEXP_REPLACE(COALESCE(
+    JSON_EXTRACT_SCALAR(pp.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(pp.name, '$.en'),
+    ''
+  ), r'^\\s+|\\s+$', '') AS combo_name,
+  REGEXP_REPLACE(COALESCE(
+    JSON_EXTRACT_SCALAR(pgrp.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(pgrp.name, '$.en'),
+    ''
+  ), r'^\\s+|\\s+$', '') AS group_name,
+  REGEXP_REPLACE(COALESCE(
+    JSON_EXTRACT_SCALAR(child.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(child.name, '$.en'),
+    ''
+  ), r'^\\s+|\\s+$', '') AS child_name,
+  gpi.num AS child_num,
+  pgrp.group_type AS group_type,  -- 0=固定, 1=可选
+  gpi.is_required,
+  gpi.add_price
+FROM `{project}`.`{dataset}`.`ttpos_product_package` pp
+JOIN `{project}`.`{dataset}`.`ttpos_product_package_group` pgrp
+  ON pgrp.product_package_uuid = pp.uuid AND pgrp.delete_time = 0
+JOIN `{project}`.`{dataset}`.`ttpos_product_package_group_item` gpi
+  ON gpi.product_package_group_uuid = pgrp.uuid AND gpi.delete_time = 0
+JOIN `{project}`.`{dataset}`.`ttpos_product_package` child
+  ON child.uuid = gpi.related_uuid AND child.delete_time = 0
+WHERE pp.delete_time = 0 AND pp.product_type = 1
+ORDER BY pp.uuid, pgrp.uuid, gpi.sort
+"""
+
 TYPE_LABEL = {0: "单品", 1: "加料"}
 
 
@@ -171,6 +217,19 @@ def query_rows(client, dataset: str):
     ORDER BY sort_type, product_name, material_name
     """
     return list(client.query(sql).result())
+
+
+def query_combo_rows(client, dataset: str):
+    sql = COMBO_SQL.format(project=client.project, dataset=dataset)
+    return list(client.query(sql).result())
+
+
+def get_store_name(client, dataset: str) -> str:
+    sql = STORE_NAME_SQL.format(project=client.project, dataset=dataset)
+    for row in client.query(sql).result():
+        name = row.company_name or ""
+        return name.strip() if name else ""
+    return ""
 
 
 def split_rows(rows):
@@ -218,48 +277,47 @@ def _merge_runs(ws, col_letter: str, start_row: int, end_row: int, value_of):
         ws.merge_cells(f"{col_letter}{run_start}:{col_letter}{end_row}")
 
 
-def _write_bom_sheet(ws, with_bom):
-    headers = ["门店名称", "商品名称", "BOM物品名称", "BOM消耗", "BOM单位"]
+def _write_bom_sheet(ws, with_bom, store_name: str):
+    headers = ["门店名称", "商品名称", "分类", "BOM物品名称", "BOM消耗", "BOM单位"]
     _style_header(ws, headers)
 
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     for r_idx, row in enumerate(with_bom, start=2):
-        ws.cell(row=r_idx, column=1, value=STORE_NAME).alignment = center
+        ws.cell(row=r_idx, column=1, value=store_name).alignment = center
         ws.cell(row=r_idx, column=2, value=row.product_name or "").alignment = center
-        ws.cell(row=r_idx, column=3, value=row.material_name or "")
+        ws.cell(row=r_idx, column=3, value=row.category_name or "").alignment = center
+        ws.cell(row=r_idx, column=4, value=row.material_name or "")
         if row.bom_num is not None:
-            ws.cell(row=r_idx, column=4, value=float(row.bom_num))
-        ws.cell(row=r_idx, column=5, value=row.bom_unit or "")
+            ws.cell(row=r_idx, column=5, value=float(row.bom_num))
+        ws.cell(row=r_idx, column=6, value=row.bom_unit or "")
 
     if with_bom:
         last_row = 1 + len(with_bom)
-        # A 列(门店名称)整列合并 —— 全是"华莱士总店"
         if last_row > 2:
             ws.merge_cells(f"A2:A{last_row}")
-        # B 列(商品名称)相邻同名合并
-        _merge_runs(ws, "B", 2, last_row, lambda r: with_bom[r - 2].product_name)
+            _merge_runs(ws, "B", 2, last_row, lambda r: with_bom[r - 2].product_name)
+            _merge_runs(ws, "C", 2, last_row,
+                        lambda r: f"{with_bom[r - 2].product_name}|{with_bom[r - 2].category_name or ''}")
 
-    for col_idx, w in enumerate([14, 30, 28, 10, 10], 1):
+    for col_idx, w in enumerate([14, 30, 18, 28, 10, 10], 1):
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = w
     ws.freeze_panes = "A2"
 
 
-def _write_no_bom_sheet(ws, no_bom):
+def _write_no_bom_sheet(ws, no_bom, store_name: str):
     headers = ["门店名称", "商品类型", "商品名称"]
     _style_header(ws, headers)
 
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     for r_idx, row in enumerate(no_bom, start=2):
-        ws.cell(row=r_idx, column=1, value=STORE_NAME).alignment = center
+        ws.cell(row=r_idx, column=1, value=store_name).alignment = center
         ws.cell(row=r_idx, column=2, value=TYPE_LABEL.get(row.sort_type, "")).alignment = center
         ws.cell(row=r_idx, column=3, value=row.product_name or "")
 
     if no_bom:
         last_row = 1 + len(no_bom)
         if last_row > 2:
-            # A 列(门店名称)整列合并 —— 全是"华莱士总店"
             ws.merge_cells(f"A2:A{last_row}")
-            # B 列(商品类型)按"单品 / 加料"两段合并
             _merge_runs(ws, "B", 2, last_row,
                         lambda r: TYPE_LABEL.get(no_bom[r - 2].sort_type, ""))
 
@@ -268,14 +326,51 @@ def _write_no_bom_sheet(ws, no_bom):
     ws.freeze_panes = "A2"
 
 
-def write_excel(with_bom, no_bom, output_path: str):
+def _write_combo_sheet(ws, combo_rows, store_name: str):
+    headers = ["门店名称", "套餐名称", "分组", "类型", "单品名称", "数量", "是否必选", "加价"]
+    _style_header(ws, headers)
+
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for r_idx, row in enumerate(combo_rows, start=2):
+        ws.cell(row=r_idx, column=1, value=store_name).alignment = center
+        ws.cell(row=r_idx, column=2, value=row.combo_name or "").alignment = center
+        ws.cell(row=r_idx, column=3, value=row.group_name or "").alignment = center
+        ws.cell(row=r_idx, column=4, value="固定" if row.group_type == 0 else "可选").alignment = center
+        ws.cell(row=r_idx, column=5, value=row.child_name or "").alignment = center
+        ws.cell(row=r_idx, column=6, value=float(row.child_num) if row.child_num is not None else 0)
+        ws.cell(row=r_idx, column=7, value="是" if row.is_required else "否").alignment = center
+        ws.cell(row=r_idx, column=8, value=float(row.add_price) if row.add_price else 0)
+
+    if combo_rows:
+        last_row = 1 + len(combo_rows)
+        if last_row > 2:
+            # A 列(门店名称)整列合并
+            ws.merge_cells(f"A2:A{last_row}")
+            # B 列(套餐名称)相邻同名合并
+            _merge_runs(ws, "B", 2, last_row, lambda r: combo_rows[r - 2].combo_name)
+            # C 列(分组)相邻同组合并(同一套餐内的同名组合并)
+            _merge_runs(ws, "C", 2, last_row,
+                        lambda r: f"{combo_rows[r - 2].combo_name}|{combo_rows[r - 2].group_name}")
+            # D 列(类型)相邻同类型合并(同一组内的同类型合并)
+            _merge_runs(ws, "D", 2, last_row,
+                        lambda r: f"{combo_rows[r - 2].combo_name}|{combo_rows[r - 2].group_name}|{'固定' if combo_rows[r - 2].group_type == 0 else '可选'}")
+
+    for col_idx, w in enumerate([14, 25, 12, 10, 25, 8, 10, 10], 1):
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = w
+    ws.freeze_panes = "A2"
+
+
+def write_excel(with_bom, no_bom, combo_rows, store_name: str, output_path: str):
     wb = Workbook()
     ws_bom = wb.active
     ws_bom.title = "BOM清单"
-    _write_bom_sheet(ws_bom, with_bom)
+    _write_bom_sheet(ws_bom, with_bom, store_name)
 
     ws_no = wb.create_sheet("未配置BOM")
-    _write_no_bom_sheet(ws_no, no_bom)
+    _write_no_bom_sheet(ws_no, no_bom, store_name)
+
+    ws_combo = wb.create_sheet("套餐组成")
+    _write_combo_sheet(ws_combo, combo_rows, store_name)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -291,7 +386,7 @@ def _inject_version(path: str) -> str:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="华莱士总店 BOM 配方导出")
+    p = argparse.ArgumentParser(description="BOM 配方导出")
     p.add_argument("--project", default=PROJECT_ID, help="GCP 项目 ID")
     p.add_argument("--dataset", default=DEFAULT_DATASET,
                    help=f"BQ dataset(任意一家分店即可,默认 {DEFAULT_DATASET})")
@@ -310,18 +405,28 @@ def main():
     print(f"[版本] {REPORT_VERSION} → 输出路径: {output_path}")
     client = get_bq_client(project_id=args.project)
 
+    store_name = get_store_name(client, args.dataset)
+    if not store_name:
+        store_name = ""
+    print(f"[门店] {store_name}")
+
     print("[BQ] 查询单品 + 加料 BOM...")
     rows = query_rows(client, args.dataset)
-    print(f"[BQ] 拉到 {len(rows)} 行")
+    print(f"[BQ] 单品+加料共 {len(rows)} 行")
+
+    print("[BQ] 查询套餐组成...")
+    combo_rows = query_combo_rows(client, args.dataset)
+    print(f"[BQ] 套餐组成共 {len(combo_rows)} 行")
 
     with_bom, no_bom = split_rows(rows)
-    write_excel(with_bom, no_bom, output_path)
+    write_excel(with_bom, no_bom, combo_rows, store_name, output_path)
 
     no_bom_singles = sum(1 for r in no_bom if r.sort_type == 0)
     no_bom_sauces = sum(1 for r in no_bom if r.sort_type == 1)
     print(f"[完成] 输出 {output_path}")
     print(f"  Sheet 1「BOM清单」: {len(with_bom)} 行")
     print(f"  Sheet 2「未配置BOM」: {len(no_bom)} 个 (单品 {no_bom_singles} 个, 加料 {no_bom_sauces} 个)")
+    print(f"  Sheet 3「套餐组成」: {len(combo_rows)} 行")
     return 0
 
 

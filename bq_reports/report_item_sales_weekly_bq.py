@@ -9,7 +9,7 @@
 - 套餐：product_package.product_type=1 (堂食) / takeout_order_item.ttpos_product_type=1 (外卖)
 - 单品：product_package.product_type=0 + 套餐子品(product_type=2 拆回到 product_package_uuid) + 外卖单品
 
-输出：单文件三 Sheet（中文 / English / 套餐组成），列结构沿用 report_daily_item_sales_bq.py。
+输出：单文件双 Sheet（中文 / English），English 版增加 Unit Price / Total Price。
 
 用法:
     venv/bin/python -m bq_reports.report_item_sales_weekly_bq \
@@ -116,12 +116,9 @@ def next_version(out_dir: Path, prefix: str) -> int:
 
 def query_shop(client, dataset_id, start_ts, end_ts):
     """
-    返回行：(sale_date, row_type, product_uuid, name_zh, name_en, name_th, qty)
+    返回行：(sale_date, row_type, product_uuid, name_zh, name_en, name_th,
+            cat_zh, cat_en, cat_th, total_qty, total_amount)
       row_type: '套餐' / '单品'
-    四个数据源 UNION：
-      A. 堂食 单品+套餐：statistics_product (按 pp.product_type 分类)
-      B. 堂食 套餐子品 → 归到「单品」：sale_order_product where product_type=2
-      C. 外卖：takeout_order_item (按 ttpos_product_type 分类)
     """
     # 商品名多语言
     pp_zh = "JSON_EXTRACT_SCALAR(pp.name, '$.zh')"
@@ -163,7 +160,8 @@ def query_shop(client, dataset_id, start_ts, end_ts):
             {pc_zh} AS cat_zh,
             {pc_en} AS cat_en,
             {pc_th} AS cat_th,
-            CAST(sp.product_num AS FLOAT64) AS qty
+            CAST(sp.product_num AS FLOAT64) AS qty,
+            CAST(COALESCE(sp.product_final_price, 0) * sp.product_num AS FLOAT64) AS amount
         FROM `{PROJECT_ID}.{dataset_id}.ttpos_statistics_product` sp
         LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_package` pp
             ON pp.uuid = sp.product_package_uuid AND pp.delete_time = 0
@@ -186,7 +184,8 @@ def query_shop(client, dataset_id, start_ts, end_ts):
             {pc_zh} AS cat_zh,
             {pc_en} AS cat_en,
             {pc_th} AS cat_th,
-            CAST(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num) AS FLOAT64) AS qty
+            CAST(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num) AS FLOAT64) AS qty,
+            CAST(COALESCE(sop.price, 0) * sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num) AS FLOAT64) AS amount
         FROM `{PROJECT_ID}.{dataset_id}.ttpos_sale_order_product` sop
         INNER JOIN `{PROJECT_ID}.{dataset_id}.ttpos_sale_bill` sb
             ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
@@ -216,7 +215,8 @@ def query_shop(client, dataset_id, start_ts, end_ts):
             {pc_zh} AS cat_zh,
             {pc_en} AS cat_en,
             {pc_th} AS cat_th,
-            CAST(toi.quantity AS FLOAT64) AS qty
+            CAST(toi.quantity AS FLOAT64) AS qty,
+            CAST(COALESCE(toi.price, 0) * toi.quantity AS FLOAT64) AS amount
         FROM `{PROJECT_ID}.{dataset_id}.ttpos_takeout_order_item` toi
         INNER JOIN `{PROJECT_ID}.{dataset_id}.ttpos_takeout_order` tko
             ON tko.uuid = toi.takeout_order_uuid AND tko.delete_time = 0
@@ -248,7 +248,8 @@ def query_shop(client, dataset_id, start_ts, end_ts):
         MAX(cat_zh) AS cat_zh,
         MAX(cat_en) AS cat_en,
         MAX(cat_th) AS cat_th,
-        ROUND(SUM(qty), 4) AS total_qty
+        ROUND(SUM(qty), 4) AS total_qty,
+        ROUND(SUM(amount), 2) AS total_amount
     FROM unioned
     WHERE qty > 0
       AND (name_zh IS NOT NULL OR name_en IS NOT NULL OR name_th IS NOT NULL)
@@ -260,61 +261,11 @@ def query_shop(client, dataset_id, start_ts, end_ts):
         return [
             (r.sale_date, r.row_type, r.product_uuid,
              r.name_zh, r.name_en, r.name_th,
-             r.cat_zh, r.cat_en, r.cat_th, r.total_qty)
+             r.cat_zh, r.cat_en, r.cat_th, r.total_qty, r.total_amount)
             for r in result
         ]
     except Exception as e:
         log(f"  {dataset_id} 查询失败: {e}")
-        return []
-
-
-def query_combo_composition(client, dataset_id, start_ts, end_ts):
-    """
-    查询套餐组成（堂食）：套餐 → 子品 销量。
-    返回行：(sale_date, combo_uuid, combo_name_zh, combo_name_en, combo_name_th,
-            item_name_zh, item_name_en, item_name_th, combo_qty, item_qty)
-    外卖 takeout_order_item 无 product_type=2 子品，暂不计入。
-    """
-    query = f"""
-    SELECT
-        DATE(TIMESTAMP_SECONDS(
-            COALESCE(NULLIF(sb.finish_time, 0), so.finish_time)
-        )) AS sale_date,
-        parent.uuid AS combo_uuid,
-        JSON_EXTRACT_SCALAR(parent.name, '$.zh') AS combo_name_zh,
-        JSON_EXTRACT_SCALAR(parent.name, '$.en') AS combo_name_en,
-        JSON_EXTRACT_SCALAR(parent.name, '$.th') AS combo_name_th,
-        JSON_EXTRACT_SCALAR(child.name, '$.zh') AS item_name_zh,
-        JSON_EXTRACT_SCALAR(child.name, '$.en') AS item_name_en,
-        JSON_EXTRACT_SCALAR(child.name, '$.th') AS item_name_th,
-        CAST(parent.num * parent.copy_num * IF(parent.unit_num = 0, 1, parent.unit_num) AS FLOAT64) AS combo_qty,
-        CAST(child.num * child.copy_num * IF(child.unit_num = 0, 1, child.unit_num) AS FLOAT64) AS item_qty
-    FROM `{PROJECT_ID}.{dataset_id}.ttpos_sale_order_product` child
-    INNER JOIN `{PROJECT_ID}.{dataset_id}.ttpos_sale_order_product` parent
-        ON parent.uuid = child.package_uuid
-    INNER JOIN `{PROJECT_ID}.{dataset_id}.ttpos_sale_bill` sb
-        ON sb.uuid = child.sale_bill_uuid AND sb.delete_time = 0
-    LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_sale_order` so
-        ON so.uuid = child.sale_order_uuid AND so.delete_time = 0
-    WHERE child.delete_time = 0
-      AND child.cancel_time = 0
-      AND parent.delete_time = 0
-      AND parent.cancel_time = 0
-      AND sb.status = 1
-      AND child.product_type = 2
-      AND parent.product_type = 1
-      AND COALESCE(NULLIF(sb.finish_time, 0), so.finish_time) BETWEEN {start_ts} AND {end_ts}
-    ORDER BY sale_date, parent.uuid
-    """
-    try:
-        result = client.query(query).result()
-        return [
-            (r.sale_date, r.combo_uuid, r.combo_name_zh, r.combo_name_en, r.combo_name_th,
-             r.item_name_zh, r.item_name_en, r.item_name_th, r.combo_qty, r.item_qty)
-            for r in result
-        ]
-    except Exception as e:
-        log(f"  {dataset_id} 套餐组成查询失败: {e}")
         return []
 
 
@@ -349,13 +300,10 @@ def process_one(args):
 
     t0 = time.time()
     rows = query_shop(client, dataset_id, start_ts, end_ts)
-    combo_rows = query_combo_composition(client, dataset_id, start_ts, end_ts)
     elapsed = time.time() - t0
     return {
         "idx": idx, "store_no": store_no, "store_name": store_name,
-        "rows": rows, "count": len(rows),
-        "combo_rows": combo_rows, "combo_count": len(combo_rows),
-        "elapsed": elapsed,
+        "rows": rows, "count": len(rows), "elapsed": elapsed,
     }
 
 
@@ -373,15 +321,17 @@ def pick_name(name_zh, name_en, name_th, prefer):
 
 def write_sheet(ws, lang, rows):
     """
-    rows: (store_no, store_name, sale_date, row_type, category, product_name, qty)
+    rows: (store_no, store_name, sale_date, row_type, category, product_name, qty, amount)
     lang: 'zh' or 'en'
     """
     if lang == "zh":
         headers = ["门店编号", "门店名称", "日期", "类型", "分类", "商品名称", "销量"]
         type_map = {"单品": "单品", "套餐": "套餐"}
+        has_amount = False
     else:
-        headers = ["Store Code", "Store Name", "Date", "Type", "Category", "Product Name", "Qty"]
+        headers = ["Store Code", "Store Name", "Date", "Type", "Category", "Product Name", "Qty", "Unit Price", "Total Price"]
         type_map = {"单品": "Single Item", "套餐": "Combo"}
+        has_amount = True
 
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
     header_font = Font(bold=True, size=11, color="FFFFFF")
@@ -399,7 +349,12 @@ def write_sheet(ws, lang, rows):
         c.alignment = Alignment(horizontal="center")
 
     for ri, row in enumerate(rows, 2):
-        store_no, store_name, sale_date, row_type, category, product_name, qty = row
+        if has_amount:
+            store_no, store_name, sale_date, row_type, category, product_name, qty, amount = row
+        else:
+            store_no, store_name, sale_date, row_type, category, product_name, qty = row
+            amount = None
+
         ws.cell(row=ri, column=1, value=store_no).border = thin
         ws.cell(row=ri, column=2, value=store_name).border = thin
         ws.cell(row=ri, column=3, value=str(sale_date)).border = thin
@@ -410,51 +365,20 @@ def write_sheet(ws, lang, rows):
         c.border = thin
         c.number_format = "#,##0.####"
 
-    for i, w in enumerate([12, 28, 12, 10, 18, 45, 12], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    ws.freeze_panes = "A2"
+        if has_amount and amount is not None:
+            unit_price = round(float(amount) / float(qty), 2) if float(qty) != 0 else 0
+            c = ws.cell(row=ri, column=8, value=float(unit_price))
+            c.border = thin
+            c.number_format = "#,##0.00"
+            c = ws.cell(row=ri, column=9, value=float(amount))
+            c.border = thin
+            c.number_format = "#,##0.00"
 
-
-def write_combo_sheet(ws, lang, rows):
-    """
-    rows: (store_no, store_name, sale_date, combo_name, combo_qty, item_name, item_qty)
-    lang: 'zh' or 'en'
-    """
-    if lang == "zh":
-        headers = ["门店编号", "门店名称", "日期", "套餐名称", "套餐数量", "单品名称", "单品数量"]
+    if has_amount:
+        widths = [12, 28, 12, 10, 18, 45, 12, 12, 12]
     else:
-        headers = ["Store Code", "Store Name", "Date", "Combo Name", "Combo Qty", "Item Name", "Item Qty"]
-
-    header_fill = PatternFill(start_color="70AD47", end_color="70AD47", fill_type="solid")
-    header_font = Font(bold=True, size=11, color="FFFFFF")
-    thin = Border(
-        left=Side(style="thin", color="D9D9D9"),
-        right=Side(style="thin", color="D9D9D9"),
-        top=Side(style="thin", color="D9D9D9"),
-        bottom=Side(style="thin", color="D9D9D9"),
-    )
-    for ci, h in enumerate(headers, 1):
-        c = ws.cell(row=1, column=ci, value=h)
-        c.font = header_font
-        c.fill = header_fill
-        c.border = thin
-        c.alignment = Alignment(horizontal="center")
-
-    for ri, row in enumerate(rows, 2):
-        store_no, store_name, sale_date, combo_name, combo_qty, item_name, item_qty = row
-        ws.cell(row=ri, column=1, value=store_no).border = thin
-        ws.cell(row=ri, column=2, value=store_name).border = thin
-        ws.cell(row=ri, column=3, value=str(sale_date)).border = thin
-        ws.cell(row=ri, column=4, value=combo_name).border = thin
-        c = ws.cell(row=ri, column=5, value=float(combo_qty))
-        c.border = thin
-        c.number_format = "#,##0.####"
-        ws.cell(row=ri, column=6, value=item_name).border = thin
-        c = ws.cell(row=ri, column=7, value=float(item_qty))
-        c.border = thin
-        c.number_format = "#,##0.####"
-
-    for i, w in enumerate([12, 28, 12, 40, 12, 40, 12], 1):
+        widths = [12, 28, 12, 10, 18, 45, 12]
+    for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
 
@@ -462,38 +386,51 @@ def write_combo_sheet(ws, lang, rows):
 def aggregate_per_lang(all_data, prefer):
     """
     all_data 行：(store_no, store_name, sale_date, row_type, product_uuid,
-                  name_zh, name_en, name_th, cat_zh, cat_en, cat_th, qty)
+                  name_zh, name_en, name_th, cat_zh, cat_en, cat_th, qty, amount)
     按 (store_no, store_name, sale_date, row_type, group_key) 聚合。
-    输出：(store_no, store_name, sale_date, row_type, category, chosen_name, qty)
+    输出：
+      zh -> (store_no, store_name, sale_date, row_type, category, chosen_name, qty)
+      en -> (store_no, store_name, sale_date, row_type, category, chosen_name, qty, amount)
     """
     bucket = {}
-    name_winner = {}   # key -> chosen product name
-    cat_winner = {}    # key -> chosen category name
+    amount_bucket = {}
+    name_winner = {}
+    cat_winner = {}
     for (store_no, store_name, sale_date, row_type,
          product_uuid, name_zh, name_en, name_th,
-         cat_zh, cat_en, cat_th, qty) in all_data:
+         cat_zh, cat_en, cat_th, qty, amount) in all_data:
         chosen = pick_name(name_zh, name_en, name_th, prefer)
         cat = pick_name(cat_zh, cat_en, cat_th, prefer)
         gkey = product_uuid or f"name::{chosen}"
         key = (store_no, store_name, sale_date, row_type, gkey)
         bucket[key] = bucket.get(key, 0.0) + float(qty or 0)
+        amount_bucket[key] = amount_bucket.get(key, 0.0) + float(amount or 0)
         if key not in name_winner or not name_winner[key]:
             name_winner[key] = chosen
         if key not in cat_winner or not cat_winner[key]:
             cat_winner[key] = cat
 
     rows = []
-    for (store_no, store_name, sale_date, row_type, gkey), qty in bucket.items():
+    for key, qty in bucket.items():
         if qty <= 0:
             continue
-        key = (store_no, store_name, sale_date, row_type, gkey)
-        rows.append((
-            store_no, store_name, sale_date, row_type,
-            cat_winner.get(key, ""),
-            name_winner.get(key, ""),
-            round(qty, 4),
-        ))
-    # 排序：门店编号(数字优先) → 日期 → 类型(套餐先) → 分类 → 商品名
+        store_no, store_name, sale_date, row_type, gkey = key
+        if prefer == "en":
+            rows.append((
+                store_no, store_name, sale_date, row_type,
+                cat_winner.get(key, ""),
+                name_winner.get(key, ""),
+                round(qty, 4),
+                round(amount_bucket.get(key, 0.0), 2),
+            ))
+        else:
+            rows.append((
+                store_no, store_name, sale_date, row_type,
+                cat_winner.get(key, ""),
+                name_winner.get(key, ""),
+                round(qty, 4),
+            ))
+
     def sort_key(r):
         sn = r[0]
         try:
@@ -502,68 +439,6 @@ def aggregate_per_lang(all_data, prefer):
             sn_n = (1, sn)
         type_order = 0 if r[3] == "套餐" else 1
         return (sn_n, str(r[2]), type_order, r[4], r[5])
-    rows.sort(key=sort_key)
-    return rows
-
-
-def aggregate_combo(all_combo_data, prefer):
-    """
-    all_combo_data 行：(store_no, store_name, sale_date,
-                        combo_name_zh, combo_name_en, combo_name_th,
-                        item_name_zh, item_name_en, item_name_th,
-                        combo_qty, item_qty)
-    注意：同一订单中一个套餐对应多个子品行，combo_qty 会重复出现。
-    输出：(store_no, store_name, sale_date, combo_name, combo_qty, item_name, item_qty)
-    """
-    combo_uuids_seen = set()   # (ckey, combo_uuid) -> 已计入
-    combo_qty_bucket = {}      # ckey -> total combo qty
-    item_qty_bucket = {}       # ikey -> total item qty
-    combo_name_winner = {}
-    item_name_winner = {}
-
-    for (store_no, store_name, sale_date,
-         combo_uuid, combo_name_zh, combo_name_en, combo_name_th,
-         item_name_zh, item_name_en, item_name_th,
-         combo_qty, item_qty) in all_combo_data:
-        combo_chosen = pick_name(combo_name_zh, combo_name_en, combo_name_th, prefer)
-        item_chosen = pick_name(item_name_zh, item_name_en, item_name_th, prefer)
-        combo_key = combo_chosen or f"combo::{combo_uuid}"
-        item_key = item_chosen or f"item::{combo_uuid}"
-
-        ckey = (store_no, store_name, sale_date, combo_key)
-        ikey = (store_no, store_name, sale_date, combo_key, item_key)
-
-        item_qty_bucket[ikey] = item_qty_bucket.get(ikey, 0.0) + float(item_qty or 0)
-        if (ckey, combo_uuid) not in combo_uuids_seen:
-            combo_uuids_seen.add((ckey, combo_uuid))
-            combo_qty_bucket[ckey] = combo_qty_bucket.get(ckey, 0.0) + float(combo_qty or 0)
-
-        if ckey not in combo_name_winner or not combo_name_winner[ckey]:
-            combo_name_winner[ckey] = combo_chosen
-        if ikey not in item_name_winner or not item_name_winner[ikey]:
-            item_name_winner[ikey] = item_chosen
-
-    rows = []
-    for ikey, qty in item_qty_bucket.items():
-        if qty <= 0:
-            continue
-        store_no, store_name, sale_date, combo_key, item_key = ikey
-        ckey = (store_no, store_name, sale_date, combo_key)
-        rows.append((
-            store_no, store_name, sale_date,
-            combo_name_winner.get(ckey, ""),
-            combo_qty_bucket.get(ckey, 0.0),
-            item_name_winner.get(ikey, ""),
-            round(qty, 4),
-        ))
-
-    def sort_key(r):
-        sn = r[0]
-        try:
-            sn_n = (0, int(sn))
-        except Exception:
-            sn_n = (1, sn)
-        return (sn_n, str(r[2]), r[3], r[5])
     rows.sort(key=sort_key)
     return rows
 
@@ -603,9 +478,7 @@ def main():
     log(f"待查询门店: {len(targets)}\n")
 
     all_data = []
-    all_combo_data = []
     total_rows = 0
-    total_combo_rows = 0
     query_time = 0.0
     query_start = time.time()
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -619,28 +492,20 @@ def main():
                 log(f"[{r['idx']}] 错误: {r['error']}")
                 continue
             log(f"[{r['idx']}/{len(targets)}] #{r['store_no']} {r['store_name']}: "
-                f"明细 {r['count']} 行 / 套餐组成 {r['combo_count']} 行 ({r['elapsed']:.2f}s)")
+                f"{r['count']} 行 ({r['elapsed']:.2f}s)")
             query_time += r["elapsed"]
             for row in r["rows"]:
                 all_data.append((r["store_no"], r["store_name"]) + row)
-            for row in r["combo_rows"]:
-                all_combo_data.append((r["store_no"], r["store_name"]) + row)
             total_rows += r["count"]
-            total_combo_rows += r["combo_count"]
 
     query_elapsed = time.time() - query_start
-    log(f"\n查询完成: 原始明细 {total_rows:,} 行 / 套餐组成原始 {total_combo_rows:,} 行"
-        f" (累计单店耗时 {query_time:.1f}s, 墙钟 {query_elapsed:.1f}s)")
+    log(f"\n查询完成: 原始行 {total_rows:,} (累计单店耗时 {query_time:.1f}s, 墙钟 {query_elapsed:.1f}s)")
 
     rows_zh = aggregate_per_lang(all_data, "zh")
     rows_en = aggregate_per_lang(all_data, "en")
     log(f"中文聚合后: {len(rows_zh):,} 行  /  English: {len(rows_en):,} 行")
 
-    combo_zh = aggregate_combo(all_combo_data, "zh")
-    combo_en = aggregate_combo(all_combo_data, "en")
-    log(f"套餐组成中文: {len(combo_zh):,} 行  /  English: {len(combo_en):,} 行")
-
-    # CSV (中文版明细)
+    # CSV (中文版)
     csv_path = OUTPUT_DIR / f"{file_prefix}_v{version}.csv"
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
@@ -649,7 +514,7 @@ def main():
             w.writerow([row[0], row[1], str(row[2]), row[3], row[4], row[5], f"{row[6]:.4f}"])
     log(f"CSV: {csv_path}")
 
-    # Excel：三 Sheet
+    # Excel：双 Sheet
     xlsx_path = OUTPUT_DIR / f"{file_prefix}_v{version}.xlsx"
     wb = Workbook()
     ws_zh = wb.active
@@ -657,8 +522,6 @@ def main():
     write_sheet(ws_zh, "zh", rows_zh)
     ws_en = wb.create_sheet("English")
     write_sheet(ws_en, "en", rows_en)
-    ws_combo = wb.create_sheet("套餐组成")
-    write_combo_sheet(ws_combo, "zh", combo_zh)
     wb.save(xlsx_path)
     log(f"Excel: {xlsx_path}")
 
