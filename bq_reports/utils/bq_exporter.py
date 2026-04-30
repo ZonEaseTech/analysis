@@ -616,12 +616,18 @@ class ReportExporter(MultiShopExporter):
         consumption_map: Dict[Tuple[str, int], Dict[str, Any]] = {}
         # 商品销量原始行（按规格拆，含 package_uuid/bom_uuid，待 Python 层后处理决定是否显示规格）
         bom_sales_raw: List[Dict[str, Any]] = []
+        # 支付方式明细（按门店 × 支付方式 × 渠道 拆开）
+        payment_results: List[Dict[str, Any]] = []
+        # 支付方式明细 - 按天（按门店 × 日期 × 支付方式 × 渠道 拆开，给客户做日报对账）
+        payment_daily_results: List[Dict[str, Any]] = []
         errors = []
 
         sales_sql = get_template('comprehensive_sales')
         consumption_sql = get_template('material_consumption')
         bom_consumption_sql = get_template('material_bom_consumption')
         bom_sales_sql = get_template('bom_product_sales')
+        payment_sql = get_template('payment_breakdown')
+        payment_daily_sql = get_template('payment_breakdown_daily')
 
         # 探测哪些店有 ttpos_business_status_period 表（测试营业时段需要排除，对齐 ttpos UI）
         # 一次 UNION ALL 查 INFORMATION_SCHEMA，避免 53 次串行 RTT
@@ -759,6 +765,45 @@ class ReportExporter(MultiShopExporter):
                 "has_bom": int(row.has_bom or 0),
             } for row in rows]
 
+        def _query_payment(account, uuid_str):
+            dataset = f"shop{uuid_str}"
+            sql = payment_sql.format(
+                project=self.project_id, dataset=dataset,
+                start_ts=start_ts, end_ts=end_ts,
+                exclude_test_business_ss=_build_exclude_test_business(uuid_str, 'sale_bill_uuid'),
+            )
+            rows = list(self.client.query(sql).result())
+            return account, [{
+                "门店编号": row.store_code or "",
+                "门店名称": _clean(row.store_name),
+                "支付方式": _clean(row.method_name),
+                "渠道": row.channel or "",
+                "笔数": int(row.bill_cnt or 0),
+                "收款总额": float(row.total_amount or 0),
+                "退款金额": float(row.total_refund or 0),
+                "净收金额": float(row.net_amount or 0),
+            } for row in rows]
+
+        def _query_payment_daily(account, uuid_str):
+            dataset = f"shop{uuid_str}"
+            sql = payment_daily_sql.format(
+                project=self.project_id, dataset=dataset,
+                start_ts=start_ts, end_ts=end_ts,
+                exclude_test_business_ss=_build_exclude_test_business(uuid_str, 'sale_bill_uuid'),
+            )
+            rows = list(self.client.query(sql).result())
+            return account, [{
+                "门店编号": row.store_code or "",
+                "门店名称": _clean(row.store_name),
+                "日期": row.pay_date or "",
+                "支付方式": _clean(row.method_name),
+                "渠道": row.channel or "",
+                "笔数": int(row.bill_cnt or 0),
+                "收款总额": float(row.total_amount or 0),
+                "退款金额": float(row.total_refund or 0),
+                "净收金额": float(row.net_amount or 0),
+            } for row in rows]
+
         with ThreadPoolExecutor(max_workers=10) as ex:
             sales_futures = {
                 ex.submit(_query_sales, account, uuid_str): account
@@ -774,6 +819,14 @@ class ReportExporter(MultiShopExporter):
             }
             bom_sales_futures = {
                 ex.submit(_query_bom_sales, account, uuid_str): account
+                for account, uuid_str in self.merchants
+            }
+            payment_futures = {
+                ex.submit(_query_payment, account, uuid_str): account
+                for account, uuid_str in self.merchants
+            }
+            payment_daily_futures = {
+                ex.submit(_query_payment_daily, account, uuid_str): account
                 for account, uuid_str in self.merchants
             }
 
@@ -808,12 +861,53 @@ class ReportExporter(MultiShopExporter):
                 except Exception as e:
                     errors.append({"account": account, "type": "bom_sales", "error": str(e)})
 
+            for fut in as_completed(payment_futures):
+                account = payment_futures[fut]
+                try:
+                    _, items = fut.result()
+                    payment_results.extend(items)
+                except Exception as e:
+                    errors.append({"account": account, "type": "payment", "error": str(e)})
+
+            for fut in as_completed(payment_daily_futures):
+                account = payment_daily_futures[fut]
+                try:
+                    _, items = fut.result()
+                    payment_daily_results.extend(items)
+                except Exception as e:
+                    errors.append({"account": account, "type": "payment_daily", "error": str(e)})
+
         # ===== Python 层后处理 =====
         # 1. 商品销量：决定每行是否显示规格后缀（同 store + 同 package 有多个 bom_uuid 才带规格）
         bom_yes_results, bom_no_results = self._build_bom_sales_rows(bom_sales_raw)
 
         # 2. 物品消耗：dict → list，并按 (店, 仓库出库量降序) 排序
         consumption_results = list(consumption_map.values())
+
+        # 3. 支付方式明细：补"未分类"行（兜底 ttpos statistics_payment 异步生成失败的几单）
+        # 销售业绩 sheet 实收用 sale_bill 兜底（事实数据源），但 sale_bill 没有 method_uuid → 那几单
+        # 在支付明细 sheet 找不到归属。用 (sales 实收 - SUM(payment 净收)) 算差额，差 > 0.5 元就补 1 行。
+        sales_received_by_store: Dict[str, Tuple[str, float]] = {
+            r["门店编号"]: (r["门店名称"], r["实收金额"]) for r in sales_results
+        }
+        payment_net_by_store: Dict[str, float] = {}
+        for r in payment_results:
+            payment_net_by_store[r["门店编号"]] = (
+                payment_net_by_store.get(r["门店编号"], 0) + r["净收金额"]
+            )
+        for code, (store_name, sales_recv) in sales_received_by_store.items():
+            unclassified = round(sales_recv - payment_net_by_store.get(code, 0), 2)
+            if unclassified > 0.5:
+                payment_results.append({
+                    "门店编号": code,
+                    "门店名称": store_name,
+                    "支付方式": "未分类(系统数据流异常)",
+                    "渠道": "POS",
+                    "笔数": 0,
+                    "收款总额": unclassified,
+                    "退款金额": 0.0,
+                    "净收金额": unclassified,
+                })
 
         # 写入 Excel（4 sheet，xlsxwriter 流式写）
         output_path = output_path or self.output_path
@@ -831,6 +925,12 @@ class ReportExporter(MultiShopExporter):
         consumption_results.sort(key=lambda r: (_store_key(r), -float(r.get("消耗量(仓库出库)", 0) or 0)))
         bom_yes_results.sort(key=lambda r: (_store_key(r), -float(r.get("销量", 0) or 0)))
         bom_no_results.sort(key=lambda r: (_store_key(r), -float(r.get("销量", 0) or 0)))
+        # 支付方式：店内按 净收金额 降序（财务最关心总收，大的在前）
+        payment_results.sort(key=lambda r: (_store_key(r), -float(r.get("净收金额", 0) or 0)))
+        # 日报：店内按 (日期升序, 净收降序) — 财务按时间线对账
+        payment_daily_results.sort(
+            key=lambda r: (_store_key(r), r.get("日期", ""), -float(r.get("净收金额", 0) or 0))
+        )
 
         import xlsxwriter
         wb = xlsxwriter.Workbook(str(output_path))
@@ -843,6 +943,10 @@ class ReportExporter(MultiShopExporter):
                 ["门店编号", "门店名称", "商品名称", "销量"])
             self._write_data_sheet_xw(wb, "未设置BOM商品销量", bom_no_results,
                 ["门店编号", "门店名称", "商品名称", "销量"])
+            self._write_data_sheet_xw(wb, "支付方式明细", payment_results,
+                ["门店编号", "门店名称", "支付方式", "渠道", "笔数", "收款总额", "退款金额", "净收金额"])
+            self._write_data_sheet_xw(wb, "支付方式明细(按天)", payment_daily_results,
+                ["门店编号", "门店名称", "日期", "支付方式", "渠道", "笔数", "收款总额", "退款金额", "净收金额"])
         finally:
             wb.close()
         
