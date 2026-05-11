@@ -18,11 +18,15 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-# 跟 ttpos 业务时区对齐（曼谷 +07:00），月份边界以 BKK 时间为准
-BKK_TZ = timezone(timedelta(hours=7))
+# 跟 ttpos 业务时区对齐（曼谷 +07:00），月份边界以 BKK 时间为准。
+# 真源在 semantic/dimensions/time.py；这里 re-export 保持现有 tests 和
+# 报表脚本 from-import 兼容。
+from semantic.dimensions.time import BKK_TZ  # noqa: E402
 from pathlib import Path
 
 from bq_reports.utils.bq_client import setup_proxy
+from semantic.dimensions.time import month_to_ts_range as _month_to_ts_range
+from semantic.entities import bom, combo, price_breakdown, sale_line, takeout_line, total_line
 from utils.cache import get_cache, set_cache, cache_key
 from utils.report_engine import ReportEngine, load_sheet_config
 from utils.resource_adapter import get_adapter
@@ -80,20 +84,85 @@ def _load_store_names(config: dict = None):
 # ERPNext 价格加载（带缓存包装）
 # ============================================================================
 
-def _try_load_erp_prices(price_list: str = None, cache_ttl: int = 3600):
+def _load_uploaded_prices(excel_path: str) -> tuple[dict, dict]:
+    """从上传的 Excel 价格清单读取物料单价和换算系数。
+    支持 '干冻货' 和 '设备材料' 两个 sheet，以及 '盘点单位匹配分析' sheet。
+    返回: (prices: {material_code: unit_price}, conversions: {material_code: conv_rate})
+    其中 unit_price = 清单单价 ÷ 销售换算系数（得到最小单位单价）
+    """
+    if not excel_path or not os.path.exists(excel_path):
+        return {}, {}
     try:
-        from bq_reports.utils.erpnext_api import load_erpnext_prices
-        key = cache_key("erpnext_prices", {"price_list": price_list or "Standard Buying"})
-        cached = get_cache(key, ttl_seconds=cache_ttl)
-        if cached is not None:
-            print(f"[ERPNext API] 缓存命中: {len(cached)} 条价格")
-            return cached
+        import openpyxl
+        wb = openpyxl.load_workbook(excel_path, data_only=True)
+        
+        # 1) 读取销售换算系数（从"盘点单位匹配分析"）
+        conversions = {}
+        if "盘点单位匹配分析" in wb.sheetnames:
+            ws_conv = wb["盘点单位匹配分析"]
+            for row in ws_conv.iter_rows(min_row=2, values_only=True):
+                code = row[0]
+                conv = row[8]  # 销售换算系数 (I列)
+                if code and conv is not None:
+                    try:
+                        conv_val = float(conv)
+                        if conv_val > 0:
+                            conversions[str(code).strip()] = conv_val
+                    except (ValueError, TypeError):
+                        pass
+            print(f"[Uploaded Prices] 加载 {len(conversions)} 条换算系数")
+        
+        # 2) 读取单价并换算
+        prices = {}
+        for sheet_name in ("干冻货", "设备材料"):
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                code = row[0]
+                price = row[7] if len(row) > 7 else None
+                if code and price is not None and price != '#N/A':
+                    try:
+                        price_val = float(price)
+                        code_str = str(code).strip()
+                        # 用最小单位单价 = 盘点单价 ÷ 销售换算系数
+                        conv = conversions.get(code_str, 1)
+                        prices[code_str] = price_val / conv
+                    except (ValueError, TypeError):
+                        pass
+        print(f"[Uploaded Prices] 从 {excel_path} 加载 {len(prices)} 条最小单位单价")
+        return prices, conversions
+    except Exception as e:
+        print(f"[警告] 加载上传价格清单失败: {e}")
+        return {}, {}
+
+
+def _try_load_erp_prices(price_list: str = None, cache_ttl: int = 3600):
+    from bq_reports.utils.erpnext_api import load_erpnext_prices
+    key = cache_key("erpnext_prices", {"price_list": price_list or "Standard Buying"})
+    
+    # 1) 先尝试缓存（正常 TTL）
+    cached = get_cache(key, ttl_seconds=cache_ttl)
+    if cached is not None:
+        print(f"[ERPNext API] 缓存命中: {len(cached)} 条价格")
+        return cached
+    
+    # 2) 缓存未命中，尝试 API
+    try:
         prices = load_erpnext_prices(price_list=price_list)
         set_cache(key, prices)
         return prices
     except Exception as e:
-        print(f"[警告] 加载 ERPNext 价格失败: {e}")
-        return {}
+        print(f"[警告] ERPNext API 失败: {e}")
+    
+    # 3) API 也失败，强制读缓存（忽略 TTL，永不过期 fallback）
+    cached = get_cache(key, ttl_seconds=99999999)
+    if cached is not None:
+        print(f"[ERPNext API] API 不可用，使用过期缓存: {len(cached)} 条价格")
+        return cached
+    
+    print("[警告] 未加载到 ERPNext 价格，成本将显示为 0")
+    return {}
 
 
 # ============================================================================
@@ -361,53 +430,20 @@ def _load_merchants(config: dict, store_names: dict, override_path: str = None,
 #   4. shop 端退款通过 (product_num - refund_num) 反映
 #   5. std_unit_price 保留我们的算法（按销量加权 product_bom.price），ttpos 没有这个概念
 
-_PROFIT_SALES_TPL = """
+# _PROFIT_SALES_TPL is assembled from the semantic layer's CTE factories. The
+# entity strings still carry literal `{project}` / `{dataset}` / `{start_ts}` /
+# `{end_ts}` placeholders (they pass through f-string interpolation unchanged
+# because the outer f-string only resolves its own `{…}` expressions). The final
+# `{{product_type}}` is escaped to a literal `{product_type}` so engine.query()
+# can still substitute it per-call via `.replace()` below.
+_PROFIT_SALES_TPL = f"""
 WITH
-shop_sales AS (
-  -- ttpos 源码: ttpos-server-go/main/app/repository/statistics.go:1980-2046 (CountProductSale - ExportProductSales 接口真实算法)
-  --   GET /statistics/product_sales/export 路由 → service/business.go:845 ExportProductSales
-  -- 注意: 不能用 RankProduct (statistics.go:1245) 的 refund_time=0 过滤 —— 那是 top10 排行，跟导出算法不一样
-  --   actual_sale_amount = SUM(IF(free|give, 0, final_price * (num - refund_num)))
-  --   时间字段: buildCountOpts 默认走 complete_time
-  SELECT
-    sp.product_package_uuid AS item_uuid,
-    SUM(sp.product_num) AS qty,
-    SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,
-           sp.product_final_price * (sp.product_num - sp.refund_num))) AS revenue
-  FROM `{project}`.`{dataset}`.`ttpos_statistics_product` sp
-  WHERE sp.complete_time >= {start_ts}
-    AND sp.complete_time < {end_ts}
-  GROUP BY item_uuid
-),
-takeout_sales AS (
-  -- ttpos 源码: ttpos-server-go/main/app/repository/statistics_takeout.go:451-502 (RankTakeoutProduct)
-  -- 时间过滤是 dynamic time condition: state=40 用 completed_time, 其他用 accepted_time
-  -- 营业额只算 state IN (10,20,30,40)，state=60 取消订单计 0
-  SELECT
-    toi.ttpos_product_package_uuid AS item_uuid,
-    SUM(toi.quantity) AS qty,
-    SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) AS revenue
-  FROM `{project}`.`{dataset}`.`ttpos_takeout_order_item` toi
-  JOIN `{project}`.`{dataset}`.`ttpos_takeout_order` t
-    ON t.uuid = toi.takeout_order_uuid AND t.delete_time = 0
-  WHERE toi.delete_time = 0
-    AND toi.ttpos_product_package_uuid > 0
-    AND t.order_state IN (10, 20, 30, 40, 60)
-    AND t.accepted_time > 0
-    AND (
-      (t.order_state = 40 AND t.completed_time >= {start_ts} AND t.completed_time < {end_ts})
-      OR (t.order_state != 40 AND t.accepted_time >= {start_ts} AND t.accepted_time < {end_ts})
-    )
-  GROUP BY item_uuid
-),
-merged AS (
-  SELECT
-    COALESCE(s.item_uuid, t.item_uuid) AS item_uuid,
-    IFNULL(s.qty, 0) + IFNULL(t.qty, 0) AS qty,
-    IFNULL(s.revenue, 0) + IFNULL(t.revenue, 0) AS revenue
-  FROM shop_sales s
-  FULL OUTER JOIN takeout_sales t USING (item_uuid)
-)
+-- 价格拆分：取前3个主要价格档（按销量降序），其余归到"其他"
+-- 必须同时覆盖堂食 + 外卖，否则销量/营业额拆分对不上下游 shop_sales+takeout_sales 合并值
+{price_breakdown.price_top3_ctes()},
+{sale_line.shop_sales_cte()},
+{takeout_line.takeout_sales_cte()},
+{total_line.merged_cte()}
 SELECT
   m.item_uuid,
   -- 部分商品名末尾带回车/换行/制表符等不可见字符（前端 trim 显示无异，但 BQ 取出来会带）
@@ -419,82 +455,42 @@ SELECT
   ), r'^\\s+|\\s+$', '') AS item_name,
   m.qty AS qty,
   m.revenue AS revenue,
+  m.sales_price AS sales_price,
+  m.original_amount AS original_amount,
+  m.avg_member_discount AS avg_member_discount,
+  m.free_qty AS free_qty,
+  m.give_qty AS give_qty,
+  m.refund_qty AS refund_qty,
+  m.refund_amount AS refund_amount,
+  m.cancelled_qty AS cancelled_qty,
+  m.cancelled_amount AS cancelled_amount,
+  -- 价格拆分：前3个主要价格档 + 其他
+  p3.price_1 AS price_1,
+  p3.qty_1 AS qty_1,
+  p3.price_2 AS price_2,
+  p3.qty_2 AS qty_2,
+  p3.price_3 AS price_3,
+  p3.qty_3 AS qty_3,
+  p3.other_qty AS other_price_qty,
   -- 单价取 Shop 商品管理标价 ttpos_product_package.price
   IFNULL(pp.price, 0) AS list_price
 FROM merged m
+-- 价格拆分 JOIN
+LEFT JOIN price_top3 p3 ON p3.item_uuid = m.item_uuid
 -- ttpos 导出用 LEFT JOIN，不过滤 pp.delete_time（已删除的商品也算销售）
 -- 但本报表必须按 product_type 区分套餐/单品 sheet，所以仍 INNER JOIN，去掉 delete_time 过滤
-JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
+JOIN `{{project}}`.`{{dataset}}`.`ttpos_product_package` pp
   ON pp.uuid = m.item_uuid
-WHERE pp.product_type = {product_type}
+WHERE pp.product_type = {{product_type}}
   AND m.qty > 0
 """
 
 COMBO_ORDERS_SQL = _PROFIT_SALES_TPL.replace("{product_type}", "1")
 SINGLE_ORDERS_SQL = _PROFIT_SALES_TPL.replace("{product_type}", "0")
 
-# 产品 BOM 结构（不关联订单表，纯产品级数据）
-# bom_unit / conversion_rate 来自 ttpos 配方录入，用于把 ERP 基准单位价换算到配方单位价
-#
-# 软删除处理: ttpos 商品/规格被软删后，pb.delete_time != 0，但历史销售 (statistics_product)
-# 仍引用该 product_package_uuid（例: 蜜汁手扒半鸡 4-22 软删，3 月销售仍存在）。
-# 直接 WHERE pb.delete_time = 0 会让这类商品的 BOM 全丢、被迫走 fallback Excel → 算错。
-# 用 window 函数实现"active 优先 + 没 active 才回退 deleted"：
-#   - 同一 product_package_uuid 下若存在 active 行 (delete_time=0)，只取 active
-#   - 全部已被软删时，把 deleted 行也带回来（用于已下架但有历史销售的商品）
-BOM_SQL = """
-WITH bom_with_flag AS (
-  SELECT
-    pb.uuid,
-    pb.product_package_uuid,
-    pb.product_bom_card_uuid,
-    pb.delete_time,
-    SUM(CASE WHEN pb.delete_time = 0 THEN 1 ELSE 0 END)
-      OVER (PARTITION BY pb.product_package_uuid) AS active_count
-  FROM `{project}`.`{dataset}`.`ttpos_product_bom` pb
-)
-SELECT
-  pb.product_package_uuid AS item_uuid,
-  m.code AS material_code,
-  JSON_EXTRACT_SCALAR(m.name, '$.zh') AS material_name,
-  rm.num AS bom_num,
-  COALESCE(
-    JSON_EXTRACT_SCALAR(rm.unit_name, '$.zh'),
-    JSON_EXTRACT_SCALAR(rm.unit_name, '$.en'),
-    JSON_EXTRACT_SCALAR(rm.base_unit_name, '$.zh'),
-    JSON_EXTRACT_SCALAR(rm.base_unit_name, '$.en')
-  ) AS bom_unit,
-  rm.base_unit_conversion_rate AS conversion_rate,
-  m.price AS material_bq_price
-FROM bom_with_flag pb
-LEFT JOIN `{project}`.`{dataset}`.`ttpos_related_material` rm
-  ON (
-    (pb.product_bom_card_uuid > 0 AND rm.related_uuid = pb.product_bom_card_uuid)
-    OR (pb.product_bom_card_uuid = 0 AND rm.related_uuid = pb.uuid)
-  )
-  AND rm.delete_time = 0
-LEFT JOIN `{project}`.`{dataset}`.`ttpos_material` m
-  ON m.uuid = rm.material_uuid AND m.delete_time = 0
-WHERE (pb.delete_time = 0 OR pb.active_count = 0)
-"""
-
-# 套餐结构（combo_uuid -> child_uuid），从当前时间范围订单推断
-COMBO_STRUCTURE_SQL = """
-SELECT DISTINCT
-  parent_sop.product_package_uuid AS combo_uuid,
-  child_sop.product_package_uuid AS child_uuid
-FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` parent_sop
-JOIN `{project}`.`{dataset}`.`ttpos_sale_order_product` child_sop
-  ON child_sop.package_uuid = parent_sop.uuid
-  AND child_sop.delete_time = 0
-JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
-  ON sb.uuid = parent_sop.sale_bill_uuid AND sb.delete_time = 0
-WHERE parent_sop.product_type = 1
-  AND parent_sop.delete_time = 0
-  AND sb.status = 1
-  AND sb.finish_time >= {start_ts}
-  AND sb.finish_time < {end_ts}
-"""
+# 产品 BOM + 套餐结构 SQL 真源在 semantic.entities.{bom,combo}
+BOM_SQL = bom.bom_sql()
+COMBO_STRUCTURE_SQL = combo.combo_structure_sql()
 
 
 # ============================================================================
@@ -554,18 +550,31 @@ def _apply_bom_overrides(bom_records):
     return [(c, n, bn, bu, cr, bp) for c, (n, bn, bu, cr, bp) in merged.items()]
 
 
-def _resolve_base_unit_price(material_code, bq_price, erp_prices):
-    """返回物料在基准单位下的单价（ERP Item Price 优先，否则用 BQ 缺省价）。"""
-    if not erp_prices or not material_code:
+def _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_prices):
+    """返回物料在基准单位下的单价。
+    优先级：1) 上传价格清单 2) ERPNext Item Price 3) BQ 缺省价
+    """
+    if not material_code:
         return float(bq_price or 0)
-    for key in (material_code, material_code.upper(), material_code.lower()):
-        if key in erp_prices:
-            price, _uom = erp_prices[key]
-            for corr_key in (material_code, material_code.upper(), material_code.lower()):
-                if corr_key in BOM_UNIT_CORRECTIONS:
-                    price = price / BOM_UNIT_CORRECTIONS[corr_key]
-                    break
-            return price
+
+    # 1) 上传价格清单（最高优先级）
+    if uploaded_prices:
+        for key in (material_code, material_code.upper(), material_code.lower()):
+            if key in uploaded_prices:
+                return uploaded_prices[key]
+
+    # 2) ERPNext Item Price
+    if erp_prices:
+        for key in (material_code, material_code.upper(), material_code.lower()):
+            if key in erp_prices:
+                price, _uom = erp_prices[key]
+                for corr_key in (material_code, material_code.upper(), material_code.lower()):
+                    if corr_key in BOM_UNIT_CORRECTIONS:
+                        price = price / BOM_UNIT_CORRECTIONS[corr_key]
+                        break
+                return price
+
+    # 3) BQ 缺省价
     return float(bq_price or 0)
 
 
@@ -705,14 +714,16 @@ def _load_boms(engine, merchants, config: dict = None):
 # 数据聚合（新版：预聚合 orders + 预加载 BOM）
 # ============================================================================
 
-def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, mode="combo"):
+def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=None, erp_prices=None, mode="combo"):
     """
-    聚合订单和 BOM 数据。
+    聚合订单和 BOM 数据（中间表版：保留所有原始字段，不预计算）。
 
     Args:
         order_rows: 引擎返回的订单行（已带 store_num, store_name）
         bom_data: {store_num: {item_uuid: [(material_code, ...), ...]}}
         combo_structure: {store_num: {combo_uuid: [child_uuid, ...]}}
+        uploaded_prices: 上传价格清单 {material_code: price}
+        erp_prices: ERPNext 价格 {material_code: (price, uom)}
         mode: "combo" 或 "single"
     """
     data = {}
@@ -723,18 +734,65 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
         item_name = row.item_name
         qty = float(row.qty or 0)
         revenue = float(row.revenue or 0)
+        sales_price = float(getattr(row, "sales_price", None) or 0)
+        original_amount = float(getattr(row, "original_amount", None) or 0)
+        avg_member_discount = float(getattr(row, "avg_member_discount", None) or 1.0)
+        free_qty = float(getattr(row, "free_qty", None) or 0)
+        give_qty = float(getattr(row, "give_qty", None) or 0)
+        refund_qty = float(getattr(row, "refund_qty", None) or 0)
+        refund_amount = float(getattr(row, "refund_amount", None) or 0)
+        cancelled_qty = float(getattr(row, "cancelled_qty", None) or 0)
+        cancelled_amount = float(getattr(row, "cancelled_amount", None) or 0)
         list_price = float(getattr(row, "list_price", None) or 0)
+        price_1 = getattr(row, "price_1", None)
+        qty_1 = getattr(row, "qty_1", None)
+        price_2 = getattr(row, "price_2", None)
+        qty_2 = getattr(row, "qty_2", None)
+        price_3 = getattr(row, "price_3", None)
+        qty_3 = getattr(row, "qty_3", None)
+        other_price_qty = getattr(row, "other_price_qty", None)
 
         key = (store_num, store_name, item_uuid, item_name)
         if key not in data:
             data[key] = {
                 "qty": 0.0,
                 "revenue": 0.0,
-                "list_price": list_price,  # ttpos_product_package.price，每个 item 唯一
+                "sales_price": 0.0,
+                "original_amount": 0.0,
+                "refund_qty": 0.0,
+                "refund_amount": 0.0,
+                "cancelled_qty": 0.0,
+                "cancelled_amount": 0.0,
+                "avg_member_discount": 0.0,
+                "free_qty": 0.0,
+                "give_qty": 0.0,
+                "list_price": list_price,
+                "price_1": price_1,
+                "qty_1": qty_1,
+                "price_2": price_2,
+                "qty_2": qty_2,
+                "price_3": price_3,
+                "qty_3": qty_3,
+                "other_price_qty": other_price_qty,
                 "bom": {},
             }
         data[key]["qty"] += qty
         data[key]["revenue"] += revenue
+        data[key]["sales_price"] += sales_price
+        data[key]["original_amount"] += original_amount
+        data[key]["refund_qty"] += refund_qty
+        data[key]["refund_amount"] += refund_amount
+        data[key]["cancelled_qty"] += cancelled_qty
+        data[key]["cancelled_amount"] += cancelled_amount
+        # 加权平均会员折扣率
+        data[key]["avg_member_discount"] += avg_member_discount * qty
+        data[key]["free_qty"] += free_qty
+        data[key]["give_qty"] += give_qty
+
+    # 归一化加权平均折扣率
+    for key, val in data.items():
+        if val["qty"] > 0:
+            val["avg_member_discount"] = val["avg_member_discount"] / val["qty"]
 
     # 为每个 item 匹配 BOM
     for key, val in data.items():
@@ -742,7 +800,7 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
         store_boms = bom_data.get(store_num, {})
 
         if mode == "combo":
-            # 套餐：合并所有子产品的 BOM。同一物料被多个子商品共用时累加 num/cost。
+            # 套餐：合并所有子产品的 BOM。同一物料被多个子商品共用时累加 num。
             store_struct = combo_structure.get(store_num, {})
             child_uuids = store_struct.get(item_uuid, [])
             for child_uuid in child_uuids:
@@ -750,20 +808,18 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
                 for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in child_bom:
                     if not material_code:
                         continue
-                    base_price = _resolve_base_unit_price(material_code, bq_price, erp_prices)
+                    base_price = _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_prices)
                     unit_price = base_price * (conv_rate or 1)
-                    delta_cost = bom_num * unit_price
                     if material_code in val["bom"]:
-                        prev_name, prev_num, prev_up, prev_unit, prev_cost = val["bom"][material_code]
+                        prev_name, prev_num, prev_up, prev_unit = val["bom"][material_code]
                         val["bom"][material_code] = (
                             prev_name or material_name,
                             prev_num + bom_num,
                             unit_price,                  # 同物料同单位价不变
                             prev_unit or bom_unit,
-                            prev_cost + delta_cost,
                         )
                     else:
-                        val["bom"][material_code] = (material_name, bom_num, unit_price, bom_unit, delta_cost)
+                        val["bom"][material_code] = (material_name, bom_num, unit_price, bom_unit)
         else:
             # 单品：直接匹配 BOM。同一商品多个 product_bom（不同 flavor/sauce 但共用 bom_card）
             # 会重复返回相同 material_code，按 dedup 处理（避免 N 倍虚增）。
@@ -772,22 +828,37 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
                 if not material_code:
                     continue
                 if material_code not in val["bom"]:
-                    base_price = _resolve_base_unit_price(material_code, bq_price, erp_prices)
+                    base_price = _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_prices)
                     unit_price = base_price * (conv_rate or 1)
-                    cost_per_unit = bom_num * unit_price
-                    val["bom"][material_code] = (material_name, bom_num, unit_price, bom_unit, cost_per_unit)
+                    val["bom"][material_code] = (material_name, bom_num, unit_price, bom_unit)
 
-    # 转换为列表格式（与旧版兼容）
+    # 转换为列表格式（保留所有原始字段，利润指标由 Excel 公式计算）
     result = {}
     for key, val in data.items():
         result[key] = {
             "qty": val["qty"],
             "revenue": val["revenue"],
+            "sales_price": val["sales_price"],
+            "original_amount": val["original_amount"],
+            "refund_qty": val["refund_qty"],
+            "refund_amount": val["refund_amount"],
+            "cancelled_qty": val["cancelled_qty"],
+            "cancelled_amount": val["cancelled_amount"],
+            "avg_member_discount": val["avg_member_discount"],
+            "free_qty": val["free_qty"],
+            "give_qty": val["give_qty"],
             "list_price": val["list_price"],
+            "price_1": val["price_1"],
+            "qty_1": val["qty_1"],
+            "price_2": val["price_2"],
+            "qty_2": val["qty_2"],
+            "price_3": val["price_3"],
+            "qty_3": val["qty_3"],
+            "other_price_qty": val["other_price_qty"],
             "bom": [
-                (code, name, bom_num, price, uom, cost)
-                for code, (name, bom_num, price, uom, cost) in val["bom"].items()
-            ]
+                (code, name, bom_num, price, uom)
+                for code, (name, bom_num, price, uom) in val["bom"].items()
+            ],
         }
     return result
 
@@ -796,62 +867,80 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, erp_prices=None, m
 # 扁平化行构建
 # ============================================================================
 
-def _build_rows(agg_data, mode, fallback_boms=None, erp_prices=None):
+def _build_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None, erp_prices=None):
     """
-    将聚合数据扁平化为引擎可消费的 list[list]。
-    每行 15 个展示列 + 第 16 列隐藏 item_uuid（用作 merge_key，避免同名不同 uuid
-    被错合并 —— 例如「合艾炸鸡（中翅 8块）」¥79/¥99 两个 SKU 共名，
-    若不带 uuid 区分会被 ReportEngine block 检测合并掉，第二个 SKU 销量被吞）。
+    中间表：只输出原始数据，所有计算交给 Excel。
+    列结构（26列）:
+      0-2:   门店编号、门店名称、商品名称
+      3-12:  当前标价、销量、营业额、标准金额、实收金额、会员折扣率、赠品数量、赠送数量、退款数量、退款金额
+      13-19: 价格1、销量1、价格2、销量2、价格3、销量3、其他价格销量
+      20-24: BOM物品名称、BOM物品编码、消耗数量、物料单价、单位
+      25:    商品UUID(隐藏)
     """
     rows = []
     for (store_num, store_name, item_uuid, item_name), data in sorted(agg_data.items()):
         qty = data["qty"]
         revenue = data["revenue"]
-        # 单价取 Shop 商品管理标价 ttpos_product_package.price
-        item_unit_price = round(data.get("list_price", 0) or 0, 2)
+        sales_price = data["sales_price"]
+        original_amount = data["original_amount"]
+        refund_qty = data["refund_qty"]
+        refund_amount = data["refund_amount"]
+        cancelled_qty = data.get("cancelled_qty", 0)
+        cancelled_amount = data.get("cancelled_amount", 0)
+        avg_member_discount = data["avg_member_discount"]
+        free_qty = data["free_qty"]
+        give_qty = data["give_qty"]
+        list_price = data["list_price"]
+        price_1 = data.get("price_1")
+        qty_1 = data.get("qty_1")
+        price_2 = data.get("price_2")
+        qty_2 = data.get("qty_2")
+        price_3 = data.get("price_3")
+        qty_3 = data.get("qty_3")
+        other_price_qty = data.get("other_price_qty")
         bom_list = data["bom"]
 
-        # Fallback BOM 补充（fallback 数据按基准单位录入，conv_rate 视为 1）
+        # Fallback BOM 补充
         if not bom_list and fallback_boms:
             matched = _match_fallback_bom(item_name, fallback_boms)
             if matched:
                 bom_list = []
                 for code, name, bom_num, uom in matched:
-                    unit_price = _resolve_base_unit_price(code, 0, erp_prices)
-                    cost_per_unit = bom_num * unit_price
-                    bom_list.append((code, name, bom_num, unit_price, uom or "-", cost_per_unit))
+                    unit_price = _resolve_base_unit_price(code, 0, uploaded_prices, erp_prices)
+                    bom_list.append((code, name, bom_num, unit_price, uom or "-"))
                 print(f"  [Fallback] {item_name}: 补充 {len(bom_list)} 个物料")
+
+        # row 末尾扩展槽位（field_index 26-29 = utility 公式列；30-31 = 标价应收/异常损失公式列；
+        # 32 = 取消数量、33 = 取消金额）。utility 列由引擎写公式，row 内填 None 占位即可。
+        tail = [None, None, None, None, None, None,
+                round(cancelled_qty, 2), round(cancelled_amount, 2)]
 
         if not bom_list:
             rows.append([
                 store_num, store_name, item_name,
-                round(qty, 2), item_unit_price, round(revenue, 2),
-                "-", "-", 0, 0, "-", 0,
-                0,                          # 12 单份总成本
-                round(item_unit_price, 2),  # 13 单品毛利 = 单价 - 0
-                round(revenue, 2),          # 14 总毛利 = 销售额 - 0
-                1.0 if revenue > 0 else 0,  # 15 毛利率
-                str(item_uuid),             # 16 隐藏 merge_key
-            ])
+                round(list_price, 2), round(qty, 2),
+                round(sales_price, 2), round(original_amount, 2),
+                round(revenue, 2), round(avg_member_discount, 4),
+                round(free_qty, 2), round(give_qty, 2),
+                round(refund_qty, 2), round(refund_amount, 2),
+                price_1, qty_1, price_2, qty_2, price_3, qty_3, other_price_qty,
+                "-", "-", None, None, "-",
+                str(item_uuid),
+            ] + tail)
             continue
 
-        per_unit_bom_cost = sum(cost for _, _, _, _, _, cost in bom_list)
-        unit_profit = item_unit_price - per_unit_bom_cost   # 单品毛利
-        # 总毛利按 market 要求 = 销量 × 单品毛利（不再用 F - M*D）
-        gross_profit = qty * unit_profit
-        gross_margin = gross_profit / revenue if revenue > 0 else 0
-
-        for code, name, bom_num, mat_price, uom, cost in bom_list:
+        for code, name, bom_num, mat_price, uom in bom_list:
             rows.append([
                 store_num, store_name, item_name,
-                round(qty, 2), item_unit_price, round(revenue, 2),
-                name, code, round(mat_price, 4), round(bom_num, 4), uom or "-", round(cost * qty, 2),
-                round(per_unit_bom_cost, 2),
-                round(unit_profit, 2),         # 13 单品毛利
-                round(gross_profit, 2),        # 14 总毛利（原毛利）
-                round(gross_margin, 4),        # 15 毛利率
-                str(item_uuid),                # 16 隐藏 merge_key
-            ])
+                round(list_price, 2), round(qty, 2),
+                round(sales_price, 2), round(original_amount, 2),
+                round(revenue, 2), round(avg_member_discount, 4),
+                round(free_qty, 2), round(give_qty, 2),
+                round(refund_qty, 2), round(refund_amount, 2),
+                price_1, qty_1, price_2, qty_2, price_3, qty_3, other_price_qty,
+                name, code, round(bom_num, 4), round(mat_price, 4), uom or "-",
+                str(item_uuid),
+            ] + tail)
 
     return rows
 
@@ -891,6 +980,7 @@ def main():
     parser.add_argument("--erp-price-list", default=None, help="ERPNext 价格表名称，默认 Standard Buying")
     parser.add_argument("--config", default=None, help="资源配置 YAML 路径")
     parser.add_argument("--column-config", default="resources/reports/profit_margin.yaml", help="列配置 YAML 路径")
+    parser.add_argument("--price-list", default=None, help="上传的物料价格清单 Excel 路径（最高优先级）")
     parser.add_argument("--no-cache", action="store_true", help="禁用缓存")
     args = parser.parse_args()
 
@@ -900,23 +990,17 @@ def main():
         return 1
 
     if args.month:
-        year, mon = int(args.month[:4]), int(args.month[5:7])
-        start_dt = datetime(year, mon, 1, tzinfo=BKK_TZ)
-        if mon == 12:
-            end_dt = datetime(year + 1, 1, 1, tzinfo=BKK_TZ)
-        else:
-            end_dt = datetime(year, mon + 1, 1, tzinfo=BKK_TZ)
+        start_ts, end_ts = _month_to_ts_range(args.month)
         range_label = args.month.replace("-", "")
     elif args.start_date and args.end_date:
         start_dt = datetime.strptime(args.start_date, "%Y-%m-%d").replace(tzinfo=BKK_TZ)
         end_dt = datetime.strptime(args.end_date, "%Y-%m-%d").replace(tzinfo=BKK_TZ) + timedelta(days=1)
         range_label = f"{args.start_date.replace('-', '')}_{args.end_date.replace('-', '')}"
+        start_ts = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
     else:
         print("[错误] 必须指定 --month 或 --start-date + --end-date")
         return 1
-
-    start_ts = int(start_dt.timestamp())
-    end_ts = int(end_dt.timestamp())
 
     # 自动推导输出路径
     output_path = args.output or f"exports/profit_{range_label}.xlsx"
@@ -927,7 +1011,13 @@ def main():
     # 加载资源配置
     config = load_config(args.config)
 
-    # 加载 ERPNext 价格（带缓存）
+    # 加载上传价格清单（最高优先级）
+    uploaded_prices = {}
+    if args.price_list:
+        uploaded_prices, _ = _load_uploaded_prices(args.price_list)
+        print()
+
+    # 加载 ERPNext 价格（带缓存，fallback）
     erp_prices = {}
     if args.use_erp_price and not args.no_erp_price:
         erp_ttl = 0 if args.no_cache else config.get("cache", {}).get("erp_prices_ttl", 3600)
@@ -998,24 +1088,19 @@ def main():
         # 聚合（订单 + BOM）
         agg_data = aggregate_with_bom(
             raw_rows, bom_data, combo_structure,
-            erp_prices=erp_prices, mode=mode
+            uploaded_prices=uploaded_prices, erp_prices=erp_prices, mode=mode
         )
 
         # 扁平化
-        flat_rows = _build_rows(agg_data, mode, fallback_boms=fallback_boms, erp_prices=erp_prices)
+        flat_rows = _build_rows(agg_data, mode, fallback_boms=fallback_boms,
+                                uploaded_prices=uploaded_prices, erp_prices=erp_prices)
 
         # 加载列配置并写入 Excel
         sheet_cfg = engine.load_sheet_config(args.column_config, item_label)
         engine.write_sheet(wb, item_label, sheet_cfg, flat_rows)
 
-        # field 13 = 单品毛利, field 14 = 总毛利
-        neg_unit = sum(1 for r in flat_rows if r[13] is not None and r[13] < 0)
-        neg_total = sum(1 for r in flat_rows if r[14] is not None and r[14] < 0)
         print(f"\n[{item_label}] 总明细行数: {len(flat_rows)} 行")
-        if neg_unit > 0:
-            print(f"[{item_label}] 单品毛利<0: {neg_unit} 行（标价 < 单份成本，赔本商品）")
-        if neg_total > 0:
-            print(f"[{item_label}] 总毛利<0: {neg_total} 行（实收 < 总成本，含折扣损失）")
+        print(f"[{item_label}] 此为中间表，利润指标请自行在 Excel 中定义")
 
     wb.close()
     print(f"\n输出文件: {output_path}")

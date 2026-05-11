@@ -10,16 +10,7 @@ Usage:
 """
 
 import argparse
-#!/usr/bin/env python3
-"""
-原料经营明细报表 - BigQuery 版本
-
-对应原脚本: ../ttpos-n8n-scheduler/scripts/report_item_consumption_statistics.sh
-功能: 统计指定原料的 BOM消耗量、涉及该原料的销售金额、采购入库量
-
-Usage:
-    python -m bq_reports.report_material_stats_bq --month 2026-01 --materials flour,chicken --output exports/material_2026_01.xlsx
-"""
+import sys
 
 from .utils.bq_exporter import ReportExporter
 

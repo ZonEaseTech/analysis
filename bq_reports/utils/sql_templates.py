@@ -578,7 +578,13 @@ SELECT
   CASE
     WHEN m.product_bom_uuid = 0 THEN IF(phb.pp_uuid IS NOT NULL, 1, 0)
     ELSE IF(b.pb_uuid IS NOT NULL, 1, 0)
-  END AS has_bom
+  END AS has_bom,
+  -- 商品分类
+  COALESCE(
+    JSON_EXTRACT_SCALAR(pc.name, '$.zh'),
+    JSON_EXTRACT_SCALAR(pc.name, '$.en'),
+    ''
+  ) AS category_name
 FROM merged m
 -- 名称 JOIN 不过滤 delete_time：软删商品的历史销售也要能正常显示名字
 -- (BQ uuid 唯一，软删后表里仍只有 1 行，不会重复)
@@ -595,6 +601,9 @@ LEFT JOIN bom_set b
   ON b.pb_uuid = m.product_bom_uuid
 LEFT JOIN package_has_bom phb
   ON phb.pp_uuid = m.product_package_uuid
+-- 商品分类
+LEFT JOIN `{project}.{dataset}.ttpos_product_category` pc
+  ON pc.uuid = pp.category_uuid AND pc.delete_time = 0
 WHERE m.total_qty > 0
 ORDER BY has_bom DESC, total_qty DESC
 """
@@ -641,25 +650,25 @@ takeout_sales AS (
         ELSE tko.accepted_time
       END
     ), 'Asia/Bangkok') AS sale_date,
-    toi.product_package_uuid,
+    toi.ttpos_product_package_uuid AS product_package_uuid,
     JSON_EXTRACT_SCALAR(pp.name, '$.zh') AS product_name_zh,
     JSON_EXTRACT_SCALAR(pp.name, '$.en') AS product_name_en,
     SUM(toi.quantity) AS qty
   FROM `{project}.{dataset}.ttpos_takeout_order_item` toi
-  JOIN `{project}.{dataset}.ttpos_takeout_order` tko 
+  JOIN `{project}.{dataset}.ttpos_takeout_order` tko
     ON tko.uuid = toi.takeout_order_uuid AND tko.delete_time = 0
-  LEFT JOIN `{project}.{dataset}.ttpos_product_package` pp 
-    ON pp.uuid = toi.product_package_uuid AND pp.delete_time = 0
+  LEFT JOIN `{project}.{dataset}.ttpos_product_package` pp
+    ON pp.uuid = toi.ttpos_product_package_uuid AND pp.delete_time = 0
   WHERE toi.delete_time = 0
     AND tko.order_state IN (10, 20, 30, 40, 60)
     AND (
-      (tko.order_state = 40 AND tko.completed_time > 0 
+      (tko.order_state = 40 AND tko.completed_time > 0
        AND tko.completed_time >= {start_ts} AND tko.completed_time < {end_ts})
       OR
-      (tko.order_state != 40 AND tko.accepted_time >= {start_ts} 
+      (tko.order_state != 40 AND tko.accepted_time >= {start_ts}
        AND tko.accepted_time < {end_ts})
     )
-  GROUP BY sale_date, toi.product_package_uuid, pp.name
+  GROUP BY sale_date, toi.ttpos_product_package_uuid, pp.name
 ),
 -- 合并
 combined AS (

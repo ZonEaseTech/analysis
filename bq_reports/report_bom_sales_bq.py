@@ -10,16 +10,7 @@ Usage:
 """
 
 import argparse
-#!/usr/bin/env python3
-"""
-BOM商品销量报表 - BigQuery 版本
-
-对应原脚本: ../ttpos-n8n-scheduler/scripts/report_bom_sales.sh
-功能: 统计商品销售数量，区分已设置BOM和未设置BOM的商品
-
-Usage:
-    python -m bq_reports.report_bom_sales_bq --month 2026-01 --output exports/bom_sales_2026_01.xlsx
-"""
+import sys
 
 from .utils.bq_exporter import ReportExporter
 

@@ -181,14 +181,20 @@ def query_daily_sales(client, dataset_id, start_ts, end_ts):
 
 
 def get_store_name(client, dataset_id):
+    # store_code 从 ttpos_setting 取，store_name 从 ttpos_company 取
+    # 跟 sql_templates.py SALES_REVENUE_SQL 用的写法一致（已在 sales_consumption 56 家验证）
+    # 注意：alias 不能用 'no' / 'name' —— 'no' 是 BQ 关键字会报 Syntax error
     try:
         r = list(client.query(f"""
-            SELECT JSON_EXTRACT_SCALAR(values, '$.store_code') as no,
-                   JSON_EXTRACT_SCALAR(values, '$.store_name') as name
-            FROM `{PROJECT_ID}.{dataset_id}.ttpos_setting`
-            WHERE `key` = 'store' AND delete_time = 0 LIMIT 1
+            SELECT
+              IFNULL((SELECT JSON_EXTRACT_SCALAR(`values`, '$.store_code')
+                      FROM `{PROJECT_ID}.{dataset_id}.ttpos_setting`
+                      WHERE `key` = 'store' AND delete_time = 0 LIMIT 1), '') AS store_code,
+              c.name AS store_name
+            FROM `{PROJECT_ID}.{dataset_id}.ttpos_company` c
+            WHERE c.delete_time = 0 LIMIT 1
         """).result())[0]
-        return r.no or "", r.name or ""
+        return r.store_code or "", r.store_name or ""
     except:
         return "", ""
 

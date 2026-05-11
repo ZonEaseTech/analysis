@@ -73,6 +73,8 @@ class ColumnConfig:
     merge: bool = False                 # 是否合并（block 级别）
     formula_template: str = ""          # 公式模板，支持 {row} {block_start} {block_end} {col}
     negative_red: bool = False          # 负值标红（基于预计算值）
+    positive_red: bool = False          # 正值标红（用于"异常损失"等"非零即异常"列；通过条件格式）
+    comment: str = ""                   # 表头悬停备注（字段语义 / 取数说明）
 
 
 @dataclass
@@ -280,6 +282,10 @@ def write_configured_sheet(workbook, sheet_name: str, sheet_config: SheetConfig,
     )
     for col_idx, col_cfg in enumerate(columns):
         ws.write(0, col_idx, col_cfg.name, hdr_fmt)
+        if col_cfg.comment:
+            ws.write_comment(0, col_idx, col_cfg.comment, {
+                "author": "数据口径", "x_scale": 1.5, "y_scale": 1.6, "visible": False,
+            })
 
     if not rows:
         ws.set_column(0, max(0, len(columns) - 1), 15)
@@ -411,10 +417,20 @@ def write_configured_sheet(workbook, sheet_name: str, sheet_config: SheetConfig,
                 if xl_first == xl_last:
                     ws.write_formula(xl_first, col_idx, formula, fmt)
                 else:
-                    ws.merge_range(xl_first, col_idx, xl_last, col_idx, "", fmt)
-                    ws.write_formula(xl_first, col_idx, formula, fmt)
+                    # merge_range 本身支持写入公式，直接传公式即可
+                    ws.merge_range(xl_first, col_idx, xl_last, col_idx, formula, fmt)
 
-    # 6. 冻结首行
+    # 6. 条件格式：positive_red 列在数据范围内 > 0 时整格标红
+    last_data_row = len(rows)  # xlsxwriter 0-based 末行 = len(rows)
+    red_fmt = workbook.add_format({"bg_color": "#FFC7CE", "font_color": "#9C0006", "bold": True})
+    for col_idx, col_cfg in enumerate(columns):
+        if not col_cfg.positive_red:
+            continue
+        ws.conditional_format(1, col_idx, last_data_row, col_idx, {
+            "type": "cell", "criteria": ">", "value": 0, "format": red_fmt,
+        })
+
+    # 7. 冻结首行
     if sheet_config.freeze_panes:
         # freeze_panes 的字符串 'A2' 转 (row=1, col=0)
         ws.freeze_panes(1, 0)
@@ -442,6 +458,8 @@ def load_sheet_config(yaml_path: str, sheet_name: str) -> SheetConfig:
             merge=c.get("merge", False),
             formula_template=c.get("formula", ""),
             negative_red=c.get("negative_red", False),
+            positive_red=c.get("positive_red", False),
+            comment=c.get("comment", ""),
         ))
 
     return SheetConfig(

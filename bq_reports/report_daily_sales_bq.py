@@ -10,16 +10,7 @@ Usage:
 """
 
 import argparse
-#!/usr/bin/env python3
-"""
-单品日销量报表 - BigQuery 版本
-
-对应原脚本: ../ttpos-n8n-scheduler/scripts/report_wallace_daily_item_sales.sh
-功能: 堂食 + 外卖单品日销量明细
-
-Usage:
-    python -m bq_reports.report_daily_sales_bq --month 2026-01 --output exports/daily_sales_2026_01.xlsx
-"""
+import sys
 
 from .utils.bq_exporter import ReportExporter
 

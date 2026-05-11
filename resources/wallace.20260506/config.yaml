@@ -1,0 +1,62 @@
+# 华莱士 Wallace 利润报表资源配置 — 5月版
+# 相对 wallace.20260422 的差异：
+#   • fallback_bom 改为客户最新提交的"合并 BOM"解析后的结构化文件
+#     源文件: resources/wallace.20260506/合并BOM_原始.xlsx (Sheet1+Sheet2 手写多行格式)
+#     解析脚本: scripts/parse_merged_bom.py（按月份过滤 Sheet2 时间区间）
+#     结果: resources/wallace.20260506/合并BOM_结构化.xlsx
+#   • 商家列表 2026-05-08 更新到 56 家（新增 3 家），改指向 wallace.20260506
+#   • 门店名映射仍指向 wallace.20260410，因为没有更新
+
+# ───────────────────────────────────────────────
+# 1. 门店名称映射
+# ───────────────────────────────────────────────
+store_name_mapping:
+  adapter: excel
+  path: "resources/wallace.20260410/销售业绩+物品消耗表（3月份）.xlsx"
+  sheet: 0
+  header_row: 1
+  mapping:
+    store_number: "门店编号"
+    store_name:
+      primary: "门店名称"
+      fallback: "名称"
+
+# ───────────────────────────────────────────────
+# 2. Fallback BOM —— 最新事实表
+# ───────────────────────────────────────────────
+fallback_bom:
+  adapter: excel
+  path: "resources/wallace.20260506/合并BOM_结构化.xlsx"
+  sheet: "BOM配方(解析结果)"
+  header_row: 1
+  mapping:
+    product_name: "商品名称"
+    material_code: "物品编号"
+    material_name: "物品名称"
+    qty: "单耗"
+    unit: "单位"
+
+# ───────────────────────────────────────────────
+# 3. 商家列表
+# ───────────────────────────────────────────────
+merchant_list:
+  adapter: excel
+  path: "resources/wallace.20260506/华莱士商家56家ID.xlsx"
+  sheet: 0
+  header_row: 1
+  mapping:
+    account: "账号"
+    uuid: "商家ID"
+
+# ───────────────────────────────────────────────
+# 4. 缓存配置
+# ───────────────────────────────────────────────
+cache:
+  store_names_ttl: 604800
+  fallback_bom_ttl: 86400
+  # ERP SID 已过期（4 月 22 日生成，7 天过期），临时复用 4 月 27 日缓存
+  # 等用户更新 .env 中的 ERPNEXT_SID 或换 API Key 后改回 3600
+  erp_prices_ttl: 2592000  # 30 天
+  merchant_list_ttl: 86400
+  combo_structure_ttl: 604800
+  bom_ttl: 86400

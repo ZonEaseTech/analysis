@@ -1,0 +1,89 @@
+# 利润报表列配置 - 中间表版（原始数据，Excel负责计算）
+#
+# 所有列均为 value 类型，不做任何 Python 聚合计算。
+# 计算指标（标准金额、差额、成本、毛利等）由 Excel 公式处理。
+#
+# 列说明：
+#   name:          表头名称
+#   field_index:   在 _build_rows 返回的列表中的索引（0-based）
+#   type:          value（仅原始数据）
+#   format:        数字格式
+#   width:         列宽
+#   merge:         是否合并（block 级别）
+
+sheets:
+  套餐:
+    merge_key_indices: [0, 1, 2, 25]   # 门店编号、门店名称、商品名称、隐藏 item_uuid
+    columns:
+      # === A. 商品基础信息 ===
+      - {name: "门店编号",    field_index: 0,  merge: true,  width: 10}
+      - {name: "门店名称",    field_index: 1,  merge: true,  width: 30}
+      - {name: "套餐名称",    field_index: 2,  merge: true,  width: 30}
+
+      # === B. 价格与销量（原始值）===
+      - {name: "当前标价",    field_index: 3,  type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "销量",        field_index: 4,  type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "营业额",      field_index: 5,  type: value, format: "0.00", merge: true,  width: 12}
+      - {name: "标准金额",    field_index: 6,  type: value, format: "0.00", merge: true,  width: 12}
+      - {name: "实收金额",    field_index: 7,  type: value, format: "0.00", merge: true,  width: 12}
+      - {name: "会员折扣率",  field_index: 8,  type: value, format: "0.0000", merge: true,  width: 12}
+      - {name: "赠品数量",    field_index: 9,  type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "赠送数量",    field_index: 10, type: value, format: "0.00", merge: true,  width: 10}
+
+      # === C. 退款 ===
+      - {name: "退款数量",    field_index: 11, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "退款金额",    field_index: 12, type: value, format: "0.00", merge: true,  width: 12}
+
+      # === D. 价格拆分（前3档 + 其他）===
+      - {name: "价格1",       field_index: 13, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "销量1",       field_index: 14, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "价格2",       field_index: 15, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "销量2",       field_index: 16, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "价格3",       field_index: 17, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "销量3",       field_index: 18, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "其他价格销量", field_index: 19, type: value, format: "0.00", merge: true,  width: 12}
+
+      # === E. BOM 成本（原始值）===
+      - {name: "BOM物品名称", field_index: 20, width: 25}
+      - {name: "BOM物品编码", field_index: 21, width: 15}
+      - {name: "消耗数量",    field_index: 22, type: value, format: "0.0000", width: 12}
+      - {name: "物料单价",    field_index: 23, type: value, format: "0.0000", width: 12}
+      - {name: "单位",        field_index: 24, width: 8}
+
+  单品:
+    merge_key_indices: [0, 1, 2, 25]   # 门店编号、门店名称、商品名称、隐藏 item_uuid
+    columns:
+      # === A. 商品基础信息 ===
+      - {name: "门店编号",    field_index: 0,  merge: true,  width: 10}
+      - {name: "门店名称",    field_index: 1,  merge: true,  width: 30}
+      - {name: "单品名称",    field_index: 2,  merge: true,  width: 30}
+
+      # === B. 价格与销量（原始值）===
+      - {name: "当前标价",    field_index: 3,  type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "销量",        field_index: 4,  type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "营业额",      field_index: 5,  type: value, format: "0.00", merge: true,  width: 12}
+      - {name: "标准金额",    field_index: 6,  type: value, format: "0.00", merge: true,  width: 12}
+      - {name: "实收金额",    field_index: 7,  type: value, format: "0.00", merge: true,  width: 12}
+      - {name: "会员折扣率",  field_index: 8,  type: value, format: "0.0000", merge: true,  width: 12}
+      - {name: "赠品数量",    field_index: 9,  type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "赠送数量",    field_index: 10, type: value, format: "0.00", merge: true,  width: 10}
+
+      # === C. 退款 ===
+      - {name: "退款数量",    field_index: 11, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "退款金额",    field_index: 12, type: value, format: "0.00", merge: true,  width: 12}
+
+      # === D. 价格拆分（前3档 + 其他）===
+      - {name: "价格1",       field_index: 13, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "销量1",       field_index: 14, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "价格2",       field_index: 15, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "销量2",       field_index: 16, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "价格3",       field_index: 17, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "销量3",       field_index: 18, type: value, format: "0.00", merge: true,  width: 10}
+      - {name: "其他价格销量", field_index: 19, type: value, format: "0.00", merge: true,  width: 12}
+
+      # === E. BOM 成本（原始值）===
+      - {name: "BOM物品名称", field_index: 20, width: 25}
+      - {name: "BOM物品编码", field_index: 21, width: 15}
+      - {name: "消耗数量",    field_index: 22, type: value, format: "0.0000", width: 12}
+      - {name: "物料单价",    field_index: 23, type: value, format: "0.0000", width: 12}
+      - {name: "单位",        field_index: 24, width: 8}

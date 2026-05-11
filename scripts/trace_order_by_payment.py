@@ -157,7 +157,10 @@ def query_pos_orders(client, store: dict, payment_kw: str, start_ts: int, end_ts
                 'order_create_time': r.order_create_time,
             })
     except Exception as e:
-        print(f"  [POS查询失败] {store['name']}: {e}")
+        if '404 Not found' in str(e) or 'was not found' in str(e):
+            pass  # 表不存在，忽略
+        else:
+            print(f"  [POS查询失败] {store['name']}: {e}")
     return rows
 
 
@@ -213,38 +216,37 @@ def query_takeout_orders(client, store: dict, platform_kw: str, start_ts: int, e
     """查询外卖平台订单"""
     dataset = store['dataset']
 
+    tto = "tto"  # 表别名，避免用 to（SQL 关键字）
     amount_where = ""
     if amount is not None:
-        amount_where = f"AND ROUND(to.platform_total, 2) = {amount}"
+        amount_where = f"AND ROUND({tto}.platform_total, 2) = {amount}"
     elif amount_min is not None or amount_max is not None:
         if amount_min is not None:
-            amount_where += f"AND to.platform_total >= {amount_min} "
+            amount_where += f"AND {tto}.platform_total >= {amount_min} "
         if amount_max is not None:
-            amount_where += f"AND to.platform_total <= {amount_max} "
+            amount_where += f"AND {tto}.platform_total <= {amount_max} "
 
     safe_kw = _sanitize_kw(platform_kw).lower()
     sql = f"""
     SELECT
-      to.uuid AS order_uuid,
-      to.order_number,
-      to.platform,
-      to.platform_total,
-      to.platform_actual_price,
-      to.takeout_type,
-      to.order_state,
-      CASE WHEN to.order_state = 40 AND to.completed_time > 0 THEN to.completed_time
-           ELSE to.accepted_time END AS pay_time,
-      to.accepted_time,
-      to.completed_time,
-      to.remark
-    FROM `{PROJECT_ID}`.`{dataset}`.`ttpos_takeout_order` to
-    WHERE to.delete_time = 0
-      AND to.order_state IN (10, 20, 30, 40)
-      AND LOWER(to.platform) LIKE '%{safe_kw}%'
-      AND (CASE WHEN to.order_state = 40 AND to.completed_time > 0 THEN to.completed_time
-                ELSE to.accepted_time END) >= {start_ts}
-      AND (CASE WHEN to.order_state = 40 AND to.completed_time > 0 THEN to.completed_time
-                ELSE to.accepted_time END) < {end_ts}
+      {tto}.uuid AS order_uuid,
+      {tto}.platform_order_id AS order_number,
+      {tto}.platform,
+      {tto}.platform_total,
+      {tto}.subtotal,
+      {tto}.order_state,
+      CASE WHEN {tto}.order_state = 40 AND {tto}.completed_time > 0 THEN {tto}.completed_time
+           ELSE {tto}.accepted_time END AS pay_time,
+      {tto}.accepted_time,
+      {tto}.completed_time
+    FROM `{PROJECT_ID}`.`{dataset}`.`ttpos_takeout_order` AS {tto}
+    WHERE {tto}.delete_time = 0
+      AND {tto}.order_state IN (10, 20, 30, 40)
+      AND LOWER({tto}.platform) LIKE '%{safe_kw}%'
+      AND (CASE WHEN {tto}.order_state = 40 AND {tto}.completed_time > 0 THEN {tto}.completed_time
+                ELSE {tto}.accepted_time END) >= {start_ts}
+      AND (CASE WHEN {tto}.order_state = 40 AND {tto}.completed_time > 0 THEN {tto}.completed_time
+                ELSE {tto}.accepted_time END) < {end_ts}
       {amount_where}
     ORDER BY pay_time DESC
     LIMIT 100
@@ -258,14 +260,15 @@ def query_takeout_orders(client, store: dict, platform_kw: str, start_ts: int, e
                 'order_number': r.order_number or '',
                 'platform': r.platform or '',
                 'platform_total': float(r.platform_total) if r.platform_total else 0,
-                'platform_actual_price': float(r.platform_actual_price) if r.platform_actual_price else 0,
-                'takeout_type': r.takeout_type,
+                'subtotal': float(r.subtotal) if r.subtotal else 0,
                 'order_state': r.order_state,
                 'pay_time': r.pay_time,
-                'remark': r.remark or '',
             })
     except Exception as e:
-        print(f"  [外卖查询失败] {store['name']}: {e}")
+        if '404 Not found' in str(e) or 'was not found' in str(e):
+            pass  # 表不存在，忽略
+        else:
+            print(f"  [外卖查询失败] {store['name']}: {e}")
     return rows
 
 

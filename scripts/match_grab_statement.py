@@ -66,12 +66,28 @@ PROJECT_ID = "diyl-407103"
 BQ_LOCATION = "asia-southeast1"
 THAILAND_TZ_OFFSET = 7 * 3600
 
-# ===== 列名自动检测候选 =====
-STORE_CANDIDATES = ['store', 'merchant', 'outlet', 'branch', 'restaurant', '门店', '商家', '店铺', '分店', 'store name', 'outlet name', 'branch name']
-DATE_CANDIDATES = ['date', 'transaction date', 'order date', 'settlement date', '日期', '交易日期', '订单日期', '结算日期']
-AMOUNT_CANDIDATES = ['amount', 'total', 'price', 'gross amount', 'net amount', 'total amount', 'order amount', '金额', '总价', '订单金额', 'gross']
-ORDER_CANDIDATES = ['order number', 'order id', 'order no', 'transaction id', 'reference', 'ref', '订单号', '交易号', '订单编号']
-TIME_CANDIDATES = ['time', 'transaction time', 'order time', '时间']
+# ===== 列名自动检测候选（支持中英泰） =====
+STORE_CANDIDATES = [
+    'store', 'merchant', 'outlet', 'branch', 'restaurant',
+    '门店', '商家', '店铺', '分店', 'store name', 'outlet name', 'branch name',
+    'ชื่อร้านค้า', 'ชื่อร้านค้า/สาขา', 'branch_name', 'shop name',
+]
+DATE_CANDIDATES = [
+    'date', 'transaction date', 'order date', 'settlement date',
+    '日期', '交易日期', '订单日期', '结算日期',
+    'นที่เกิดรายการ', 'วันที่เกิดรายการ', 'order completed time',
+]
+AMOUNT_CANDIDATES = [
+    'amount', 'total', 'price', 'gross amount', 'net amount', 'total amount', 'order amount',
+    '金额', '总价', '订单金额', 'gross',
+    'ยอดเงิน', 'total_revenue', '应收', '实收',
+]
+ORDER_CANDIDATES = [
+    'order number', 'order id', 'order no', 'transaction id', 'reference', 'ref',
+    '订单号', '交易号', '订单编号',
+    'หมายเลข', 'order no.',
+]
+TIME_CANDIDATES = ['time', 'transaction time', 'order time', '时间', 'เวลา']
 
 
 def _detect_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -90,7 +106,7 @@ def _detect_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
 
 
 def _parse_amount(val) -> float:
-    """清洗金额字符串，去除货币符号和千分位"""
+    """清洗金额字符串，去除货币符号和千分位，返回保留 2 位小数的金额"""
     if pd.isna(val):
         return 0.0
     s = str(val).strip()
@@ -100,24 +116,20 @@ def _parse_amount(val) -> float:
     s = s.replace(' ', '')
     # 处理千分位逗号
     if ',' in s and '.' in s:
-        # 有逗号有点，判断哪个是小数点
         last_comma = s.rfind(',')
         last_dot = s.rfind('.')
         if last_comma > last_dot:
-            # 逗号是小数点（欧洲格式）
             s = s.replace('.', '').replace(',', '.')
         else:
-            # 点是小数点（美式格式）
             s = s.replace(',', '')
     elif ',' in s:
-        # 只有逗号，可能是小数点（欧洲）或千分位
         parts = s.split(',')
         if len(parts) == 2 and len(parts[1]) <= 2:
             s = s.replace(',', '.')
         else:
             s = s.replace(',', '')
     try:
-        return float(s)
+        return round(float(s), 2)
     except ValueError:
         return 0.0
 
@@ -373,12 +385,14 @@ def export_matched(df: pd.DataFrame, output_path: str, unmatched_count: int, ord
 def main():
     parser = argparse.ArgumentParser(description="Grab 对账单与 TTPOS 订单匹配对账")
     parser.add_argument("--input", required=True, help="Grab 对账单文件路径（Excel/CSV）")
+    parser.add_argument("--store", help="手动指定门店关键词（用于对账单中没有分店信息的情况，如 --store TR）")
     parser.add_argument("--store-col", help="门店名称列名（默认自动检测）")
     parser.add_argument("--date-col", help="日期列名（默认自动检测）")
     parser.add_argument("--amount-col", help="金额列名（默认自动检测）")
     parser.add_argument("--order-col", help="Grab 订单号列名（可选，默认自动检测）")
     parser.add_argument("--date-format", help="日期格式（如 %%d/%%m/%%Y），默认自动解析")
     parser.add_argument("--tolerance", type=float, default=1.0, help="金额匹配容差（默认 ±1.0）")
+    parser.add_argument("--skip-rows", type=int, default=0, help="跳过前 N 行（用于有标题行的文件，默认 0）")
     parser.add_argument("--output", default="exports/grab_reconciled.xlsx", help="输出路径")
     args = parser.parse_args()
 
@@ -389,10 +403,11 @@ def main():
         print(f"错误: 文件不存在: {args.input}")
         return 1
 
+    read_kwargs = {'header': 0 if args.skip_rows == 0 else args.skip_rows}
     if input_path.suffix.lower() == '.csv':
-        df = pd.read_csv(args.input)
+        df = pd.read_csv(args.input, **read_kwargs)
     else:
-        df = pd.read_excel(args.input)
+        df = pd.read_excel(args.input, **read_kwargs)
 
     print(f"  共 {len(df)} 行, {len(df.columns)} 列: {list(df.columns)}")
 
@@ -403,8 +418,8 @@ def main():
     amount_col = args.amount_col or _detect_column(df, AMOUNT_CANDIDATES)
     order_col = args.order_col or _detect_column(df, ORDER_CANDIDATES)
 
-    if not store_col:
-        print("错误: 无法检测门店列，请通过 --store-col 指定")
+    if not store_col and not args.store:
+        print("错误: 无法检测门店列，且未指定 --store")
         print(f"  可用列: {list(df.columns)}")
         return 1
     if not date_col:
@@ -445,16 +460,32 @@ def main():
     print(f"  共 {len(all_stores)} 家 TTPOS 门店")
 
     # 按门店匹配
-    df_valid['_matched_store'] = df_valid[store_col].apply(lambda x: match_store(x, all_stores))
-    unmatched_store = df_valid['_matched_store'].isna().sum()
-    if unmatched_store > 0:
-        print(f"  警告: {unmatched_store} 行无法匹配到 TTPOS 门店")
-        # 列出未匹配的唯一门店名
-        unmatched_names = df_valid[df_valid['_matched_store'].isna()][store_col].unique()
-        for name in unmatched_names[:5]:
-            print(f"    - '{name}'")
-        if len(unmatched_names) > 5:
-            print(f"    ... 还有 {len(unmatched_names) - 5} 个")
+    if args.store:
+        # 手动指定门店关键词
+        matched = match_store(args.store, all_stores)
+        if matched:
+            print(f"  手动指定门店: '{args.store}' -> {matched['abbr']} | {matched['name']}")
+            df_valid['_matched_store'] = [matched] * len(df_valid)
+        else:
+            print(f"  错误: --store '{args.store}' 无法匹配到 TTPOS 门店")
+            print(f"  可用门店关键词参考:")
+            for s in all_stores[:10]:
+                print(f"    - {s['abbr']} | {s['name']}")
+            return 1
+        unmatched_store = 0
+    elif store_col:
+        df_valid['_matched_store'] = df_valid[store_col].apply(lambda x: match_store(x, all_stores))
+        unmatched_store = df_valid['_matched_store'].isna().sum()
+        if unmatched_store > 0:
+            print(f"  警告: {unmatched_store} 行无法匹配到 TTPOS 门店")
+            unmatched_names = df_valid[df_valid['_matched_store'].isna()][store_col].unique()
+            for name in unmatched_names[:5]:
+                print(f"    - '{name}'")
+            if len(unmatched_names) > 5:
+                print(f"    ... 还有 {len(unmatched_names) - 5} 个")
+    else:
+        print("  错误: 无法检测门店列，且未指定 --store")
+        return 1
 
     # 按 (门店, 日期) 分组批量查询
     query_groups = {}

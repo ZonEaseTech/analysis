@@ -1134,9 +1134,12 @@ class ReportExporter(MultiShopExporter):
                 rows = list(self.client.query(query).result())
                 
                 for row in rows:
+                    package_name = row.package_name or ""
+                    spec_name = row.spec_name or ""
                     record = {
                         "账号": account,
-                        "商品名称": row.product_name or "",
+                        "商品名称": f"{package_name}({spec_name})" if spec_name else package_name,
+                        "分类": row.category_name or "",
                         "销量": float(row.total_qty or 0)
                     }
                     if row.has_bom:
@@ -1156,10 +1159,10 @@ class ReportExporter(MultiShopExporter):
         
         ws1 = wb.active
         ws1.title = "已设置BOM"
-        self._write_data_to_sheet(ws1, has_bom_data, ["账号", "商品名称", "销量"])
+        self._write_data_to_sheet(ws1, has_bom_data, ["账号", "商品名称", "分类", "销量"])
         
         ws2 = wb.create_sheet(title="未设置BOM")
-        self._write_data_to_sheet(ws2, no_bom_data, ["账号", "商品名称", "销量"])
+        self._write_data_to_sheet(ws2, no_bom_data, ["账号", "商品名称", "分类", "销量"])
         
         wb.save(output_path)
         
