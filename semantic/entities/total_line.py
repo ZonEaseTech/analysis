@@ -31,6 +31,10 @@ def merged_cte() -> str:
     (IFNULL(s.avg_member_discount * s.qty, 0) + IFNULL(t.avg_member_discount * t.qty, 0)) / NULLIF(IFNULL(s.qty, 0) + IFNULL(t.qty, 0), 0) AS avg_member_discount,
     IFNULL(s.free_qty, 0) + IFNULL(t.free_qty, 0) AS free_qty,
     IFNULL(s.give_qty, 0) + IFNULL(t.give_qty, 0) AS give_qty,
+    -- 金额恒等式所需的 3 个分项（外卖端固定 0）
+    IFNULL(s.free_amount, 0) + IFNULL(t.free_amount, 0) AS free_amount,
+    IFNULL(s.give_amount, 0) + IFNULL(t.give_amount, 0) AS give_amount,
+    IFNULL(s.discount_amount, 0) + IFNULL(t.discount_amount, 0) AS discount_amount,
     IFNULL(s.cancelled_qty, 0) + IFNULL(t.cancelled_qty, 0) AS cancelled_qty,
     IFNULL(s.cancelled_amount, 0) + IFNULL(t.cancelled_amount, 0) AS cancelled_amount
   FROM shop_sales s

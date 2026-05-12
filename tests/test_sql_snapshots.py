@@ -141,16 +141,49 @@ class BomSqlTests(unittest.TestCase):
 
 
 class ComboStructureSqlTests(unittest.TestCase):
-    def test_parent_child_join_via_package_uuid(self):
+    """v2 (2026-05): 改读 ttpos_product_package_group + _group_item 定义表，
+    跨月稳定，不再从订单 sale_order_product 反推。"""
+
+    def test_reads_definition_tables_not_orders(self):
         sql = render(COMBO_STRUCTURE_SQL)
-        # parent.product_type = 1 (combo); child links via child.package_uuid = parent.uuid
-        self.assertIn("parent_sop.product_type = 1", sql)
-        self.assertIn("ON child_sop.package_uuid = parent_sop.uuid", sql)
-        # Time bounds use sale_bill.finish_time.
-        self.assertIn("sb.finish_time >= 1700000000", sql)
-        self.assertIn("sb.finish_time < 1700864000", sql)
-        # Must only count finished sales (sb.status = 1).
-        self.assertIn("sb.status = 1", sql)
+        # 真源 = 定义表
+        self.assertIn("ttpos_product_package_group", sql)
+        self.assertIn("ttpos_product_package_group_item", sql)
+        # 不再依赖订单
+        self.assertNotIn("ttpos_sale_order_product", sql)
+        self.assertNotIn("sb.finish_time", sql)
+
+    def test_returns_child_num_and_weight(self):
+        sql = render(COMBO_STRUCTURE_SQL)
+        # 输出 4 列: combo_uuid / child_uuid / child_num / weight
+        self.assertIn("AS combo_uuid", sql)
+        self.assertIn("AS child_uuid", sql)
+        self.assertIn("AS child_num", sql)
+        self.assertIn("AS weight", sql)
+
+    def test_weight_formula_caps_at_one(self):
+        """weight = optional_count / candidate_count，上限 1，防 BQ 除零。"""
+        sql = render(COMBO_STRUCTURE_SQL)
+        self.assertIn("candidate_count = 0", sql)
+        self.assertIn("LEAST(1.0, ", sql)
+        self.assertIn("gm.optional_count / gm.candidate_count", sql)
+
+    def test_soft_delete_fallback_for_groups(self):
+        """跟 BOM_SQL 同套路: 全删时回退到 deleted 行，确保已删套餐仍有定义。"""
+        sql = render(COMBO_STRUCTURE_SQL)
+        # 套餐分组 (group) 软删 fallback
+        self.assertIn(
+            "SUM(CASE WHEN g.delete_time = 0 THEN 1 ELSE 0 END)\n"
+            "      OVER (PARTITION BY g.product_package_uuid) AS active_group_count",
+            sql,
+        )
+        self.assertIn("WHERE group_delete_time = 0 OR active_group_count = 0", sql)
+        # 分组项 (item) 软删 fallback
+        self.assertIn(
+            "SUM(CASE WHEN i.delete_time = 0 THEN 1 ELSE 0 END)\n"
+            "      OVER (PARTITION BY i.product_package_group_uuid) AS active_item_count",
+            sql,
+        )
 
 
 if __name__ == "__main__":

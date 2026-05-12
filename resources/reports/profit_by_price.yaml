@@ -1,0 +1,204 @@
+# 按价利润报表 — 客户交付物（per-SKU 横向价格档展开 + BOM）
+#
+# 粒度: (店, SKU, BOM 物料)  ← 价格档不分行，变横向列
+# 价格档展开: 售价1/净销量1 ... 售价5/净销量5 + 其它销量（按净销量降序取 top5）
+#
+# 利润传导:
+#   标准金额 (商品管理标价 × 销量)
+#     ↓ 改价 (= 标准 − 营业额，分项展示)
+#   营业额 (按各价格档加权)
+#     ↓ 打折/退款/赠送/取消 (折损金额)
+#   实收金额 ★
+#     ↓ 净销量 × 单份成本 (净口径)
+#   总毛利
+#
+# 列字母总图 (37 visible + 1 hidden = 38 total):
+#   A 门店编号  B 店名  C SKU名
+#   D 销量      E 净销量
+#   F 营业额    G 标准金额  H 实收金额
+#   I 折损金额  J 客单实收  K 实收占比
+#   L 售价1     M 净销量1
+#   N 售价2     O 净销量2
+#   P 售价3     Q 净销量3
+#   R 售价4     S 净销量4
+#   T 售价5     U 净销量5
+#   V 其它销量
+#   W 赠品数   X 赠送数  Y 退款数  Z 退款金额  AA 取消数  AB 取消金额
+#   AC BOM名   AD 编码   AE 消耗   AF 单价     AG 单位
+#   AH 单份总成本  AI 单品毛利  AJ 总毛利  AK 净利润率
+#   (hidden) item_uuid
+#
+# 行 schema (与 _build_per_sku_rows 严格对齐):
+#   0..2   门店编号/名/SKU名 (merge: true 跨 BOM 行)
+#   3..4   销量/净销量 (merge: true)
+#   5..7   营业额/标准/实收 (merge: true)
+#   8..10  折损/客单实收/实收占比 (block_formula merge: true)
+#   11..20 售价1-5 / 净销量1-5 (merge: true)
+#   21     其它销量 (merge: true)
+#   22..27 赠品/赠送/退款/退款金额/取消/取消金额 (merge: true)
+#   28..32 BOM 5 列 (每物料一行)
+#   33     单份总成本 (block_formula SUMPRODUCT)
+#   34..36 单品毛利/总毛利/净利润率 (block_formula)
+#   37     item_uuid (hidden, merge_key 防同名不同 SKU 错合)
+
+sheets:
+  套餐:
+    merge_key_indices: [0, 1, 2, 37]   # 店编/店名/SKU名/hidden uuid
+    columns:
+      - {name: "门店编号",   field_index: 0,  merge: true, width: 10,
+         comment: "门店编号；BQ ttpos_setting.store_code"}
+      - {name: "门店名称",   field_index: 1,  merge: true, width: 28,
+         comment: "门店中文名；优先 BQ ttpos_setting.store_name，缺失时回退店名 Excel"}
+      - {name: "套餐名称",   field_index: 2,  merge: true, width: 28,
+         comment: "套餐中文名 (ttpos_product_package.name $.zh)"}
+
+      - {name: "销量",       field_index: 3,  type: value, format: "0.00", merge: true, width: 9,
+         comment: "总销量（含赠/退/取，所有价格档累加）"}
+      - {name: "净销量",     field_index: 4,  type: value, format: "0.00", merge: true, width: 9,
+         comment: "= 销量 − 赠品 − 赠送 − 退款 − 取消（真正贡献了实收的件数）"}
+
+      - {name: "营业额",     field_index: 5,  type: value, format: "0.00", merge: true, width: 12,
+         comment: "= Σ(价格档 × 净销量)；所有价格档加权"}
+      - {name: "标准金额",   field_index: 6,  type: value, format: "0.00", merge: true, width: 12,
+         comment: "= 商品管理后台标价 × 销量；≠ 营业额 = 改价了"}
+      - {name: "实收金额",   field_index: 7,  type: value, format: "0.00", merge: true, width: 14,
+         comment: "★ 核心：ttpos CountProductSale 真值（赠送归零、扣退款、用成交价）"}
+
+      - {name: "折损金额",   field_index: 8,  type: block_formula, format: "0.00", merge: true, width: 11,
+         formula: "=F{block_start}-H{block_start}",
+         comment: "= 营业额 − 实收；打折/退款/赠送/取消 综合让利"}
+      - {name: "客单实收",   field_index: 9,  type: block_formula, format: "0.00", merge: true, width: 10,
+         formula: "=IF(E{block_start}=0,0,H{block_start}/E{block_start})",
+         comment: "= 实收 / 净销量；每个真销售件平均回收"}
+      - {name: "实收占比",   field_index: 10, type: block_formula, format: "0.00%", merge: true, width: 10,
+         formula: "=IF(F{block_start}=0,0,H{block_start}/F{block_start})",
+         comment: "= 实收 / 营业额；<90% 通常说明 promotion 损失较大"}
+
+      # 价格档展开（top 5 按净销量降序）
+      - {name: "售价1",      field_index: 11, type: value, format: "0.00", merge: true, width: 9,
+         comment: "主销价档（净销量最高的价格）"}
+      - {name: "净销量1",    field_index: 12, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "售价2",      field_index: 13, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "净销量2",    field_index: 14, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "售价3",      field_index: 15, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "净销量3",    field_index: 16, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "售价4",      field_index: 17, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "净销量4",    field_index: 18, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "售价5",      field_index: 19, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "净销量5",    field_index: 20, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "其它销量",   field_index: 21, type: value, format: "0.00", merge: true, width: 10,
+         comment: "第 6 档及更后所有价格档的净销量合计；>0 表示该 SKU 价格档很碎"}
+
+      # 减项审计
+      - {name: "赠品数量",   field_index: 22, type: value, format: "0.00", merge: true, width: 9,
+         comment: "free_num: 整行白送（actual_amount 计 0）"}
+      - {name: "赠送数量",   field_index: 23, type: value, format: "0.00", merge: true, width: 9,
+         comment: "give_num: 营销赠送"}
+      - {name: "退款数量",   field_index: 24, type: value, format: "0.00", merge: true, width: 9,
+         comment: "refund_num: 实卖后退款"}
+      - {name: "退款金额",   field_index: 25, type: value, format: "0.00", merge: true, width: 11,
+         comment: "= 标价 × 退款数量"}
+      - {name: "取消数量",   field_index: 26, type: value, format: "0.00", merge: true, width: 9,
+         comment: "仅外卖 state=60"}
+      - {name: "取消金额",   field_index: 27, type: value, format: "0.00", merge: true, width: 11}
+
+      # BOM 5 列 — 每物料一行
+      - {name: "BOM物品名称", field_index: 28, width: 22,
+         comment: "原材料中文名 (ttpos_material.name $.zh)"}
+      - {name: "BOM物品编码", field_index: 29, width: 13,
+         comment: "原材料编码 (ttpos_material.code)，对齐 ERPNext/上传价格清单"}
+      - {name: "消耗数量",    field_index: 30, type: value, format: "0.0000", width: 10,
+         comment: "单份商品消耗的原材料数量"}
+      - {name: "物料单价",    field_index: 31, type: value, format: "0.0000", width: 10,
+         comment: "原材料单价（配方单位）；优先级: 上传清单 > ERPNext > BQ"}
+      - {name: "单位",        field_index: 32, width: 6,
+         comment: "配方计量单位（g / pc / 份 等）"}
+
+      # 利润 4 件套 — 跨 BOM block 合并
+      - {name: "单份总成本", field_index: 33, type: block_formula, format: "0.0000", merge: true, width: 11,
+         formula: "=SUMPRODUCT(AE{block_start}:AE{block_end},AF{block_start}:AF{block_end})",
+         comment: "= Σ(消耗 × 单价)；BOM 行内累加。= 0 时极可能 BOM/价格未加载"}
+      - {name: "单品毛利",   field_index: 34, type: block_formula, format: "0.00", merge: true, width: 11, negative_red: true,
+         formula: "=IF(OR(E{block_start}=0,AH{block_start}=0),\"\",H{block_start}/E{block_start}-AH{block_start})",
+         comment: "净毛利: = 客单实收 − 单份成本；分母用净销量"}
+      - {name: "总毛利",     field_index: 35, type: block_formula, format: "0.00", merge: true, width: 11, negative_red: true,
+         formula: "=IF(AH{block_start}=0,\"\",H{block_start}-E{block_start}*AH{block_start})",
+         comment: "= 实收 − 净销量 × 单份成本（净口径，赠/退/取的成本属营销损失另列）"}
+      - {name: "净利润率",   field_index: 36, type: block_formula, format: "0.00%", merge: true, width: 10, negative_red: true,
+         formula: "=IF(OR(H{block_start}=0,AH{block_start}=0),\"\",AJ{block_start}/H{block_start})",
+         comment: "= 总毛利 / 实收；全套净口径"}
+
+  单品:
+    merge_key_indices: [0, 1, 2, 37]
+    columns:
+      - {name: "门店编号",   field_index: 0,  merge: true, width: 10,
+         comment: "门店编号；BQ ttpos_setting.store_code"}
+      - {name: "门店名称",   field_index: 1,  merge: true, width: 28,
+         comment: "门店中文名；优先 BQ ttpos_setting.store_name，缺失时回退店名 Excel"}
+      - {name: "单品名称",   field_index: 2,  merge: true, width: 28,
+         comment: "单品中文名 (ttpos_product_package.name $.zh)"}
+      - {name: "销量",       field_index: 3,  type: value, format: "0.00", merge: true, width: 9,
+         comment: "总销量（含赠/退/取，所有价格档累加）"}
+      - {name: "净销量",     field_index: 4,  type: value, format: "0.00", merge: true, width: 9,
+         comment: "= 销量 − 赠品 − 赠送 − 退款 − 取消"}
+      - {name: "营业额",     field_index: 5,  type: value, format: "0.00", merge: true, width: 12,
+         comment: "= Σ(价格档 × 净销量)"}
+      - {name: "标准金额",   field_index: 6,  type: value, format: "0.00", merge: true, width: 12,
+         comment: "= 商品管理标价 × 销量"}
+      - {name: "实收金额",   field_index: 7,  type: value, format: "0.00", merge: true, width: 14,
+         comment: "★ 核心：ttpos CountProductSale 真值"}
+      - {name: "折损金额",   field_index: 8,  type: block_formula, format: "0.00", merge: true, width: 11,
+         formula: "=F{block_start}-H{block_start}",
+         comment: "= 营业额 − 实收"}
+      - {name: "客单实收",   field_index: 9,  type: block_formula, format: "0.00", merge: true, width: 10,
+         formula: "=IF(E{block_start}=0,0,H{block_start}/E{block_start})",
+         comment: "= 实收 / 净销量"}
+      - {name: "实收占比",   field_index: 10, type: block_formula, format: "0.00%", merge: true, width: 10,
+         formula: "=IF(F{block_start}=0,0,H{block_start}/F{block_start})",
+         comment: "= 实收 / 营业额"}
+      - {name: "售价1",      field_index: 11, type: value, format: "0.00", merge: true, width: 9,
+         comment: "主销价档（净销量最高）"}
+      - {name: "净销量1",    field_index: 12, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "售价2",      field_index: 13, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "净销量2",    field_index: 14, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "售价3",      field_index: 15, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "净销量3",    field_index: 16, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "售价4",      field_index: 17, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "净销量4",    field_index: 18, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "售价5",      field_index: 19, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "净销量5",    field_index: 20, type: value, format: "0.00", merge: true, width: 9}
+      - {name: "其它销量",   field_index: 21, type: value, format: "0.00", merge: true, width: 10,
+         comment: "第 6 档及更后净销量合计"}
+      - {name: "赠品数量",   field_index: 22, type: value, format: "0.00", merge: true, width: 9,
+         comment: "free_num: 整行白送（actual_amount 计 0）"}
+      - {name: "赠送数量",   field_index: 23, type: value, format: "0.00", merge: true, width: 9,
+         comment: "give_num: 营销赠送"}
+      - {name: "退款数量",   field_index: 24, type: value, format: "0.00", merge: true, width: 9,
+         comment: "refund_num: 实卖后退款"}
+      - {name: "退款金额",   field_index: 25, type: value, format: "0.00", merge: true, width: 11,
+         comment: "= 标价 × 退款数量"}
+      - {name: "取消数量",   field_index: 26, type: value, format: "0.00", merge: true, width: 9,
+         comment: "仅外卖 state=60"}
+      - {name: "取消金额",   field_index: 27, type: value, format: "0.00", merge: true, width: 11}
+      - {name: "BOM物品名称", field_index: 28, width: 22,
+         comment: "原材料中文名 (ttpos_material.name $.zh)"}
+      - {name: "BOM物品编码", field_index: 29, width: 13,
+         comment: "原材料编码 (ttpos_material.code)，对齐 ERPNext/上传价格清单"}
+      - {name: "消耗数量",    field_index: 30, type: value, format: "0.0000", width: 10,
+         comment: "单份商品消耗的原材料数量"}
+      - {name: "物料单价",    field_index: 31, type: value, format: "0.0000", width: 10,
+         comment: "原材料单价（配方单位）；优先级: 上传清单 > ERPNext > BQ"}
+      - {name: "单位",        field_index: 32, width: 6,
+         comment: "配方计量单位（g / pc / 份 等）"}
+      - {name: "单份总成本", field_index: 33, type: block_formula, format: "0.0000", merge: true, width: 11,
+         formula: "=SUMPRODUCT(AE{block_start}:AE{block_end},AF{block_start}:AF{block_end})",
+         comment: "= Σ(消耗 × 单价)；= 0 时极可能 BOM/价格未加载"}
+      - {name: "单品毛利",   field_index: 34, type: block_formula, format: "0.00", merge: true, width: 11, negative_red: true,
+         formula: "=IF(OR(E{block_start}=0,AH{block_start}=0),\"\",H{block_start}/E{block_start}-AH{block_start})",
+         comment: "净毛利: = 客单实收 − 单份成本"}
+      - {name: "总毛利",     field_index: 35, type: block_formula, format: "0.00", merge: true, width: 11, negative_red: true,
+         formula: "=IF(AH{block_start}=0,\"\",H{block_start}-E{block_start}*AH{block_start})",
+         comment: "= 实收 − 净销量 × 单份成本"}
+      - {name: "净利润率",   field_index: 36, type: block_formula, format: "0.00%", merge: true, width: 10, negative_red: true,
+         formula: "=IF(OR(H{block_start}=0,AH{block_start}=0),\"\",AJ{block_start}/H{block_start})",
+         comment: "= 总毛利 / 实收"}

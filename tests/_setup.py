@@ -28,6 +28,8 @@ def order_row(**fields) -> SimpleNamespace:
         sales_price=0, original_amount=0, avg_member_discount=1.0,
         free_qty=0, give_qty=0, refund_qty=0, refund_amount=0,
         cancelled_qty=0, cancelled_amount=0,
+        # 金额恒等式分项（堂食 sale_line 才有非零；外卖固定 0）
+        free_amount=0, give_amount=0, discount_amount=0,
         list_price=0,
         price_1=None, qty_1=None,
         price_2=None, qty_2=None,

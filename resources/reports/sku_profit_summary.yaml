@@ -1,0 +1,64 @@
+# SKU 利润汇总报表（每 SKU 一行；不展开 BOM 物料）
+#
+# 用途：客户层面看每个 SKU 真实带来多少实收 / 多少成本 / 多少利润。
+# 与 profit_margin.yaml 的区别：profit_margin 一行=一个 BOM 物料，本表一行=一个 SKU。
+# 数据来源：profit_margin_report._build_summary_rows() —— 同一份 agg_data 不同 flatten。
+#
+# 行 schema（与 _build_summary_rows 输出严格对齐）：
+#   0  门店编号
+#   1  门店名称
+#   2  商品名称
+#   3  销量 (qty, 含赠/退/取)
+#   4  净销量 (net_qty)
+#   5  营业额 (sales_price)
+#   6  实收金额 (revenue / actual_amount)
+#   7  单份总成本 (sum bom_num × unit_price)
+#   8  总成本 = 单份总成本 × 销量 (gross qty 因为 BOM 真消耗了)
+#   9  总利润 = 实收 - 总成本
+#  10  利润率 = 总利润 / 实收
+#  11  item_uuid (hidden merge key)
+
+sheets:
+  套餐:
+    merge_key_indices: []   # 一行 = 一个 SKU，无需 block merge
+    columns:
+      - {name: "门店编号",   field_index: 0,  width: 10,
+         comment: "门店编号（来自 BQ ttpos_setting.values.store_code）"}
+      - {name: "门店名称",   field_index: 1,  width: 30}
+      - {name: "套餐名称",   field_index: 2,  width: 35}
+
+      - {name: "销量",       field_index: 3,  type: value, format: "0.00", width: 10,
+         comment: "总销量（堂食 + 外卖，含赠品/赠送/退款件，外卖含 state=60 取消单）"}
+      - {name: "净销量",     field_index: 4,  type: value, format: "0.00", width: 10,
+         comment: "净销量 = 销量 − 赠品 − 赠送 − 退款 − 取消 = 真正贡献了实收的件数"}
+
+      - {name: "营业额",     field_index: 5,  type: value, format: "0.00", width: 12,
+         comment: "标价 × 销量；不扣折扣/退款，但已排除外卖 state=60 取消"}
+      - {name: "实收金额",   field_index: 6,  type: value, format: "0.00", width: 12,
+         comment: "ttpos CountProductSale 真实口径：赠品/赠送归零、扣退款、用成交价"}
+
+      - {name: "单份总成本", field_index: 7,  type: value, format: "0.0000", width: 12,
+         comment: "= Σ (BOM 消耗 × 物料单价)；用销量 × 此列 = 总成本"}
+      - {name: "总成本",     field_index: 8,  type: value, format: "0.00", width: 12,
+         comment: "= 单份总成本 × 销量（含赠品/退款件，因 BOM 消耗实际发生）"}
+      - {name: "总利润",     field_index: 9,  type: value, format: "0.00", width: 12, negative_red: true,
+         comment: "= 实收金额 − 总成本"}
+      - {name: "利润率",     field_index: 10, type: value, format: "0.00%", width: 10, negative_red: true,
+         comment: "= 总利润 / 实收金额"}
+
+  单品:
+    merge_key_indices: []
+    columns:
+      - {name: "门店编号",   field_index: 0,  width: 10}
+      - {name: "门店名称",   field_index: 1,  width: 30}
+      - {name: "单品名称",   field_index: 2,  width: 35}
+      - {name: "销量",       field_index: 3,  type: value, format: "0.00", width: 10,
+         comment: "总销量（含赠品/赠送/退款件 + 外卖取消件）"}
+      - {name: "净销量",     field_index: 4,  type: value, format: "0.00", width: 10,
+         comment: "= 销量 − 赠品 − 赠送 − 退款 − 取消"}
+      - {name: "营业额",     field_index: 5,  type: value, format: "0.00", width: 12}
+      - {name: "实收金额",   field_index: 6,  type: value, format: "0.00", width: 12}
+      - {name: "单份总成本", field_index: 7,  type: value, format: "0.0000", width: 12}
+      - {name: "总成本",     field_index: 8,  type: value, format: "0.00", width: 12}
+      - {name: "总利润",     field_index: 9,  type: value, format: "0.00", width: 12, negative_red: true}
+      - {name: "利润率",     field_index: 10, type: value, format: "0.00%", width: 10, negative_red: true}

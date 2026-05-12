@@ -33,6 +33,10 @@ def takeout_sales_cte() -> str:
     1.0 AS avg_member_discount,
     0 AS free_qty,
     0 AS give_qty,
+    -- 外卖无赠送/折扣概念，3 个金额项固定 0（金额恒等式用，保证 schema 跟 shop_sales 对齐）
+    0 AS free_amount,
+    0 AS give_amount,
+    0 AS discount_amount,
     -- 取消订单：state=60 单独统计
     SUM(IF(t.order_state = 60, toi.quantity, 0)) AS cancelled_qty,
     SUM(IF(t.order_state = 60, toi.price * toi.quantity, 0)) AS cancelled_amount

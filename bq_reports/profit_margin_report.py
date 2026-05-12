@@ -464,6 +464,10 @@ SELECT
   m.refund_amount AS refund_amount,
   m.cancelled_qty AS cancelled_qty,
   m.cancelled_amount AS cancelled_amount,
+  -- 金额恒等式三分项：sales_price = actual + refund + free + give + cancelled + discount
+  m.free_amount AS free_amount,
+  m.give_amount AS give_amount,
+  m.discount_amount AS discount_amount,
   -- 价格拆分：前3个主要价格档 + 其他
   p3.price_1 AS price_1,
   p3.qty_1 AS qty_1,
@@ -585,22 +589,28 @@ def _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_price
 def _load_combo_structures(engine, merchants, start_ts, end_ts, config: dict = None):
     """
     查询并缓存每个门店的套餐结构。
-    返回: {store_num: {combo_uuid: [child_uuid, ...]}}
+    返回: {store_num: {combo_uuid: [(child_uuid, child_num, weight), ...]}}
+
+    v2 (2026-05): 改读 ttpos_product_package_group + _group_item 定义表，
+    跨月稳定，不再依赖订单反推；返回 3 元组带份数 + 摊薄权重。
     """
     cfg = config or {}
     cache_ttl = cfg.get("cache", {}).get("combo_structure_ttl", 604800)  # 7天
-    key = cache_key("combo_structures", {"count": len(merchants), "start": start_ts, "end": end_ts})
+    # v2: shape 变了 (list[(child, num, weight)] 三元组), bump cache key 避免读旧格式
+    key = cache_key("combo_structures_v2", {"count": len(merchants)})
     cached = get_cache(key, ttl_seconds=cache_ttl)
     if cached is not None:
         print(f"[Combo Structure] 缓存命中: {len(cached)} 个门店")
         return cached
 
-    print("[Combo Structure] 从 BQ 查询套餐结构...")
+    print("[Combo Structure] 从 BQ 查询套餐定义...")
     raw_rows, errors = engine.query(
         sql_template=COMBO_STRUCTURE_SQL,
         merchants=merchants,
-        start_ts=start_ts,
-        end_ts=end_ts,
+        # SQL v2 不读 {start_ts}/{end_ts}（套餐定义跨月稳定），但 engine.query
+        # 仍要这俩参数避免 KeyError —— 传死值即可
+        start_ts=0,
+        end_ts=0,
         workers=10,
         row_proxy_factory=lambda row, acc, num, name: type("RowProxy", (), {
             "__getattr__": lambda self, attr: getattr(row, attr),
@@ -616,10 +626,12 @@ def _load_combo_structures(engine, merchants, start_ts, end_ts, config: dict = N
             structures[store_num] = {}
         combo_uuid = str(row.combo_uuid)
         child_uuid = str(row.child_uuid)
+        child_num = float(row.child_num or 0)
+        weight = float(row.weight or 1.0)
         if combo_uuid not in structures[store_num]:
             structures[store_num][combo_uuid] = []
-        if child_uuid not in structures[store_num][combo_uuid]:
-            structures[store_num][combo_uuid].append(child_uuid)
+        # 同 combo 可能有多个 group，多个 slot，允许同 child 多行（不 dedup）
+        structures[store_num][combo_uuid].append((child_uuid, child_num, weight))
 
     set_cache(key, structures)
     total_combos = sum(len(v) for v in structures.values())
@@ -743,6 +755,10 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         refund_amount = float(getattr(row, "refund_amount", None) or 0)
         cancelled_qty = float(getattr(row, "cancelled_qty", None) or 0)
         cancelled_amount = float(getattr(row, "cancelled_amount", None) or 0)
+        # 金额恒等式分项（堂食才有非零值）
+        free_amount = float(getattr(row, "free_amount", None) or 0)
+        give_amount = float(getattr(row, "give_amount", None) or 0)
+        discount_amount = float(getattr(row, "discount_amount", None) or 0)
         list_price = float(getattr(row, "list_price", None) or 0)
         price_1 = getattr(row, "price_1", None)
         qty_1 = getattr(row, "qty_1", None)
@@ -763,6 +779,9 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
                 "refund_amount": 0.0,
                 "cancelled_qty": 0.0,
                 "cancelled_amount": 0.0,
+                "free_amount": 0.0,
+                "give_amount": 0.0,
+                "discount_amount": 0.0,
                 "avg_member_discount": 0.0,
                 "free_qty": 0.0,
                 "give_qty": 0.0,
@@ -784,6 +803,9 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         data[key]["refund_amount"] += refund_amount
         data[key]["cancelled_qty"] += cancelled_qty
         data[key]["cancelled_amount"] += cancelled_amount
+        data[key]["free_amount"] += free_amount
+        data[key]["give_amount"] += give_amount
+        data[key]["discount_amount"] += discount_amount
         # 加权平均会员折扣率
         data[key]["avg_member_discount"] += avg_member_discount * qty
         data[key]["free_qty"] += free_qty
@@ -800,26 +822,37 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         store_boms = bom_data.get(store_num, {})
 
         if mode == "combo":
-            # 套餐：合并所有子产品的 BOM。同一物料被多个子商品共用时累加 num。
+            # 套餐：合并所有子产品的 BOM，按 (子商品份数 × 选项权重) 加权。
+            # combo_structure v2 元素 = (child_uuid, child_num, weight)
+            # 旧 shape (纯 str 列表) 也兼容: 视为 num=1, weight=1
             store_struct = combo_structure.get(store_num, {})
-            child_uuids = store_struct.get(item_uuid, [])
-            for child_uuid in child_uuids:
+            child_specs = store_struct.get(item_uuid, [])
+            for spec in child_specs:
+                # JSON cache 把 tuple 序列化为 list，所以两种都得识别
+                if isinstance(spec, (tuple, list)) and len(spec) == 3:
+                    child_uuid, child_num, weight = spec
+                else:
+                    # 旧 shape 兼容: 纯字符串 child_uuid (synthetic 测试用)
+                    child_uuid, child_num, weight = spec, 1.0, 1.0
+                # 一个 child 在套餐里出的 BOM 量 = bom_num × child_num × weight
+                child_mult = float(child_num) * float(weight)
                 child_bom = store_boms.get(child_uuid, [])
                 for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in child_bom:
                     if not material_code:
                         continue
                     base_price = _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_prices)
                     unit_price = base_price * (conv_rate or 1)
+                    weighted_bom_num = bom_num * child_mult
                     if material_code in val["bom"]:
                         prev_name, prev_num, prev_up, prev_unit = val["bom"][material_code]
                         val["bom"][material_code] = (
                             prev_name or material_name,
-                            prev_num + bom_num,
+                            prev_num + weighted_bom_num,
                             unit_price,                  # 同物料同单位价不变
                             prev_unit or bom_unit,
                         )
                     else:
-                        val["bom"][material_code] = (material_name, bom_num, unit_price, bom_unit)
+                        val["bom"][material_code] = (material_name, weighted_bom_num, unit_price, bom_unit)
         else:
             # 单品：直接匹配 BOM。同一商品多个 product_bom（不同 flavor/sauce 但共用 bom_card）
             # 会重复返回相同 material_code，按 dedup 处理（避免 N 倍虚增）。
@@ -835,8 +868,12 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
     # 转换为列表格式（保留所有原始字段，利润指标由 Excel 公式计算）
     result = {}
     for key, val in data.items():
+        # 衍生指标：净销量（真正卖出去的件数）
+        net_qty = (val["qty"] - val["free_qty"] - val["give_qty"]
+                   - val["refund_qty"] - val["cancelled_qty"])
         result[key] = {
             "qty": val["qty"],
+            "net_qty": net_qty,
             "revenue": val["revenue"],
             "sales_price": val["sales_price"],
             "original_amount": val["original_amount"],
@@ -844,6 +881,9 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
             "refund_amount": val["refund_amount"],
             "cancelled_qty": val["cancelled_qty"],
             "cancelled_amount": val["cancelled_amount"],
+            "free_amount": val["free_amount"],
+            "give_amount": val["give_amount"],
+            "discount_amount": val["discount_amount"],
             "avg_member_discount": val["avg_member_discount"],
             "free_qty": val["free_qty"],
             "give_qty": val["give_qty"],
@@ -945,6 +985,60 @@ def _build_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None, erp_pr
     return rows
 
 
+def _build_summary_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None, erp_prices=None):
+    """SKU 汇总视角：一个 (店, SKU) 一行，提前算好 总成本/总利润/利润率。
+
+    跟 `_build_rows` 共享 agg_data 输入，但 flatten 方式不同：
+      - _build_rows:        N 个 BOM 物料 → N 行（共享 SKU 维度列）
+      - _build_summary_rows: BOM 列表压成"单份总成本"标量 → 1 行
+
+    适合客户做透视/汇总。`negative_red` 在 yaml 中触发字体红色。
+
+    Returns: list of [store_num, store_name, item_name, qty, net_qty,
+                       sales_price, revenue, per_unit_cost, total_cost,
+                       total_profit, margin, item_uuid]
+    """
+    rows = []
+    for (store_num, store_name, item_uuid, item_name), data in sorted(agg_data.items()):
+        qty = data["qty"]
+        net_qty = data.get("net_qty", qty)
+        sales_price = data["sales_price"]
+        revenue = data["revenue"]
+        bom_list = data["bom"]
+
+        # Fallback BOM 补全（口径跟 _build_rows 一致）
+        if not bom_list and fallback_boms:
+            matched = _match_fallback_bom(item_name, fallback_boms)
+            if matched:
+                bom_list = []
+                for code, name, bom_num, uom in matched:
+                    unit_price = _resolve_base_unit_price(code, 0, uploaded_prices, erp_prices)
+                    bom_list.append((code, name, bom_num, unit_price, uom or "-"))
+
+        # 单份总成本 = Σ (BOM 消耗 × 物料单价)
+        per_unit_cost = sum(bom_num * unit_price
+                            for _, _, bom_num, unit_price, _ in bom_list)
+        # 总成本 = 单份成本 × 销量（含赠/退/取，因为 BOM 实际消耗了）
+        total_cost = per_unit_cost * qty
+        # 总利润 = 实收 - 总成本
+        total_profit = revenue - total_cost
+        margin = total_profit / revenue if revenue > 0 else 0
+
+        rows.append([
+            store_num, store_name, item_name,
+            round(qty, 2),
+            round(net_qty, 2),
+            round(sales_price, 2),
+            round(revenue, 2),
+            round(per_unit_cost, 4),
+            round(total_cost, 2),
+            round(total_profit, 2),
+            round(margin, 4),
+            str(item_uuid),
+        ])
+    return rows
+
+
 # ============================================================================
 # 资源配置加载
 # ============================================================================
@@ -981,8 +1075,13 @@ def main():
     parser.add_argument("--config", default=None, help="资源配置 YAML 路径")
     parser.add_argument("--column-config", default="resources/reports/profit_margin.yaml", help="列配置 YAML 路径")
     parser.add_argument("--price-list", default=None, help="上传的物料价格清单 Excel 路径（最高优先级）")
+    parser.add_argument("--summary", action="store_true",
+                        help="汇总视角：每 SKU 一行（不展开 BOM 物料），默认输出 sku_profit_summary.yaml 格式")
     parser.add_argument("--no-cache", action="store_true", help="禁用缓存")
     args = parser.parse_args()
+    # --summary 自动切换列配置（除非用户显式覆盖）
+    if args.summary and args.column_config == "resources/reports/profit_margin.yaml":
+        args.column_config = "resources/reports/sku_profit_summary.yaml"
 
     # 时间范围解析
     if args.month and (args.start_date or args.end_date):
@@ -1091,16 +1190,45 @@ def main():
             uploaded_prices=uploaded_prices, erp_prices=erp_prices, mode=mode
         )
 
-        # 扁平化
-        flat_rows = _build_rows(agg_data, mode, fallback_boms=fallback_boms,
-                                uploaded_prices=uploaded_prices, erp_prices=erp_prices)
+        # 扁平化（汇总视角 or BOM 展开视角）
+        if args.summary:
+            flat_rows = _build_summary_rows(
+                agg_data, mode, fallback_boms=fallback_boms,
+                uploaded_prices=uploaded_prices, erp_prices=erp_prices,
+            )
+        else:
+            flat_rows = _build_rows(
+                agg_data, mode, fallback_boms=fallback_boms,
+                uploaded_prices=uploaded_prices, erp_prices=erp_prices,
+            )
 
         # 加载列配置并写入 Excel
         sheet_cfg = engine.load_sheet_config(args.column_config, item_label)
         engine.write_sheet(wb, item_label, sheet_cfg, flat_rows)
 
         print(f"\n[{item_label}] 总明细行数: {len(flat_rows)} 行")
-        print(f"[{item_label}] 此为中间表，利润指标请自行在 Excel 中定义")
+        if not args.summary:
+            print(f"[{item_label}] 此为中间表，利润指标请自行在 Excel 中定义")
+
+        # 校验恒等式 — 中间表也跑，作为对账锚必须自校
+        # agg_data 在两种 build 模式下字段一致，校验器对 grain 不敏感
+        from semantic.validators import check, print_result
+        from semantic.validators.identities import DEFAULT_IDENTITIES
+
+        check_rows = [
+            {
+                "store_num": store_num,
+                "item_name": item_name,
+                **data,
+            }
+            for (store_num, _store_name, _uuid, item_name), data
+            in agg_data.items()
+        ]
+        print(f"\n[{item_label}] 校验恒等式 …")
+        result = check(check_rows, DEFAULT_IDENTITIES)
+        print_result(result, row_label=lambda r: f"店 {r['store_num']:>3}  {r['item_name']:<30}")
+        if result.has_must_fix:
+            print(f"⚠️  [{item_label}] 有 🔴 离谱违反，请核实数据/口径。\n")
 
     wb.close()
     print(f"\n输出文件: {output_path}")

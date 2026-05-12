@@ -14,6 +14,9 @@ Returned fields per item_uuid:
   refund_amount      ── 退款标价金额
   avg_member_discount── 平均会员折扣率
   free_qty, give_qty ── 赠品 / 赠送数量
+  free_amount,
+  give_amount        ── 赠品 / 赠送行的整单标价金额（金额恒等式用）
+  discount_amount    ── 调价折扣：(标价-成交价) × 已售件数（金额恒等式用）
   cancelled_qty,
   cancelled_amount   ── 堂食固定 0（POS 直接成交，无取消单概念）
 """
@@ -43,6 +46,12 @@ def shop_sales_cte() -> str:
     AVG(sp.member_order_discount_rate) AS avg_member_discount,
     SUM(sp.free_num) AS free_qty,
     SUM(sp.give_num) AS give_qty,
+    -- 赠品行的整单标价金额（ttpos 把整行算赠送，跟 actual_amount 的 IF 同条件）
+    SUM(IF(sp.free_num > 0, sp.product_sale_price * sp.product_num, 0)) AS free_amount,
+    SUM(IF(sp.give_num > 0, sp.product_sale_price * sp.product_num, 0)) AS give_amount,
+    -- 调价折扣：(标价 - 成交价) × 已售件数，跟 actual_amount 同口径（赠送行排除，退款扣除）
+    SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,
+           (sp.product_sale_price - sp.product_final_price) * (sp.product_num - sp.refund_num))) AS discount_amount,
     -- 堂食没有"取消订单"概念（POS 直接成交），固定 0
     0 AS cancelled_qty,
     0 AS cancelled_amount
