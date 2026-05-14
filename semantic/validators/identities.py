@@ -6,6 +6,12 @@ Thresholds in `_money_classify` are placeholders tuned for ttpos
 Don't define identities outside this file unless they're truly one-off —
 the value of having ONE place is greater than the convenience of
 report-local rules.
+
+Identity families:
+  - DEFAULT_IDENTITIES        : 数学恒等式（销量、金额）
+  - SOURCE_COVERAGE_IDENTITIES: 来源完整性 (P2 新增)
+  - SANITY_BAND_IDENTITIES    : 业务合理性区间 (P2 新增)
+  - FULL_IDENTITIES           : 全部启用 (默认 + source 覆盖 + sanity)
 """
 from .core import Identity, Severity
 
@@ -73,3 +79,168 @@ AMOUNT_IDENTITY = Identity(
 
 # Default bundle for the profit_margin / sku_profit_summary reports.
 DEFAULT_IDENTITIES = [SALES_QTY_IDENTITY, AMOUNT_IDENTITY]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P2 — Source Coverage Identities (来源完整性)
+#
+# 报表行经 P1 Resolver 解析后, agg_data 上会带 bom_source / price_source
+# 字段 (由 _annotate_agg_data_sources 写入). 这些 identity 校验"有销量但
+# 没找到 BOM 来源"这种数据缺失.
+# ═══════════════════════════════════════════════════════════════════
+
+def _coverage_classify(delta: float, lhs: float) -> Severity:
+    """0 = 完整 (NEGLIGIBLE), 1 = 缺失 (MUST_FIX)。
+
+    跟 _money_classify / _qty_classify 不同, coverage 是 binary —— 任何缺失
+    都是 must-fix, 没有 NEEDS_REVIEW 中间档.
+    """
+    return Severity.NEGLIGIBLE if delta == 0 else Severity.MUST_FIX
+
+
+BOM_SOURCE_COVERAGE = Identity(
+    name="BOM 来源完整性",
+    description=(
+        "有销量 (qty > 0) 的 SKU 必须有 BOM 来源 (bom_source != '无').\n"
+        "缺失意味着这个 SKU 没匹配上任何 BOM 数据源, 物料成本会算成 0.\n"
+        "Opt-in: 只在 row 显式有 bom_source 字段时检查 (profit_by_price 不走 BOM)."
+    ),
+    # lhs = 1 if 缺失 else 0; rhs = 0; delta != 0 即缺失
+    # 只对显式带 bom_source 字段的 row 检查 (opt-in)
+    lhs=lambda r: 1.0 if (
+        "bom_source" in r
+        and float(r.get("qty", 0) or 0) > 0
+        and r.get("bom_source", "无") == "无"
+    ) else 0.0,
+    rhs=lambda r: 0.0,
+    classify=_coverage_classify,
+)
+
+
+PRICE_SOURCE_COVERAGE = Identity(
+    name="物料单价来源完整性",
+    description=(
+        "有 BOM 物料的 SKU 必须有物料单价来源 (price_source != '无').\n"
+        "缺失意味着 BOM 找到了但单价全部 fallback 到 bq_native 或 0, 成本不可信.\n"
+        "Opt-in: 只在 row 显式有 price_source 字段时检查."
+    ),
+    lhs=lambda r: 1.0 if (
+        "price_source" in r
+        and r.get("bom_source", "无") != "无"
+        and r.get("price_source", "无") == "无"
+    ) else 0.0,
+    rhs=lambda r: 0.0,
+    classify=_coverage_classify,
+)
+
+
+SOURCE_COVERAGE_IDENTITIES = [
+    BOM_SOURCE_COVERAGE,
+    PRICE_SOURCE_COVERAGE,
+]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# P2 — Sanity Band Identities (业务合理性区间)
+#
+# 不是数学恒等式, 是"业务上数字应该在某区间内"的检查. 比如退款率应该 < 5%.
+# 越界不一定数据错, 但值得人工 review. 走 NEEDS_REVIEW (🟡) 而不是 MUST_FIX,
+# 除非越界离谱.
+# ═══════════════════════════════════════════════════════════════════
+
+def _band_classify(low: float, high: float,
+                   hard_low: float = None, hard_high: float = None):
+    """构造一个区间检查 classify 函数。
+
+    [low, high]          → NEGLIGIBLE (OK)
+    [hard_low, low)
+      或 (high, hard_high] → NEEDS_REVIEW (🟡 复核)
+    < hard_low / > hard_high → MUST_FIX (🔴 离谱)
+
+    Args:
+        low, high: 健康区间
+        hard_low, hard_high: hard 离谱区间. 不传时默认软区间外 2x.
+
+    用法:
+        Identity(..., classify=_band_classify(0.0, 0.05, hard_high=0.20))
+        # 期望 < 5%; 5-20% 黄色; > 20% 红色
+    """
+    if hard_low is None:
+        hard_low = float("-inf")
+    if hard_high is None:
+        hard_high = float("inf")
+
+    def classify(_delta: float, lhs: float) -> Severity:
+        val = lhs  # band 检查里 lhs 就是 value, delta 没意义
+        if low <= val <= high:
+            return Severity.NEGLIGIBLE
+        if val < hard_low or val > hard_high:
+            return Severity.MUST_FIX
+        return Severity.NEEDS_REVIEW
+
+    return classify
+
+
+REFUND_RATIO_BAND = Identity(
+    name="退款率合理性",
+    description=(
+        "退款率 (refund_qty / qty) 应 < 5%; > 20% 必查.\n"
+        "高退款率可能是: 商品质量问题 / 收银录单错 / 顾客大量退订单."
+    ),
+    lhs=lambda r: (
+        float(r.get("refund_qty", 0) or 0) / float(r["qty"])
+        if float(r.get("qty", 0) or 0) > 0 else 0.0
+    ),
+    rhs=lambda r: 0.0,
+    classify=_band_classify(0.0, 0.05, hard_high=0.20),
+)
+
+
+FREE_GIVE_RATIO_BAND = Identity(
+    name="赠品赠送率合理性",
+    description=(
+        "(赠品 + 赠送) / 销量 应 < 10%; > 30% 必查.\n"
+        "高赠送率可能是: 活动促销 (正常) / 员工权限滥用 / 录单走赠送绕收银."
+    ),
+    lhs=lambda r: (
+        (float(r.get("free_qty", 0) or 0) + float(r.get("give_qty", 0) or 0))
+        / float(r["qty"])
+        if float(r.get("qty", 0) or 0) > 0 else 0.0
+    ),
+    rhs=lambda r: 0.0,
+    classify=_band_classify(0.0, 0.10, hard_high=0.30),
+)
+
+
+CANCEL_RATIO_BAND = Identity(
+    name="外卖取消率合理性",
+    description=(
+        "外卖取消率 (cancelled_qty / qty) 应 < 10%; > 30% 必查.\n"
+        "高取消率可能是: 商品缺货频繁 / 商家拒单 / 平台账号异常."
+    ),
+    lhs=lambda r: (
+        float(r.get("cancelled_qty", 0) or 0) / float(r["qty"])
+        if float(r.get("qty", 0) or 0) > 0 else 0.0
+    ),
+    rhs=lambda r: 0.0,
+    classify=_band_classify(0.0, 0.10, hard_high=0.30),
+)
+
+
+SANITY_BAND_IDENTITIES = [
+    REFUND_RATIO_BAND,
+    FREE_GIVE_RATIO_BAND,
+    CANCEL_RATIO_BAND,
+]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Combined bundles
+# ═══════════════════════════════════════════════════════════════════
+
+# Full bundle — all P1 + P2 identities. 推荐生产用这个.
+FULL_IDENTITIES = (
+    DEFAULT_IDENTITIES
+    + SOURCE_COVERAGE_IDENTITIES
+    + SANITY_BAND_IDENTITIES
+)

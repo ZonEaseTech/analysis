@@ -369,6 +369,138 @@ class ConditionalAdapter(ResourceAdapter):
 
 
 # ───────────────────────────────────────────────────────────────
+# 成本价专用适配器 (业务语义编码: ✅ 直读 vs 算法路径 / 规格 parser)
+# ───────────────────────────────────────────────────────────────
+
+import re
+
+
+def _parse_spec_to_min_unit_count(spec):
+    """规格字符串 → 每箱最小单位数 (提取所有数字相乘).
+    示例:
+        '100只/包；100包/袋/箱'  → 10000
+        '52个/条*25条/箱'       → 1300
+        '500张/包*4包/箱'       → 2000
+        '3043杯/卷*6卷/箱'      → 18258
+    """
+    if not spec:
+        return None
+    nums = re.findall(r'\d+(?:\.\d+)?', str(spec))
+    if not nums:
+        return None
+    result = 1.0
+    for n in nums:
+        result *= float(n)
+    return int(result) if result == int(result) else result
+
+
+def _normalize_overseas_suffix(name):
+    """去 (海外版) / （海外版）/ ( 海外版 ) 尾缀, trim 空白"""
+    if not name:
+        return ''
+    s = str(name).strip()
+    s = re.sub(r'[\(（]\s*海外版\s*[\)）]\s*$', '', s).strip()
+    return s
+
+
+class CostPriceTaixiAdapter(ResourceAdapter):
+    """读 '所有成本价_含ItemCode.xlsx' 的【泰国采】sheet, 输出 {编码: {price, unit, source_tag}}.
+
+    取价规则:
+      - col 14「系统匹配」== '✅'  → 直读 col 10「单价(最小单位)」
+      - 否则                    → 算 col 8「销售单价」÷ col 6「转换系数」
+    单位: col 11「最小单位」 (克/个 等).
+    """
+
+    def load(self, config):
+        from openpyxl import load_workbook
+        filepath = config["path"]
+        sheet_name = config.get("sheet", "泰国采")
+
+        wb = load_workbook(filepath, data_only=True)
+        try:
+            ws = wb[sheet_name]
+        except KeyError as e:
+            wb.close()
+            raise ValueError(f"Sheet '{sheet_name}' 不存在: {[s.title for s in wb.worksheets]}") from e
+
+        result = {}
+        for r in range(2, ws.max_row + 1):
+            code = ws.cell(r, 1).value
+            sales_price = ws.cell(r, 8).value
+            conv = ws.cell(r, 6).value
+            min_unit_price = ws.cell(r, 10).value
+            min_unit = ws.cell(r, 11).value
+            sys_match = ws.cell(r, 14).value
+            if not code:
+                continue
+            code_str = str(code).strip()
+            if sys_match == '✅' and isinstance(min_unit_price, (int, float)):
+                price = float(min_unit_price)
+                tag = '泰国采[✅直读]'
+            elif isinstance(sales_price, (int, float)) and isinstance(conv, (int, float)) and conv > 0:
+                price = sales_price / conv
+                tag = '泰国采[销售单价/转换系数]'
+            else:
+                continue
+            if code_str not in result:
+                result[code_str] = {
+                    "price": price,
+                    "unit": str(min_unit or '').strip(),
+                    "source_tag": tag,
+                }
+        wb.close()
+        return result
+
+
+class CostPriceImportAdapter(ResourceAdapter):
+    """读 '2026进口货物(2).xlsx' 的【2026.1】sheet (报关单), 输出 {归一化名: {price, unit, ...}}.
+
+    取价规则: col 17「销售无税单价」÷ parse_spec(col 6「规格」) = per-最小单位.
+    匹配键: col 5「NC 名称」去「(海外版)」/「（海外版）」尾缀.
+    """
+
+    def load(self, config):
+        from openpyxl import load_workbook
+        filepath = config["path"]
+        sheet_name = config.get("sheet", "2026.1")
+
+        wb = load_workbook(filepath, data_only=True)
+        try:
+            ws = wb[sheet_name]
+        except KeyError as e:
+            wb.close()
+            raise ValueError(f"Sheet '{sheet_name}' 不存在: {[s.title for s in wb.worksheets]}") from e
+
+        result = {}
+        for r in range(2, ws.max_row + 1):
+            nc_name = ws.cell(r, 5).value
+            spec = ws.cell(r, 6).value
+            sales_no_tax = ws.cell(r, 17).value
+            if not nc_name or not isinstance(sales_no_tax, (int, float)):
+                continue
+            normalized = _normalize_overseas_suffix(nc_name)
+            if not normalized or normalized in result:
+                continue
+            per_box_total = _parse_spec_to_min_unit_count(spec)
+            if not per_box_total or per_box_total <= 0:
+                continue
+            price = float(sales_no_tax) / per_box_total
+            # 单位: 规格里第一个 数字+单位 token
+            m = re.match(r'(\d+(?:\.\d+)?)\s*([^\d\s/*；,]+)', str(spec))
+            unit = m.group(2) if m else ''
+            result[normalized] = {
+                "price": price,
+                "unit": unit,
+                "source_tag": '2026进口[规格×销售无税]',
+                "raw_nc_name": nc_name,
+                "spec": spec,
+            }
+        wb.close()
+        return result
+
+
+# ───────────────────────────────────────────────────────────────
 # 适配器注册表
 # ───────────────────────────────────────────────────────────────
 
@@ -379,6 +511,8 @@ _ADAPTERS = {
     "multi_sheet": MultiSheetAdapter,
     "fallback": FallbackAdapter,
     "conditional": ConditionalAdapter,
+    "cost_price_taixi": CostPriceTaixiAdapter,
+    "cost_price_import": CostPriceImportAdapter,
 }
 
 

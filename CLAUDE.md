@@ -2,6 +2,22 @@
 
 ## 必须遵守的规则
 
+### 0. 接 adhoc 导表任务 / 客户给新事实表 → 必走 `adhoc-export` skill
+
+⚠️ 任何下面这类任务,**禁止直接动手, 必须先走 `.claude/skills/adhoc-export/SKILL.md`**:
+
+- 市场/老板说"要个表 / 临时导一份 / 帮我看看 XX 数据"
+- 客户/同事甩新 Excel/CSV(BOM / 物料价 / 商家 / 销售对账单)过来
+- "重新导一次 X 月报表"
+- 改 `resources/config.yaml` 任何 priority 栈
+- 改 `bq_reports/*.py` 报表脚本
+
+**唯一活配置 = `resources/config.yaml`**(报表脚本默认读这份)。
+新数据文件按 `resources/wallace.<日期>/` 归档,但 config 永远只改 `resources/config.yaml`,
+不要再往 `resources/wallace.*/` 里放 config.yaml。历史版本靠 git history 回溯。
+
+skill 强制 4 步审现状(查当前 config / 看 ground truth / 对照 / 确认报表类型), 跳过任一步就会踩历史踩过的坑 — 用错 config / 用错报表 / 用错事实表 / 误信 audit. 不要凭直觉.
+
 ### 1. 虚拟环境
 
 **所有 Python 脚本必须通过虚拟环境运行。**

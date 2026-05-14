@@ -94,7 +94,7 @@ sheets:
          comment: "原材料编码\nttpos_material.code，用于跟 ERPNext / 上传价格清单 对齐"}
       - {name: "消耗数量", field_index: 22, type: value, format: "0.0000", width: 12,
          comment: "单份商品消耗的原材料数量（配方单位）\nttpos_related_material.num"}
-      - {name: "物料单价", field_index: 23, type: value, format: "0.0000", width: 12,
+      - {name: "物料单价", field_index: 23, type: value, format: "0.0000", width: 12, zero_yellow: true,
          comment: "原材料单价（已折算到配方单位）\n优先级: 上传价格清单 > ERPNext Item Price > BQ 内置价"}
       - {name: "单位", field_index: 24, width: 8,
          comment: "配方单位（g / pc / 份 等）"}
@@ -112,6 +112,10 @@ sheets:
       - {name: "毛利率", field_index: 29, type: block_formula, format: "0.00%", merge: true, width: 10,
          formula: "=AD{row}/(H{row}/E{row})", negative_red: true,
          comment: "毛利率 = 单品毛利 / 平均实收单价\n相对真实成交价的毛利百分比"}
+      - {name: "BOM来源", field_index: 34, merge: true, width: 22,
+         comment: "BOM 数量/单位 选取来源 (priority 栈):\n  外挂层名 → 客户调整版命中\n  bq_native → BQ 原生 BOM\n  无 → 无 BOM 数据"}
+      - {name: "价来源", field_index: 35, merge: true, width: 24,
+         comment: "物料单价 选取来源 (priority 栈, 跟 BOM 数量解耦):\n  外挂层名 → 客户单品 sheet 命中\n  uploaded_price_list → --price-list 上传清单\n  ERPNext → ERPNext Item Price\n  bq_native → BQ ttpos_material 缺省价\n  '无 (strict)' → strict 模式且外挂层未命中\n  跨 BOM 行多源时用 ' + ' 拼接"}
 
   单品:
     merge_key_indices: [0, 1, 2, 25]
@@ -176,7 +180,7 @@ sheets:
          comment: "原材料编码 ttpos_material.code"}
       - {name: "消耗数量", field_index: 22, type: value, format: "0.0000", width: 12,
          comment: "单份商品消耗物料数量（配方单位）"}
-      - {name: "物料单价", field_index: 23, type: value, format: "0.0000", width: 12,
+      - {name: "物料单价", field_index: 23, type: value, format: "0.0000", width: 12, zero_yellow: true,
          comment: "物料单价（折算配方单位）\n优先级: 上传价格清单 > ERPNext > BQ 内置"}
       - {name: "单位", field_index: 24, width: 8,
          comment: "配方单位 (g / pc 等)"}
@@ -193,3 +197,7 @@ sheets:
       - {name: "毛利率", field_index: 29, type: block_formula, format: "0.00%", merge: true, width: 10,
          formula: "=AD{row}/(H{row}/E{row})", negative_red: true,
          comment: "毛利率 = 单品毛利 / 平均实收单价"}
+      - {name: "BOM来源", field_index: 34, merge: true, width: 22,
+         comment: "BOM 数量/单位 来源 (priority 栈):\n  外挂层名 → 客户调整版命中\n  bq_native → BQ 原生\n  无 → 无 BOM"}
+      - {name: "价来源", field_index: 35, merge: true, width: 24,
+         comment: "物料单价 来源 (priority 栈):\n  外挂层名 → 客户单品 sheet\n  uploaded_price_list / ERPNext / bq_native / 无 (strict)\n  多源用 ' + ' 拼接"}

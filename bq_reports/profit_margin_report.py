@@ -25,8 +25,25 @@ from semantic.dimensions.time import BKK_TZ  # noqa: E402
 from pathlib import Path
 
 from bq_reports.utils.bq_client import setup_proxy
+from semantic.cogs import (
+    BOM_UNIT_CORRECTIONS,
+    MaterialPriceLayerProvider as _MaterialPriceLayerProvider,
+    build_bom_resolver as _build_bom_resolver,
+    build_material_price_resolver as _build_material_price_resolver,
+    expand_item_bom,
+    find_matched_bom_key as _find_matched_bom_key,
+    match_bom_layered as _match_bom_layered,
+    match_fallback_bom as _match_fallback_bom,
+    resolve_unit_price as _resolve_unit_price_with_source,
+)
 from semantic.dimensions.time import month_to_ts_range as _month_to_ts_range
 from semantic.entities import bom, combo, price_breakdown, sale_line, takeout_line, total_line
+from semantic.resolvers import (
+    CallableProvider,
+    Resolved,
+    Resolver,
+    YamlMatchProvider,
+)
 from utils.cache import get_cache, set_cache, cache_key
 from utils.report_engine import ReportEngine, load_sheet_config
 from utils.resource_adapter import get_adapter
@@ -166,27 +183,39 @@ def _try_load_erp_prices(price_list: str = None, cache_ttl: int = 3600):
 
 
 # ============================================================================
-# 补充 BOM 加载（适配器 + 缓存）
+# 外挂 BOM 加载（支持 priority 栈 + 缓存）
+#
+# 配置形态:
+#   bom_sources:                      # 新格式: 多源 + priority
+#     - name: colleague_20260513
+#       priority: 100                 # 数字大 = 更权威, 优先命中
+#       adapter: excel
+#       path: ...
+#       sheet: ...
+#       mapping: {...}
+#     - name: customer_20260506
+#       priority: 50
+#       ...
+#   fallback_bom:                     # 老格式 (兼容): 单源, 隐式 priority=50
+#     adapter: excel
+#     ...
+#
+# BQ 原生 BOM 是隐式最低层 (priority=0); 客户给的"调整版"应放高 priority,
+# 它的 BOM 会覆盖 BQ 原生 (而不是只在 BQ 没 BOM 时兜底).
 # ============================================================================
 
-def _load_fallback_boms(config: dict = None):
-    """从配置中指定的资源加载补充 BOM 数据。支持缓存。"""
-    cfg = config or {}
-    cache_ttl = cfg.get("cache", {}).get("fallback_bom_ttl", 86400)
-    bom_config = cfg.get("fallback_bom")
-    if not bom_config:
-        return {}
-
+def _load_one_bom_source(source_cfg: dict, cache_ttl: int, label: str = "BOM Source"):
+    """加载单个 BOM 源 → {product_name: [(code, mat_name, num, uom), ...]}。"""
     # v2: 应用市场 BOM 替换/删除规则
-    key = cache_key("fallback_boms_v2", {"path": bom_config.get("path", "")})
+    key = cache_key("fallback_boms_v2", {"path": source_cfg.get("path", "")})
     cached = get_cache(key, ttl_seconds=cache_ttl)
     if cached is not None:
-        print(f"[Fallback BOM] 缓存命中: {len(cached)} 个商品")
+        print(f"[{label}] 缓存命中: {len(cached)} 个商品")
         return cached
 
     try:
-        adapter = get_adapter(bom_config["adapter"])
-        records = adapter.load(bom_config)
+        adapter = get_adapter(source_cfg["adapter"])
+        records = adapter.load(source_cfg)
 
         boms = {}
         current_product = None
@@ -223,7 +252,7 @@ def _load_fallback_boms(config: dict = None):
                     std_uom,
                 ))
 
-        # 对 fallback BOM 应用相同的替换/删除规则（统一口径）
+        # 对外挂 BOM 应用相同的替换/删除规则（统一口径）
         fb_drop = 0
         fb_replace = 0
         for product_name, recs in list(boms.items()):
@@ -234,71 +263,78 @@ def _load_fallback_boms(config: dict = None):
             fb_replace += len(old_codes & set(BOM_REPLACEMENTS.keys()))
             boms[product_name] = [(c, n, num, u) for c, n, num, u, _, _ in new_wrapped]
         if fb_drop or fb_replace:
-            print(f"[Fallback BOM] 市场规则: 替换 {fb_replace} 处, 删除 {fb_drop} 处")
+            print(f"[{label}] 市场规则: 替换 {fb_replace} 处, 删除 {fb_drop} 处")
 
         set_cache(key, boms)
-        print(f"[Fallback BOM] 加载 {len(boms)} 个商品的补充 BOM")
+        print(f"[{label}] 加载 {len(boms)} 个商品的外挂 BOM")
         return boms
 
     except Exception as e:
-        print(f"[Fallback BOM] 加载失败: {e}")
+        print(f"[{label}] 加载失败: {e}")
         return {}
 
 
-def _match_fallback_bom(item_name, fallback_boms):
-    """用 BQ 商品名匹配 fallback BOM 中的商品名。
+def _load_bom_layers(config: dict = None):
+    """加载所有外挂 BOM 源, 按 priority 降序返回。
 
-    优先级（从严到宽）：
-      1. fallback key 整字符串与 item_name 精确相等
-      2. key 的中文段（"/" 首段）与 item_name 精确相等
-      3. 中文段以 item_name 开头（如 item="鸡块"，zh="鸡块（中）"）
-      4. 中文段包含 item_name（如 item="鸡肉芝士球"，zh="周一特惠 - 鸡肉芝士球 2 盒 69"）
-      5. 长前缀模糊（item ≥5 字符，前 10 字符出现在 zh 里）
-    多个候选时取**中文段最短**的（最接近原始商品名）。
-
-    历史 bug：旧逻辑遍历 dict 直接 `item_name in key` 会优先命中长 key，
-    导致"鸡肉芝士球"被错误匹配到"周一特惠 - 鸡肉芝士球 2 盒 69"，
-    成本按 2 盒装算（虚高一倍）。
+    Returns:
+        List[(name, priority, boms_dict, match_mode)], priority 大的在前。
+        match_mode: "fuzzy" (默认, 5 层模糊匹配) | "exact" (只整 key 精确).
+        客户/市场精确列出商品名的层 (e.g. 补充 BOM) 应在 config 里标
+        match_mode: exact, 避免短名误命中长 key.
     """
-    if not item_name or not fallback_boms:
-        return None
-    name = item_name.strip()
-    if not name:
-        return None
+    cfg = config or {}
+    cache_ttl = cfg.get("cache", {}).get("fallback_bom_ttl", 86400)
 
-    # 1. 整 key 精确
-    if name in fallback_boms:
-        return fallback_boms[name]
+    # 新格式: bom_sources 列表
+    sources = cfg.get("bom_sources")
+    if not sources:
+        # 老格式兼容: 单个 fallback_bom (隐式 priority=50)
+        legacy = cfg.get("fallback_bom")
+        if not legacy:
+            return []
+        sources = [{
+            "name": legacy.get("name", "fallback_bom"),
+            "priority": legacy.get("priority", 50),
+            **{k: v for k, v in legacy.items() if k not in ("name", "priority")},
+        }]
 
-    # 预提取中文首段
-    keys_zh = [(k, k.split(" / ")[0].strip()) for k in fallback_boms]
+    layers = []
+    for src in sources:
+        # 来源名 = 显式 name > path 的 basename > "?"
+        # 强制用文件名而不是自己编的标签, 客户看 Excel 能直接定位到源文件
+        path = src.get("path", "")
+        name = src.get("name") or (os.path.basename(path) if path else "?")
+        priority = int(src.get("priority", 0))
+        match_mode = src.get("match_mode", "fuzzy")
+        boms = _load_one_bom_source(src, cache_ttl, label=f"BOM[{name}]")
+        if boms:
+            layers.append((name, priority, boms, match_mode))
+    layers.sort(key=lambda x: -x[1])
+    if layers:
+        order = " > ".join(
+            f"{n}(p={p}, {len(b)}, {m})" for n, p, b, m in layers)
+        print(f"[BOM Layers] 优先级顺序: {order}")
+    return layers
 
-    # 2. 中文段精确
-    for k, zh in keys_zh:
-        if zh == name:
-            return fallback_boms[k]
 
-    # 3. 中文段以 item_name 开头
-    starts = [(k, zh) for k, zh in keys_zh if zh.startswith(name) and zh != name]
-    if starts:
-        starts.sort(key=lambda x: len(x[1]))
-        return fallback_boms[starts[0][0]]
+# _build_bom_resolver / _match_bom_layered / _find_matched_bom_key / _match_fallback_bom
+# 现在统一由 semantic.cogs.bom_match 提供 (import 见文件顶部); 这里保留私有别名仅为
+# 兼容老 tests 的 `from bq_reports.profit_margin_report import _xxx`.
 
-    # 4. 中文段包含 item_name
-    contains = [(k, zh) for k, zh in keys_zh if name in zh]
-    if contains:
-        contains.sort(key=lambda x: len(x[1]))
-        return fallback_boms[contains[0][0]]
 
-    # 5. 长前缀模糊
-    if len(name) >= 5:
-        prefix = name[:10]
-        loose = [(k, zh) for k, zh in keys_zh if prefix in zh]
-        if loose:
-            loose.sort(key=lambda x: len(x[1]))
-            return fallback_boms[loose[0][0]]
+def _load_fallback_boms(config: dict = None):
+    """向后兼容: 把所有 BOM 层合并成扁平 dict (高优先级覆盖低优先级)。
 
-    return None
+    新代码请用 _load_bom_layers + _match_bom_layered。
+    保留此函数仅为兼容旧 tests / 旧调用点。
+    """
+    layers = _load_bom_layers(config)
+    merged = {}
+    # 从低 priority 到高 priority 依次 update, 让高的覆盖低的
+    for _name, _p, boms, _mode in reversed(layers):
+        merged.update(boms)
+    return merged
 
 
 # ============================================================================
@@ -498,12 +534,9 @@ COMBO_STRUCTURE_SQL = combo.combo_structure_sql()
 
 
 # ============================================================================
-# 价格解析
+# 价格解析 — BOM_UNIT_CORRECTIONS 真源在 semantic.cogs.material_price,
+# 这里 re-import (见文件顶部) 仅为兼容老 tests 的 `from bq_reports... import`.
 # ============================================================================
-
-BOM_UNIT_CORRECTIONS = {
-    "MK01018": 50,
-}
 
 # 市场要求的 BOM 物料替换/删除规则（套餐和单品都生效）
 # value 为 None 时保留旧 material_name；指定字符串时覆盖名称。
@@ -554,32 +587,147 @@ def _apply_bom_overrides(bom_records):
     return [(c, n, bn, bu, cr, bp) for c, (n, bn, bu, cr, bp) in merged.items()]
 
 
-def _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_prices):
-    """返回物料在基准单位下的单价。
-    优先级：1) 上传价格清单 2) ERPNext Item Price 3) BQ 缺省价
+# ============================================================================
+# 物料单价 Resolver — 真源在 semantic.cogs.material_price.
+# _MaterialPriceLayerProvider / _build_material_price_resolver /
+# _resolve_unit_price_with_source 在文件顶部以私有别名 re-import, 仅为
+# 兼容老 tests 的 `from bq_reports.profit_margin_report import _xxx`.
+# 这里只保留 _resolve_base_unit_price (旧"不带 source"接口) 的薄包装。
+# ============================================================================
+
+def _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_prices,
+                              price_layers=None, strict=False):
+    """旧接口: 只返回 price, 不带来源。新代码请用
+    semantic.cogs.material_price.resolve_unit_price。"""
+    price, _ = _resolve_unit_price_with_source(
+        material_code, bq_price, uploaded_prices, erp_prices,
+        price_layers=price_layers, strict=strict)
+    return price
+
+
+# ============================================================================
+# 物料单价层 (priority 栈, 独立于 BOM 数量栈)
+# ============================================================================
+
+def _load_material_price_layers(config: dict = None):
+    """从 config.material_price_sources 加载物料价 priority 栈, 支持双索引 (编码 + 名字).
+
+    支持 2 类 adapter:
+      - 老 'excel' adapter: 返回 records 列表, mapping 字段 material_code/unit_price
+        → 转成 by_code 单 dict 索引
+      - 新 'cost_price_taixi' / 'cost_price_import' adapter: 返回 {key: {price, unit, source_tag}}
+        → 用 source 配置的 'index_by' 决定是 by_code 还是 by_name
+          index_by = 'code'  → 按编码索引
+          index_by = 'name'  → 按归一化名字索引 (CostPriceImportAdapter 的输出已经是归一化名)
+
+    Returns: List[Layer], Layer.data 是 dict, 但里面 value 是 {price, unit, source_tag, ...} 结构 (新)
+             或 float (老兼容).
     """
-    if not material_code:
-        return float(bq_price or 0)
+    from utils.layered_resource import load_layers
 
-    # 1) 上传价格清单（最高优先级）
-    if uploaded_prices:
-        for key in (material_code, material_code.upper(), material_code.lower()):
-            if key in uploaded_prices:
-                return uploaded_prices[key]
+    cfg = config or {}
+    cache_ttl = cfg.get("cache", {}).get("material_price_ttl",
+                cfg.get("cache", {}).get("fallback_bom_ttl", 86400))
+    sources = cfg.get("material_price_sources", [])
+    if not sources:
+        return []
 
-    # 2) ERPNext Item Price
-    if erp_prices:
-        for key in (material_code, material_code.upper(), material_code.lower()):
-            if key in erp_prices:
-                price, _uom = erp_prices[key]
-                for corr_key in (material_code, material_code.upper(), material_code.lower()):
-                    if corr_key in BOM_UNIT_CORRECTIONS:
-                        price = price / BOM_UNIT_CORRECTIONS[corr_key]
-                        break
-                return price
+    def _loader(src):
+        key = cache_key("material_prices_v2", {
+            "path": src.get("path", ""), "sheet": src.get("sheet", ""),
+            "adapter": src.get("adapter", "")})
+        cached = get_cache(key, ttl_seconds=cache_ttl)
+        if cached is not None:
+            return cached
 
-    # 3) BQ 缺省价
-    return float(bq_price or 0)
+        adapter = get_adapter(src["adapter"])
+        records = adapter.load(src)
+
+        if isinstance(records, dict):
+            # 新成本价 adapter 直接返回 {key: {price, unit, source_tag, ...}}
+            out = records
+        else:
+            # 老 'excel' adapter 返回 records 列表, 转换成 {code: price} dict
+            out = {}
+            for r in records:
+                code = r.get("material_code")
+                price = r.get("unit_price")
+                if not code or price is None:
+                    continue
+                try:
+                    out[str(code).strip()] = float(price)
+                except (ValueError, TypeError):
+                    continue
+        set_cache(key, out)
+        return out
+
+    layers = load_layers(sources, _loader, label_prefix="MaterialPrice")
+
+    # 给每层标记 index_by (用于 _resolve_unit_price_with_source 选择匹配键)
+    for src, layer in zip(sources, layers):
+        layer.index_by = src.get("index_by", "code")    # 默认按编码
+    return layers
+
+
+# ============================================================================
+# Source 标注 (P2)
+#
+# 把 BOM/price 来源算好写回 agg_data, 让 validator 能消费 source 信息.
+# _build_summary_rows / _build_rows 内部仍会重新算 (报表展示用), 这里独立算
+# 一份给 validator, 保证 source 元数据进 check_rows.
+# ============================================================================
+
+def _annotate_agg_data_sources(
+    agg_data,
+    bom_layers,
+    uploaded_prices,
+    erp_prices,
+    price_layers,
+    strict_price=False,
+):
+    """对每个 (store, sku) 算 bom_source / price_source 写回 agg_data['bom_source'] /
+    agg_data['price_source']。
+
+    后续 build_rows / build_summary_rows 仍会重新算 (报表展示用，互不污染)，
+    但 check_rows 在 check() 之前能拿到 source 信息，让 SOURCE_COVERAGE
+    identity 工作。
+    """
+    bom_layers = bom_layers or []
+    # 构造一次共享 resolver, 避免 per-BOM-row 重建 (10 万行 = 重建 10 万次)
+    _price_resolver = _build_material_price_resolver(
+        uploaded_prices, erp_prices, price_layers, strict=strict_price)
+    for key, data in agg_data.items():
+        _store_num, _store_name, _item_uuid, item_name = key
+        bom_source = "bq_native" if data.get("bom") else None
+        price_sources_seen = set()
+
+        matched, layer_name = _match_bom_layered(item_name, bom_layers)
+        if matched:
+            for code, name, _bom_num, _uom in matched:
+                _, p_src = _resolve_unit_price_with_source(
+                    code, 0, uploaded_prices, erp_prices,
+                    price_layers=price_layers, strict=strict_price,
+                    material_name=name, resolver=_price_resolver,
+                )
+                price_sources_seen.add(p_src)
+            bom_source = layer_name
+        else:
+            for code, _n, _bn, _up, _u in (data.get("bom") or []):
+                _, p_src = _resolve_unit_price_with_source(
+                    code, 0, uploaded_prices, erp_prices,
+                    price_layers=price_layers, strict=strict_price,
+                    resolver=_price_resolver,
+                )
+                price_sources_seen.add(p_src)
+
+        if bom_source is None:
+            bom_source = "无"
+        price_source_str = (
+            " + ".join(sorted(price_sources_seen)) if price_sources_seen else "无"
+        )
+
+        data["bom_source"] = bom_source
+        data["price_source"] = price_source_str
 
 
 # ============================================================================
@@ -726,7 +874,8 @@ def _load_boms(engine, merchants, config: dict = None):
 # 数据聚合（新版：预聚合 orders + 预加载 BOM）
 # ============================================================================
 
-def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=None, erp_prices=None, mode="combo"):
+def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=None, erp_prices=None,
+                        mode="combo", price_layers=None, strict_price=False):
     """
     聚合订单和 BOM 数据（中间表版：保留所有原始字段，不预计算）。
 
@@ -816,54 +965,54 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         if val["qty"] > 0:
             val["avg_member_discount"] = val["avg_member_discount"] / val["qty"]
 
-    # 为每个 item 匹配 BOM
-    for key, val in data.items():
-        store_num, store_name, item_uuid, item_name = key
-        store_boms = bom_data.get(store_num, {})
+    # 为每个 item 匹配 BOM — 委托给 semantic.cogs.expand_item_bom.
+    # 4 层 priority 栈构造一次, 全店共享 (避免 per-row 重建).
+    # bq_price 是 per-BOM-row 的兜底, 不进 Resolver, 由 price_fn 闭包从 row 上读。
+    _price_resolver = _build_material_price_resolver(
+        uploaded_prices, erp_prices, price_layers, strict=strict_price,
+    )
 
+    def _make_price_fn(rows):
+        bq_price_by_code = {}
+        for r in rows:
+            mc = r[0]
+            if mc:
+                # 同物料多行: 后值覆盖前值, 跟旧 per-row 实现里"最后一次写"对齐.
+                bq_price_by_code[mc] = r[5]  # (code, name, num, unit, conv, bq_price)
+
+        def fn(material_code, material_name):
+            r = _price_resolver.resolve((material_code, material_name))
+            if r is not None:
+                return r.value
+            if strict_price:
+                return 0.0
+            return float(bq_price_by_code.get(material_code) or 0)
+        return fn
+
+    for key, val in data.items():
+        store_num, _store_name, item_uuid, _item_name = key
+        store_boms = bom_data.get(store_num, {})
+        store_struct = combo_structure.get(store_num, {})
+
+        # 收集"本商品会用到的 BOM 行"以便构造 per-row bq_price fallback
         if mode == "combo":
-            # 套餐：合并所有子产品的 BOM，按 (子商品份数 × 选项权重) 加权。
-            # combo_structure v2 元素 = (child_uuid, child_num, weight)
-            # 旧 shape (纯 str 列表) 也兼容: 视为 num=1, weight=1
-            store_struct = combo_structure.get(store_num, {})
-            child_specs = store_struct.get(item_uuid, [])
-            for spec in child_specs:
-                # JSON cache 把 tuple 序列化为 list，所以两种都得识别
+            relevant_rows = []
+            for spec in store_struct.get(item_uuid, []):
                 if isinstance(spec, (tuple, list)) and len(spec) == 3:
-                    child_uuid, child_num, weight = spec
+                    cu = spec[0]
                 else:
-                    # 旧 shape 兼容: 纯字符串 child_uuid (synthetic 测试用)
-                    child_uuid, child_num, weight = spec, 1.0, 1.0
-                # 一个 child 在套餐里出的 BOM 量 = bom_num × child_num × weight
-                child_mult = float(child_num) * float(weight)
-                child_bom = store_boms.get(child_uuid, [])
-                for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in child_bom:
-                    if not material_code:
-                        continue
-                    base_price = _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_prices)
-                    unit_price = base_price * (conv_rate or 1)
-                    weighted_bom_num = bom_num * child_mult
-                    if material_code in val["bom"]:
-                        prev_name, prev_num, prev_up, prev_unit = val["bom"][material_code]
-                        val["bom"][material_code] = (
-                            prev_name or material_name,
-                            prev_num + weighted_bom_num,
-                            unit_price,                  # 同物料同单位价不变
-                            prev_unit or bom_unit,
-                        )
-                    else:
-                        val["bom"][material_code] = (material_name, weighted_bom_num, unit_price, bom_unit)
+                    cu = spec
+                relevant_rows.extend(store_boms.get(cu, []))
         else:
-            # 单品：直接匹配 BOM。同一商品多个 product_bom（不同 flavor/sauce 但共用 bom_card）
-            # 会重复返回相同 material_code，按 dedup 处理（避免 N 倍虚增）。
-            item_bom = store_boms.get(item_uuid, [])
-            for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in item_bom:
-                if not material_code:
-                    continue
-                if material_code not in val["bom"]:
-                    base_price = _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_prices)
-                    unit_price = base_price * (conv_rate or 1)
-                    val["bom"][material_code] = (material_name, bom_num, unit_price, bom_unit)
+            relevant_rows = store_boms.get(item_uuid, [])
+
+        val["bom"] = expand_item_bom(
+            item_uuid=item_uuid,
+            mode=mode,
+            store_boms=store_boms,
+            store_combo_struct=store_struct,
+            price_resolver=_make_price_fn(relevant_rows),
+        )
 
     # 转换为列表格式（保留所有原始字段，利润指标由 Excel 公式计算）
     result = {}
@@ -907,7 +1056,29 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
 # 扁平化行构建
 # ============================================================================
 
-def _build_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None, erp_prices=None):
+def _build_rows(agg_data, mode, bom_layers=None, uploaded_prices=None, erp_prices=None,
+                fallback_boms=None, price_layers=None, strict_price=False,
+                strict_bom=False):
+    """中间表行构建。
+
+    BOM 选取顺序（priority 栈）:
+        1. bom_layers 按 priority 从高到低逐层匹配，命中即 override BQ 原生 BOM
+        2. 都没命中 → 用 BQ 原生 (data["bom"])
+        3. BQ 也无 → 空行 (BOM 列填 "-")
+
+    strict_bom=True 时禁用第 2 步: bom_layers 没命中直接标 BOM来源="无",
+    抛弃 BQ 原生 BOM. 跟 strict_price 对称, 用于"BOM 只走客户事实表"场景.
+
+    单价选取 (独立 priority 栈, 跟 BOM 数量解耦):
+        price_layers → uploaded → ERPNext → bq_price
+        strict_price=True 时只走 price_layers, 缺失 → 0 (审计列标 "无")
+
+    `fallback_boms` 是老接口的兼容参数 (扁平 dict)，仅当未传 bom_layers 时使用。
+    """
+    # 老接口兼容: 把 fallback_boms 包成单层
+    if bom_layers is None and fallback_boms:
+        bom_layers = [("fallback_bom", 50, fallback_boms)]
+    bom_layers = bom_layers or []
     """
     中间表：只输出原始数据，所有计算交给 Excel。
     列结构（26列）:
@@ -917,6 +1088,9 @@ def _build_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None, erp_pr
       20-24: BOM物品名称、BOM物品编码、消耗数量、物料单价、单位
       25:    商品UUID(隐藏)
     """
+    # 构造一次共享 resolver, 避免 per-BOM-row 重建
+    _price_resolver = _build_material_price_resolver(
+        uploaded_prices, erp_prices, price_layers, strict=strict_price)
     rows = []
     for (store_num, store_name, item_uuid, item_name), data in sorted(agg_data.items()):
         qty = data["qty"]
@@ -939,21 +1113,48 @@ def _build_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None, erp_pr
         qty_3 = data.get("qty_3")
         other_price_qty = data.get("other_price_qty")
         bom_list = data["bom"]
+        if strict_bom:
+            # 抛弃 BQ 原生 BOM, 等下要么命中 bom_layers, 要么标"无"
+            bom_list = []
+            bom_source = None
+        else:
+            bom_source = "bq_native" if bom_list else None
+        price_sources_seen = set()   # 该 SKU 用到的所有单价来源 (审计)
 
-        # Fallback BOM 补充
-        if not bom_list and fallback_boms:
-            matched = _match_fallback_bom(item_name, fallback_boms)
-            if matched:
-                bom_list = []
-                for code, name, bom_num, uom in matched:
-                    unit_price = _resolve_base_unit_price(code, 0, uploaded_prices, erp_prices)
-                    bom_list.append((code, name, bom_num, unit_price, uom or "-"))
-                print(f"  [Fallback] {item_name}: 补充 {len(bom_list)} 个物料")
+        # 外挂 BOM override (priority 栈, 高 priority 优先, 覆盖 BQ 原生)
+        matched, layer_name = _match_bom_layered(item_name, bom_layers)
+        if matched:
+            bom_list = []
+            for code, name, bom_num, uom in matched:
+                unit_price, p_src = _resolve_unit_price_with_source(
+                    code, 0, uploaded_prices, erp_prices,
+                    price_layers=price_layers, strict=strict_price,
+                    material_name=name, resolver=_price_resolver)
+                price_sources_seen.add(p_src)
+                bom_list.append((code, name, bom_num, unit_price, uom or "-"))
+            bom_source = layer_name
+        elif not strict_bom:
+            # BQ 原生 BOM 路径 — 单价已在 aggregate_with_bom 时按 price_layers 解析过
+            for code, name, _bn, _up, _u in (data["bom"] or []):
+                _, p_src = _resolve_unit_price_with_source(
+                    code, 0, uploaded_prices, erp_prices,
+                    price_layers=price_layers, strict=strict_price,
+                    material_name=name, resolver=_price_resolver)
+                price_sources_seen.add(p_src)
+        if bom_source is None:
+            bom_source = "无"
+
+        # 价来源汇总字符串 (跨 BOM 行去重, 多个用 " + ")
+        if price_sources_seen:
+            price_source_str = " + ".join(sorted(price_sources_seen))
+        else:
+            price_source_str = "无"
 
         # row 末尾扩展槽位（field_index 26-29 = utility 公式列；30-31 = 标价应收/异常损失公式列；
-        # 32 = 取消数量、33 = 取消金额）。utility 列由引擎写公式，row 内填 None 占位即可。
+        # 32 = 取消数量、33 = 取消金额、34 = BOM 来源；35 = 物料价来源）。
         tail = [None, None, None, None, None, None,
-                round(cancelled_qty, 2), round(cancelled_amount, 2)]
+                round(cancelled_qty, 2), round(cancelled_amount, 2),
+                bom_source, price_source_str]
 
         if not bom_list:
             rows.append([
@@ -985,7 +1186,18 @@ def _build_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None, erp_pr
     return rows
 
 
-def _build_summary_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None, erp_prices=None):
+def _build_summary_rows(agg_data, mode, bom_layers=None, uploaded_prices=None, erp_prices=None,
+                        fallback_boms=None, price_layers=None, strict_price=False,
+                        strict_bom=False):
+    """SKU 汇总视角 — BOM 选取顺序跟 _build_rows 一致 (priority 栈 override).
+
+    strict_bom=True 时禁用 BQ 原生 BOM 兜底, 跟 _build_rows 对称.
+
+    `fallback_boms` 仅老接口兼容。
+    """
+    if bom_layers is None and fallback_boms:
+        bom_layers = [("fallback_bom", 50, fallback_boms)]
+    bom_layers = bom_layers or []
     """SKU 汇总视角：一个 (店, SKU) 一行，提前算好 总成本/总利润/利润率。
 
     跟 `_build_rows` 共享 agg_data 输入，但 flatten 方式不同：
@@ -998,6 +1210,9 @@ def _build_summary_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None
                        sales_price, revenue, per_unit_cost, total_cost,
                        total_profit, margin, item_uuid]
     """
+    # 构造一次共享 resolver, 避免 per-BOM-row 重建
+    _price_resolver = _build_material_price_resolver(
+        uploaded_prices, erp_prices, price_layers, strict=strict_price)
     rows = []
     for (store_num, store_name, item_uuid, item_name), data in sorted(agg_data.items()):
         qty = data["qty"]
@@ -1005,15 +1220,35 @@ def _build_summary_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None
         sales_price = data["sales_price"]
         revenue = data["revenue"]
         bom_list = data["bom"]
+        if strict_bom:
+            bom_list = []
+            bom_source = None
+        else:
+            bom_source = "bq_native" if bom_list else None
+        price_sources_seen = set()
 
-        # Fallback BOM 补全（口径跟 _build_rows 一致）
-        if not bom_list and fallback_boms:
-            matched = _match_fallback_bom(item_name, fallback_boms)
-            if matched:
-                bom_list = []
-                for code, name, bom_num, uom in matched:
-                    unit_price = _resolve_base_unit_price(code, 0, uploaded_prices, erp_prices)
-                    bom_list.append((code, name, bom_num, unit_price, uom or "-"))
+        # 外挂 BOM override (口径跟 _build_rows 一致, 高 priority 覆盖 BQ)
+        matched, layer_name = _match_bom_layered(item_name, bom_layers)
+        if matched:
+            bom_list = []
+            for code, name, bom_num, uom in matched:
+                unit_price, p_src = _resolve_unit_price_with_source(
+                    code, 0, uploaded_prices, erp_prices,
+                    price_layers=price_layers, strict=strict_price,
+                    material_name=name, resolver=_price_resolver)
+                price_sources_seen.add(p_src)
+                bom_list.append((code, name, bom_num, unit_price, uom or "-"))
+            bom_source = layer_name
+        elif not strict_bom:
+            for code, name, _bn, _up, _u in (data["bom"] or []):
+                _, p_src = _resolve_unit_price_with_source(
+                    code, 0, uploaded_prices, erp_prices,
+                    price_layers=price_layers, strict=strict_price,
+                    material_name=name, resolver=_price_resolver)
+                price_sources_seen.add(p_src)
+        if bom_source is None:
+            bom_source = "无"
+        price_source_str = " + ".join(sorted(price_sources_seen)) if price_sources_seen else "无"
 
         # 单份总成本 = Σ (BOM 消耗 × 物料单价)
         per_unit_cost = sum(bom_num * unit_price
@@ -1035,6 +1270,8 @@ def _build_summary_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None
             round(total_profit, 2),
             round(margin, 4),
             str(item_uuid),
+            bom_source,           # field_index 12
+            price_source_str,     # field_index 13
         ])
     return rows
 
@@ -1043,16 +1280,44 @@ def _build_summary_rows(agg_data, mode, fallback_boms=None, uploaded_prices=None
 # 资源配置加载
 # ============================================================================
 
+# 唯一活配置. 统一前散落在 resources/wallace.<日期>/config.yaml (导致每次跑
+# 报表都可能用错版本); 统一后只有这一份, 新数据文件仍按 resources/wallace.<日期>/
+# 归档, 但 config 只改 resources/config.yaml.
+_DEFAULT_CONFIG_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "resources", "config.yaml")
+
+
+def _resolve_latest_config() -> str | None:
+    """兜底: resources/config.yaml 不存在时, 找 resources/wallace.*/config.yaml
+    最新一份 (统一前的旧布局). 正常流程不会走到这里.
+    """
+    import glob
+    pattern = os.path.join(os.path.dirname(__file__), "..",
+                            "resources", "wallace.*", "config.yaml")
+    matches = sorted(glob.glob(pattern))
+    return matches[-1] if matches else None
+
+
 def load_config(config_path: str = None) -> dict:
-    """加载资源配置 YAML。"""
+    """加载资源配置 YAML.
+
+    --config 没传时, 默认读 resources/config.yaml (唯一活配置).
+    该文件不存在时兜底找 resources/wallace.*/config.yaml 最新一份 (旧布局).
+    stdout 打印实际用的哪个 — AI / 人审计一目了然.
+    """
     import yaml
-    path = config_path or os.path.join(
-        os.path.dirname(__file__), "..",
-        "resources", "wallace.20260422", "config.yaml"
-    )
-    if not os.path.exists(path):
+    if config_path is None:
+        if os.path.exists(_DEFAULT_CONFIG_PATH):
+            config_path = _DEFAULT_CONFIG_PATH
+        else:
+            config_path = _resolve_latest_config()
+            if config_path:
+                print(f"[Config] resources/config.yaml 不存在, 兜底取旧布局: "
+                      f"{os.path.relpath(config_path)}")
+    if not config_path or not os.path.exists(config_path):
         return {}
-    with open(path, "r", encoding="utf-8") as f:
+    print(f"[Config] 加载: {os.path.relpath(config_path)}")
+    with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
@@ -1075,6 +1340,17 @@ def main():
     parser.add_argument("--config", default=None, help="资源配置 YAML 路径")
     parser.add_argument("--column-config", default="resources/reports/profit_margin.yaml", help="列配置 YAML 路径")
     parser.add_argument("--price-list", default=None, help="上传的物料价格清单 Excel 路径（最高优先级）")
+    # 单价默认 strict: 只走 material_price_sources (客户成本表),
+    # 缺失 → 0 + 来源标 '无 (strict)' + 报表里那行物料标黄.
+    # --allow-erp-fallback 反向开关 (应急): 允许 fallback ERPNext.
+    parser.add_argument("--allow-erp-fallback", action="store_true",
+                        help="允许 fallback ERPNext (默认禁用)。默认: 单价只走 material_price_sources, "
+                             "缺失即留空, 报表里那行物料标黄.")
+    # BOM 默认 strict: 只走 bom_sources (客户事实表), 缺失 → BOM来源="无".
+    # --allow-bq-native-bom 反向开关 (应急): 允许 fallback BQ 内置 product_bom.
+    parser.add_argument("--allow-bq-native-bom", action="store_true",
+                        help="允许 fallback BQ 内置 BOM (默认禁用)。默认: BOM 只走 bom_sources, "
+                             "缺失即标 BOM来源='无', 成本列空.")
     parser.add_argument("--summary", action="store_true",
                         help="汇总视角：每 SKU 一行（不展开 BOM 物料），默认输出 sku_profit_summary.yaml 格式")
     parser.add_argument("--no-cache", action="store_true", help="禁用缓存")
@@ -1101,8 +1377,14 @@ def main():
         print("[错误] 必须指定 --month 或 --start-date + --end-date")
         return 1
 
-    # 自动推导输出路径
-    output_path = args.output or f"exports/profit_{range_label}.xlsx"
+    # 自动推导输出路径; 不传 --output 时每次升版 _v{N}, 跟 profit_by_price 一致
+    if args.output:
+        output_path = args.output
+    else:
+        from bq_reports.profit_by_price_report import _next_version_path
+        base_dir = Path("exports")
+        base_dir.mkdir(parents=True, exist_ok=True)
+        output_path = str(_next_version_path(base_dir, f"profit_{range_label}"))
 
     # 初始化引擎
     engine = ReportEngine(project_id=args.project)
@@ -1138,8 +1420,24 @@ def main():
     print(f"门店数: {len(merchants)}")
     print()
 
-    # 加载补充 BOM
-    fallback_boms = _load_fallback_boms(config)
+    # 加载外挂 BOM 层 (按 priority 从高到低)
+    bom_layers = _load_bom_layers(config)
+
+    # 加载物料单价层 (独立 priority 栈, 跟 BOM 数量解耦)
+    price_layers = _load_material_price_layers(config)
+    strict_price = not bool(args.allow_erp_fallback)   # 默认 strict
+    if strict_price:
+        print(f"[Strict Price] 默认严格模式: 物料单价只走外挂成本表, 缺失 → 0 (不 fallback ERP)")
+        print(f"               想恢复 ERP fallback 用 --allow-erp-fallback\n")
+    else:
+        print(f"[ERP Fallback] 允许 fallback ERPNext\n")
+
+    strict_bom = not bool(args.allow_bq_native_bom)   # 默认 strict
+    if strict_bom:
+        print(f"[Strict BOM] 默认严格模式: BOM 只走 bom_sources, 缺失 → 来源='无' (不 fallback BQ 内置)")
+        print(f"             想恢复 BQ 内置 BOM 用 --allow-bq-native-bom\n")
+    else:
+        print(f"[BQ Native BOM Fallback] 允许 fallback BQ 内置 product_bom\n")
 
     # 预加载套餐结构（如果 mode 包含 combo）
     combo_structure = {}
@@ -1187,20 +1485,24 @@ def main():
         # 聚合（订单 + BOM）
         agg_data = aggregate_with_bom(
             raw_rows, bom_data, combo_structure,
-            uploaded_prices=uploaded_prices, erp_prices=erp_prices, mode=mode
+            uploaded_prices=uploaded_prices, erp_prices=erp_prices, mode=mode,
+            price_layers=price_layers, strict_price=strict_price,
+        )
+
+        # P2: 把 bom_source / price_source 写回 agg_data, 让后续 validator 用
+        _annotate_agg_data_sources(
+            agg_data, bom_layers, uploaded_prices, erp_prices,
+            price_layers, strict_price=strict_price,
         )
 
         # 扁平化（汇总视角 or BOM 展开视角）
+        common = dict(uploaded_prices=uploaded_prices, erp_prices=erp_prices,
+                      bom_layers=bom_layers, price_layers=price_layers,
+                      strict_price=strict_price, strict_bom=strict_bom)
         if args.summary:
-            flat_rows = _build_summary_rows(
-                agg_data, mode, fallback_boms=fallback_boms,
-                uploaded_prices=uploaded_prices, erp_prices=erp_prices,
-            )
+            flat_rows = _build_summary_rows(agg_data, mode, **common)
         else:
-            flat_rows = _build_rows(
-                agg_data, mode, fallback_boms=fallback_boms,
-                uploaded_prices=uploaded_prices, erp_prices=erp_prices,
-            )
+            flat_rows = _build_rows(agg_data, mode, **common)
 
         # 加载列配置并写入 Excel
         sheet_cfg = engine.load_sheet_config(args.column_config, item_label)
@@ -1210,10 +1512,10 @@ def main():
         if not args.summary:
             print(f"[{item_label}] 此为中间表，利润指标请自行在 Excel 中定义")
 
-        # 校验恒等式 — 中间表也跑，作为对账锚必须自校
-        # agg_data 在两种 build 模式下字段一致，校验器对 grain 不敏感
+        # 校验恒等式 + 来源完整性 + 业务合理性 (P2 FULL_IDENTITIES 一次跑完)
+        # agg_data 已带 bom_source / price_source (P2 annotation)
         from semantic.validators import check, print_result
-        from semantic.validators.identities import DEFAULT_IDENTITIES
+        from semantic.validators.identities import FULL_IDENTITIES
 
         check_rows = [
             {
@@ -1224,14 +1526,15 @@ def main():
             for (store_num, _store_name, _uuid, item_name), data
             in agg_data.items()
         ]
-        print(f"\n[{item_label}] 校验恒等式 …")
-        result = check(check_rows, DEFAULT_IDENTITIES)
+        print(f"\n[{item_label}] 校验恒等式 + 来源 + sanity …")
+        result = check(check_rows, FULL_IDENTITIES)
         print_result(result, row_label=lambda r: f"店 {r['store_num']:>3}  {r['item_name']:<30}")
         if result.has_must_fix:
             print(f"⚠️  [{item_label}] 有 🔴 离谱违反，请核实数据/口径。\n")
 
     wb.close()
     print(f"\n输出文件: {output_path}")
+    # NOTE: 物料单价为空标黄的后处理已禁用 (openpyxl 重开慢, 见 profit_by_price_report 注释)
     return 0
 
 

@@ -74,6 +74,7 @@ class ColumnConfig:
     formula_template: str = ""          # 公式模板，支持 {row} {block_start} {block_end} {col}
     negative_red: bool = False          # 负值标红（基于预计算值）
     positive_red: bool = False          # 正值标红（用于"异常损失"等"非零即异常"列；通过条件格式）
+    zero_yellow: bool = False           # 0 值标黄（用于"应有值却缺失"列，如 strict 模式下物料单价=0）
     comment: str = ""                   # 表头悬停备注（字段语义 / 取数说明）
 
 
@@ -430,6 +431,15 @@ def write_configured_sheet(workbook, sheet_name: str, sheet_config: SheetConfig,
             "type": "cell", "criteria": ">", "value": 0, "format": red_fmt,
         })
 
+    # 6b. 条件格式：zero_yellow 列 <= 0 时整格标黄（"应有值却缺失"，如物料单价=0）
+    yellow_fmt = workbook.add_format({"bg_color": "#FFEB9C", "font_color": "#9C6500"})
+    for col_idx, col_cfg in enumerate(columns):
+        if not col_cfg.zero_yellow:
+            continue
+        ws.conditional_format(1, col_idx, last_data_row, col_idx, {
+            "type": "cell", "criteria": "<=", "value": 0, "format": yellow_fmt,
+        })
+
     # 7. 冻结首行
     if sheet_config.freeze_panes:
         # freeze_panes 的字符串 'A2' 转 (row=1, col=0)
@@ -459,6 +469,7 @@ def load_sheet_config(yaml_path: str, sheet_name: str) -> SheetConfig:
             formula_template=c.get("formula", ""),
             negative_red=c.get("negative_red", False),
             positive_red=c.get("positive_red", False),
+            zero_yellow=c.get("zero_yellow", False),
             comment=c.get("comment", ""),
         ))
 

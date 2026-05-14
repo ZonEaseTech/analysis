@@ -147,6 +147,16 @@ def print_result(
 def _print_violations(viols: list[Violation], row_label: Callable[[dict], str]) -> None:
     for v in viols:
         rel = (abs(v.delta) / abs(v.lhs) * 100) if v.lhs else 0
-        print(f"    {row_label(v.row):<40}  "
-              f"LHS {v.lhs:>10,.2f}  RHS {v.rhs:>10,.2f}  "
-              f"delta {v.delta:>+10,.2f} ({rel:>5.1f}%)")
+        line = (f"    {row_label(v.row):<40}  "
+                f"LHS {v.lhs:>10,.2f}  RHS {v.rhs:>10,.2f}  "
+                f"delta {v.delta:>+10,.2f} ({rel:>5.1f}%)")
+        # P2: 附加 source 元数据 (如果 row 有 bom_source / price_source).
+        # 让 console 直接显示"差额来自哪份数据源", 不用再去 Excel 翻审计列.
+        srcs = []
+        if "bom_source" in v.row:
+            srcs.append(f"bom={v.row['bom_source']}")
+        if "price_source" in v.row:
+            srcs.append(f"price={v.row['price_source']}")
+        if srcs:
+            line += "  [" + " | ".join(srcs) + "]"
+        print(line)

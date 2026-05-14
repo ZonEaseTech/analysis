@@ -127,8 +127,8 @@ class BuildRowsShapeTests(unittest.TestCase):
         )
         # 1 SKU × 2 BOM = 2 行 (不是 2 价 × 2 BOM = 4)
         self.assertEqual(len(rows), 2)
-        # 38 列 (37 visible + 1 hidden)
-        self.assertEqual(len(rows[0]), 38)
+        # 40 列 (37 visible + 1 hidden + 2 audit: BOM 来源, 价来源)
+        self.assertEqual(len(rows[0]), 40)
 
     def test_row_columns_match_yaml_layout(self):
         fine = aggregate_by_grain(self.events, FINE_GRAIN_KEYS, METRIC_KEYS)

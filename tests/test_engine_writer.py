@@ -171,5 +171,71 @@ class SingleRowBlockTest(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class ZeroYellowTest(unittest.TestCase):
+    """zero_yellow — 列值 <= 0 时整格标黄 (条件格式).
+
+    用于"应有值却缺失"列, 如 strict_price 模式下物料单价=0.
+    commit f6f2730 引入. 跟 positive_red / negative_red 一套机制.
+    """
+
+    def _cfg(self):
+        return SheetConfig(
+            name="测试",
+            columns=[
+                ColumnConfig(name="商品", field_index=0),
+                ColumnConfig(name="物料单价", field_index=1, col_type="value",
+                             format_str="0.0000", zero_yellow=True),
+            ],
+            merge_key_indices=[],
+        )
+
+    def _write(self, rows):
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "out.xlsx")
+        wb = xlsxwriter.Workbook(path)
+        write_configured_sheet(wb, "测试", self._cfg(), rows)
+        wb.close()
+        return path, tmpdir
+
+    def test_zero_yellow_registers_le_conditional_format(self):
+        # 3 行: 单价 5.0 / 0 / 2.0 — 列 B
+        rows = [["A", 5.0], ["B", 0], ["C", 2.0]]
+        path, tmpdir = self._write(rows)
+        try:
+            ws = load_workbook(path)["测试"]
+            found = []
+            for cf in ws.conditional_formatting:
+                if "B2:B" in str(cf.sqref):
+                    for rule in cf.rules:
+                        found.append((rule.type, rule.operator))
+            self.assertTrue(
+                any(op == "lessThanOrEqual" for _, op in found),
+                f"zero_yellow 未注册 <= 条件格式; got {found}",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_no_zero_yellow_no_conditional_format(self):
+        # zero_yellow=False 的列不应有条件格式
+        cfg = SheetConfig(
+            name="测试",
+            columns=[ColumnConfig(name="物料单价", field_index=0,
+                                  col_type="value")],
+            merge_key_indices=[],
+        )
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "out.xlsx")
+        wb = xlsxwriter.Workbook(path)
+        write_configured_sheet(wb, "测试", cfg, [[5.0], [0]])
+        wb.close()
+        try:
+            ws = load_workbook(path)["测试"]
+            self.assertEqual(list(ws.conditional_formatting), [])
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

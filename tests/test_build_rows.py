@@ -39,7 +39,7 @@ def make_agg(bom=None, **fields):
 class ColumnContractTests(unittest.TestCase):
     """Position-by-position assertions — these mirror the YAML field_index map."""
 
-    EXPECTED_LEN = 26 + 8  # base layout + 8-slot tail
+    EXPECTED_LEN = 26 + 10  # base layout + 10-slot tail (含 34=bom_source, 35=price_source)
 
     def test_row_length_with_bom(self):
         agg = make_agg(bom=[("M1", "盐", 1.0, 0.5, "g")])

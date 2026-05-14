@@ -109,7 +109,7 @@ sheets:
          comment: "原材料编码 (ttpos_material.code)，对齐 ERPNext/上传价格清单"}
       - {name: "消耗数量",    field_index: 30, type: value, format: "0.0000", width: 10,
          comment: "单份商品消耗的原材料数量"}
-      - {name: "物料单价",    field_index: 31, type: value, format: "0.0000", width: 10,
+      - {name: "物料单价",    field_index: 31, type: value, format: "0.0000", width: 10, zero_yellow: true,
          comment: "原材料单价（配方单位）；优先级: 上传清单 > ERPNext > BQ"}
       - {name: "单位",        field_index: 32, width: 6,
          comment: "配方计量单位（g / pc / 份 等）"}
@@ -127,6 +127,10 @@ sheets:
       - {name: "净利润率",   field_index: 36, type: block_formula, format: "0.00%", merge: true, width: 10, negative_red: true,
          formula: "=IF(OR(H{block_start}=0,AH{block_start}=0),\"\",AJ{block_start}/H{block_start})",
          comment: "= 总毛利 / 实收；全套净口径"}
+      - {name: "BOM来源",   field_index: 38, merge: true, width: 22,
+         comment: "BOM 数量/单位 来源 (priority 栈)\n  外挂层名/bq_native/无"}
+      - {name: "价来源",     field_index: 39, merge: true, width: 24,
+         comment: "物料单价 来源 (priority 栈, 跟 BOM 数量解耦)\n  外挂层名 / uploaded_price_list / ERPNext / bq_native / 无 (strict)\n  多源用 ' + ' 拼接"}
 
   单品:
     merge_key_indices: [0, 1, 2, 37]
@@ -186,7 +190,7 @@ sheets:
          comment: "原材料编码 (ttpos_material.code)，对齐 ERPNext/上传价格清单"}
       - {name: "消耗数量",    field_index: 30, type: value, format: "0.0000", width: 10,
          comment: "单份商品消耗的原材料数量"}
-      - {name: "物料单价",    field_index: 31, type: value, format: "0.0000", width: 10,
+      - {name: "物料单价",    field_index: 31, type: value, format: "0.0000", width: 10, zero_yellow: true,
          comment: "原材料单价（配方单位）；优先级: 上传清单 > ERPNext > BQ"}
       - {name: "单位",        field_index: 32, width: 6,
          comment: "配方计量单位（g / pc / 份 等）"}
@@ -202,3 +206,7 @@ sheets:
       - {name: "净利润率",   field_index: 36, type: block_formula, format: "0.00%", merge: true, width: 10, negative_red: true,
          formula: "=IF(OR(H{block_start}=0,AH{block_start}=0),\"\",AJ{block_start}/H{block_start})",
          comment: "= 总毛利 / 实收"}
+      - {name: "BOM来源",   field_index: 38, merge: true, width: 22,
+         comment: "BOM 数量/单位 来源 (priority 栈)"}
+      - {name: "价来源",     field_index: 39, merge: true, width: 24,
+         comment: "物料单价 来源 (priority 栈, 跟 BOM 数量解耦)"}

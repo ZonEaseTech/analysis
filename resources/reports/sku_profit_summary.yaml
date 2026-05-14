@@ -17,6 +17,8 @@
 #   9  总利润 = 实收 - 总成本
 #  10  利润率 = 总利润 / 实收
 #  11  item_uuid (hidden merge key)
+#  12  BOM 来源（数量/单位维度）
+#  13  价来源（物料单价维度, 跟 BOM 数量解耦）
 
 sheets:
   套餐:
@@ -45,6 +47,10 @@ sheets:
          comment: "= 实收金额 − 总成本"}
       - {name: "利润率",     field_index: 10, type: value, format: "0.00%", width: 10, negative_red: true,
          comment: "= 总利润 / 实收金额"}
+      - {name: "BOM来源",   field_index: 12, width: 22,
+         comment: "BOM 数量/单位 来源 (priority 栈)"}
+      - {name: "价来源",     field_index: 13, width: 24,
+         comment: "物料单价 来源 (priority 栈, 跟 BOM 数量解耦)"}
 
   单品:
     merge_key_indices: []
@@ -62,3 +68,7 @@ sheets:
       - {name: "总成本",     field_index: 8,  type: value, format: "0.00", width: 12}
       - {name: "总利润",     field_index: 9,  type: value, format: "0.00", width: 12, negative_red: true}
       - {name: "利润率",     field_index: 10, type: value, format: "0.00%", width: 10, negative_red: true}
+      - {name: "BOM来源",   field_index: 12, width: 22,
+         comment: "BOM 数量/单位 来源 (priority 栈)"}
+      - {name: "价来源",     field_index: 13, width: 24,
+         comment: "物料单价 来源 (priority 栈, 跟 BOM 数量解耦)"}

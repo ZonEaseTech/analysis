@@ -23,19 +23,25 @@ import argparse
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import xlsxwriter
 
 from bq_reports.profit_margin_report import (
+    _load_bom_layers,
     _load_combo_structures,
     _load_boms,
-    _load_fallback_boms,
+    _load_fallback_boms,  # 兼容: 兜底导出, 单文件场景仍可用
+    _load_material_price_layers,
+    _build_material_price_resolver,
     _load_merchants,
     _load_store_names,
     _load_uploaded_prices,
+    _match_bom_layered,
     _match_fallback_bom,
     _resolve_base_unit_price,
+    _resolve_unit_price_with_source,
     _try_load_erp_prices,
     load_config,
 )
@@ -44,7 +50,7 @@ from semantic.aggregations.by_grain import aggregate_by_grain
 from semantic.dimensions.time import month_to_ts_range
 from semantic.entities import sale_event
 from semantic.validators import check, print_result
-from semantic.validators.identities import DEFAULT_IDENTITIES
+from semantic.validators.identities import FULL_IDENTITIES
 from utils.report_engine import ReportEngine, load_sheet_config
 
 
@@ -131,7 +137,9 @@ def _rollup_per_sku(fine_grouped: dict) -> dict:
 
 
 def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
-                         fallback_boms=None, uploaded_prices=None, erp_prices=None):
+                         bom_layers=None, uploaded_prices=None, erp_prices=None,
+                         fallback_boms=None, price_layers=None, strict_price=False,
+                         strict_bom=False):
     """Per-SKU + 横向价格档 + BOM 物料展开。
 
     输入: fine-grain (店, SKU, price) 聚合。
@@ -139,6 +147,14 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
 
     列结构 (37 visible + 1 hidden) 见 resources/reports/profit_by_price.yaml。
     """
+    if bom_layers is None and fallback_boms:
+        bom_layers = [("fallback_bom", 50, fallback_boms)]
+    bom_layers = bom_layers or []
+
+    # 构造一次共享 price resolver, 避免 per-SKU/per-BOM-row 重建
+    _price_resolver = _build_material_price_resolver(
+        uploaded_prices, erp_prices, price_layers, strict=strict_price)
+
     by_sku = _rollup_per_sku(grouped)
     rows = []
 
@@ -189,20 +205,24 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             round(data["cancelled_qty"], 2),        # 26 取消数量       AA
             round(data["cancelled_amount"], 2),     # 27 取消金额       AB
         ]
-        # 利润 4 件套 + hidden uuid （suffix）
+        bom_list, bom_source, price_source = _bom_for_item(
+            store_num, item_uuid_str, item_name,
+            bom_data, combo_structure, mode,
+            bom_layers, uploaded_prices, erp_prices,
+            price_layers=price_layers, strict_price=strict_price,
+            strict_bom=strict_bom, price_resolver=_price_resolver,
+        )
+
+        # 利润 4 件套 + hidden uuid + 双审计列（suffix）
         suffix = [
             None,                                   # 33 单份总成本    AH  (SUMPRODUCT)
             None,                                   # 34 单品毛利      AI  (formula)
             None,                                   # 35 总毛利        AJ  (formula)
             None,                                   # 36 净利润率      AK  (formula)
             item_uuid_str,                          # 37 hidden item_uuid
+            bom_source,                             # 38 BOM 数量来源
+            price_source,                           # 39 物料价来源
         ]
-
-        bom_list = _bom_for_item(
-            store_num, item_uuid_str, item_name,
-            bom_data, combo_structure, mode,
-            fallback_boms, uploaded_prices, erp_prices,
-        )
 
         if not bom_list:
             rows.append(prefix + ["-", "-", None, None, "-"] + suffix)
@@ -221,7 +241,8 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
 
 
 def _sanity_check_cost(grouped, bom_data, combo_structure, mode,
-                       fallback_boms=None, uploaded_prices=None, erp_prices=None,
+                       bom_layers=None, uploaded_prices=None, erp_prices=None,
+                       fallback_boms=None, price_layers=None, strict_price=False,
                        top_n: int = 10):
     """单份总成本 = 0 但有销量 = 数据异常（最常见原因：BOM 或物料价格未加载）。
 
@@ -231,6 +252,12 @@ def _sanity_check_cost(grouped, bom_data, combo_structure, mode,
 
     返回触发 SKU 列表（caller 决定怎么打印）。
     """
+    if bom_layers is None and fallback_boms:
+        bom_layers = [("fallback_bom", 50, fallback_boms)]
+    bom_layers = bom_layers or []
+    # 构造一次共享 price resolver, 避免 per-SKU 重建
+    _price_resolver = _build_material_price_resolver(
+        uploaded_prices, erp_prices, price_layers, strict=strict_price)
     # rollup 到 per-SKU 粒度做 sanity（跟最终 Excel 行粒度一致，避免逐价格档重复警告）
     by_sku = _rollup_per_sku(grouped)
     triggered = []
@@ -240,10 +267,12 @@ def _sanity_check_cost(grouped, bom_data, combo_structure, mode,
         data = by_sku[sku_key]
         if data["qty"] <= 0:
             continue
-        bom_list = _bom_for_item(
+        bom_list, _bs, _ps = _bom_for_item(
             store_num, item_uuid_str, item_name,
             bom_data, combo_structure, mode,
-            fallback_boms, uploaded_prices, erp_prices,
+            bom_layers, uploaded_prices, erp_prices,
+            price_layers=price_layers, strict_price=strict_price,
+            price_resolver=_price_resolver,
         )
         per_unit_cost = sum(num * unit_price for _, _, num, unit_price, _ in bom_list)
         if per_unit_cost == 0:
@@ -252,34 +281,57 @@ def _sanity_check_cost(grouped, bom_data, combo_structure, mode,
 
 
 def _bom_for_item(store_num, item_uuid, item_name, bom_data, combo_structure,
-                  mode, fallback_boms, uploaded_prices, erp_prices):
+                  mode, bom_layers, uploaded_prices, erp_prices,
+                  price_layers=None, strict_price=False, strict_bom=False,
+                  price_resolver=None):
     """Compute BOM list with prices for one SKU.
 
-    Same logic as profit_margin's aggregate_with_bom, lifted out here so cost
-    calculation is decoupled from order aggregation. BOM is price-invariant —
-    a SKU's recipe doesn't change because it's sold at a discount.
+    BOM 选取顺序 (跟 profit_margin 一致):
+      1. bom_layers 按 priority 高→低逐层匹配, 命中即覆盖 BQ 原生
+      2. BQ 原生 (bom_data / combo_structure)  — strict_bom=True 时跳过
+      3. 都没 → 空
+
+    strict_bom=True 时禁用第 2 步, 跟 profit_margin_report 对称.
+
+    price_resolver: 调用方 (per-report) 构造一次传进来, 避免 per-SKU/per-BOM-row
+    重建整个 Resolver. 不传则内部自建 (兼容旧调用).
+
+    Returns: (bom_list, qty_source_label, price_source_label)
+        bom_list: [(code, name, num, unit_price, uom), ...]
+        qty_source_label: "bq_native" / bom_layer_name / "无"
+        price_source_label: " + " 拼接的 price_layer/uploaded/ERPNext/bq_native/"无 (strict)"
     """
     store_boms = bom_data.get(store_num, {})
+    price_sources_seen = set()
+    if price_resolver is None:
+        price_resolver = _build_material_price_resolver(
+            uploaded_prices, erp_prices, price_layers, strict=strict_price)
 
-    if mode == "combo":
+    def _resolve(code, bq_p, mat_name=None):
+        p, src = _resolve_unit_price_with_source(
+            code, bq_p, uploaded_prices, erp_prices,
+            price_layers=price_layers, strict=strict_price,
+            material_name=mat_name, resolver=price_resolver)
+        price_sources_seen.add(src)
+        return p
+
+    if strict_bom:
+        # 跳过 BQ 原生 BOM 计算, bom_list 留空, 等下要么 bom_layers 命中, 要么"无"
+        bom_list = []
+    elif mode == "combo":
         # 套餐：累加所有子产品 BOM，按 (child_num × weight) 加权。
-        # combo_structure v2 元素 = (child_uuid, child_num, weight)；
-        # 旧 shape (纯 str) 兼容: num=1, weight=1
         store_struct = combo_structure.get(store_num, {})
         merged = {}
         for spec in store_struct.get(item_uuid, []):
-            # JSON cache 把 tuple 序列化为 list，所以两种都得识别
             if isinstance(spec, (tuple, list)) and len(spec) == 3:
                 child_uuid, child_num, weight = spec
             else:
-                # 旧 shape 兼容: 纯字符串 child_uuid (synthetic 测试用)
                 child_uuid, child_num, weight = spec, 1.0, 1.0
             child_mult = float(child_num) * float(weight)
             for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in store_boms.get(child_uuid, []):
                 if not material_code:
                     continue
-                base_price = _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_prices)
-                unit_price = base_price * (conv_rate or 1)
+                unit_price = _resolve(material_code, bq_price, material_name) * (conv_rate or 1)
                 weighted_bom_num = bom_num * child_mult
                 if material_code in merged:
                     prev_name, prev_num, prev_up, prev_unit = merged[material_code]
@@ -290,29 +342,35 @@ def _bom_for_item(store_num, item_uuid, item_name, bom_data, combo_structure,
                     merged[material_code] = (material_name, weighted_bom_num, unit_price, bom_unit)
         bom_list = [(c, *rest) for c, rest in merged.items()]
     else:
-        # 单品：直接匹配 + dedup（避免同 material 多 product_bom 行虚增）
         seen = set()
         bom_list = []
         for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in store_boms.get(item_uuid, []):
             if not material_code or material_code in seen:
                 continue
             seen.add(material_code)
-            base_price = _resolve_base_unit_price(material_code, bq_price, uploaded_prices, erp_prices)
-            unit_price = base_price * (conv_rate or 1)
+            unit_price = _resolve(material_code, bq_price, material_name) * (conv_rate or 1)
             bom_list.append((material_code, material_name, bom_num, unit_price, bom_unit))
 
-    # Fallback BOM 补全
-    if not bom_list and fallback_boms:
-        matched = _match_fallback_bom(item_name, fallback_boms)
-        if matched:
-            for code, name, bom_num, uom in matched:
-                unit_price = _resolve_base_unit_price(code, 0, uploaded_prices, erp_prices)
-                bom_list.append((code, name, bom_num, unit_price, uom or "-"))
+    bom_source = "bq_native" if bom_list else None
+
+    # 外挂 BOM override (priority 栈, 高 priority 覆盖 BQ 原生)
+    matched, layer_name = _match_bom_layered(item_name, bom_layers or [])
+    if matched:
+        bom_list = []
+        price_sources_seen = set()   # 覆盖时重置 (BQ 路径的 source 不算)
+        for code, name, bom_num, uom in matched:
+            unit_price = _resolve(code, 0, name)
+            bom_list.append((code, name, bom_num, unit_price, uom or "-"))
+        bom_source = layer_name
+    if bom_source is None:
+        bom_source = "无"
 
     # Shape: [(code, name, num, unit_price, uom), ...]
-    return [(c, n, num, up, uom)
-            for entry in bom_list
-            for c, n, num, up, uom in [entry if len(entry) == 5 else (entry[0], entry[1], entry[2], entry[3], entry[4])]]
+    normalized = [(c, n, num, up, uom)
+                  for entry in bom_list
+                  for c, n, num, up, uom in [entry if len(entry) == 5 else (entry[0], entry[1], entry[2], entry[3], entry[4])]]
+    price_source = " + ".join(sorted(price_sources_seen)) if price_sources_seen else "无"
+    return normalized, bom_source, price_source
 
 
 # ============================================================================
@@ -346,6 +404,13 @@ def main() -> int:
     parser.add_argument("--price-list", default=None,
                         help="上传的物料价格清单 Excel 路径（最高优先级）")
     parser.add_argument("--no-cache", action="store_true")
+    # 默认 strict: 单价只走 material_price_sources, 缺失留空 + 标黄
+    parser.add_argument("--allow-erp-fallback", action="store_true",
+                        help="允许 fallback ERPNext (默认禁用)。默认: 缺失即留空, 报表里标黄。")
+    # BOM 默认 strict: 只走 bom_sources, 缺失 → BOM来源="无". 跟 profit_margin 对称.
+    parser.add_argument("--allow-bq-native-bom", action="store_true",
+                        help="允许 fallback BQ 内置 BOM (默认禁用)。默认: BOM 只走 bom_sources, "
+                             "缺失即标 BOM来源='无', 成本列空。")
     args = parser.parse_args()
 
     setup_proxy()
@@ -383,19 +448,42 @@ def main() -> int:
 
     combo_structure = _load_combo_structures(engine, merchants, start_ts, end_ts, config)
     bom_data = _load_boms(engine, merchants, config)
-    fallback_boms = _load_fallback_boms(config)
+    bom_layers = _load_bom_layers(config)
+    price_layers = _load_material_price_layers(config)
+    strict_price = not bool(args.allow_erp_fallback)   # 默认 strict
+    if strict_price:
+        print(f"[Strict Price] 默认严格模式: 物料单价只走外挂成本表, 缺失 → 0")
+        print(f"               想恢复 ERP fallback 用 --allow-erp-fallback\n")
+    else:
+        print(f"[ERP Fallback] 允许 fallback ERPNext\n")
+
+    strict_bom = not bool(args.allow_bq_native_bom)   # 默认 strict
+    if strict_bom:
+        print(f"[Strict BOM] 默认严格模式: BOM 只走 bom_sources, 缺失 → 来源='无'")
+        print(f"             想恢复 BQ 内置 BOM 用 --allow-bq-native-bom\n")
+    else:
+        print(f"[BQ Native BOM Fallback] 允许 fallback BQ 内置 product_bom\n")
 
     modes = ["combo", "single"] if args.mode == "both" else [args.mode]
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     wb = xlsxwriter.Workbook(str(output_path))
 
+    # ── 分段计时 (profile) ── 数据驱动: 看瓶颈在哪段再决定要不要并行
+    _timings: dict = {}
+
+    def _timed(label, fn):
+        t0 = time.perf_counter()
+        out = fn()
+        _timings[label] = _timings.get(label, 0.0) + time.perf_counter() - t0
+        return out
+
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = COMBO_BY_PRICE_SQL if mode == "combo" else SINGLE_BY_PRICE_SQL
         print(f"\n========== 处理 {item_label} ==========")
 
-        raw_rows, errors = engine.query(
+        raw_rows, errors = _timed("BQ 拉数", lambda: engine.query(
             sql_template=sql_template,
             merchants=merchants,
             start_ts=start_ts,
@@ -406,21 +494,25 @@ def main() -> int:
                 "account": acc, "store_num": num, "store_name": name,
             })(),
             label=item_label,
-        )
+        ))
 
         # Fine-grain (店, SKU, price) 聚合 — 用于收集每 SKU 价格档列表
         # 行展开时 rollup 到 per-SKU
-        grouped = aggregate_by_grain(raw_rows, FINE_GRAIN_KEYS, METRIC_KEYS)
+        grouped = _timed("聚合", lambda: aggregate_by_grain(
+            raw_rows, FINE_GRAIN_KEYS, METRIC_KEYS))
 
         # Flatten: per-SKU 行 + 横向价格档 + BOM 物料展开
-        flat_rows = _build_by_price_rows(
+        flat_rows = _timed("行构建+BOM展开", lambda: _build_by_price_rows(
             grouped, bom_data, combo_structure, mode,
-            fallback_boms=fallback_boms,
+            bom_layers=bom_layers,
             uploaded_prices=uploaded_prices, erp_prices=erp_prices,
-        )
+            price_layers=price_layers, strict_price=strict_price,
+            strict_bom=strict_bom,
+        ))
 
         sheet_cfg = engine.load_sheet_config(args.column_config, item_label)
-        engine.write_sheet(wb, item_label, sheet_cfg, flat_rows)
+        _timed("写 Excel", lambda: engine.write_sheet(
+            wb, item_label, sheet_cfg, flat_rows))
         print(f"[{item_label}] {len(flat_rows)} 行")
 
         # Accounting-identity validation (per fine-grain key — finer = 更严)
@@ -434,8 +526,8 @@ def main() -> int:
             }
             for k, v in grouped.items()
         ]
-        print(f"\n[{item_label}] 校验恒等式 …")
-        result = check(check_rows, DEFAULT_IDENTITIES)
+        print(f"\n[{item_label}] 校验恒等式 + sanity …")
+        result = _timed("校验恒等式", lambda: check(check_rows, FULL_IDENTITIES))
         print_result(
             result,
             row_label=lambda r: f"店 {r['store_num']:>3}  {r['item_name']:<24}  @¥{r['price']}",
@@ -444,11 +536,12 @@ def main() -> int:
             print(f"⚠️  [{item_label}] 有 🔴 离谱违反，发出前请核实数据/口径。\n")
 
         # 业务合理性 sanity check（独立于会计恒等式）
-        zero_cost = _sanity_check_cost(
+        zero_cost = _timed("sanity check", lambda: _sanity_check_cost(
             grouped, bom_data, combo_structure, mode,
-            fallback_boms=fallback_boms,
+            bom_layers=bom_layers,
             uploaded_prices=uploaded_prices, erp_prices=erp_prices,
-        )
+            price_layers=price_layers, strict_price=strict_price,
+        ))
         if zero_cost:
             print(f"\n[{item_label}] 🟠 单份总成本=0 异常: {len(zero_cost)} SKU 行")
             print(f"   常见原因: BOM 未配 / ERPNext 价格未加载 / 物料无价")
@@ -459,8 +552,22 @@ def main() -> int:
             if len(zero_cost) > 10:
                 print(f"   ⏬ 还有 {len(zero_cost)-10} 条略")
 
+    _t0 = time.perf_counter()
     wb.close()
+    _timings["wb.close (落盘)"] = time.perf_counter() - _t0
+
     print(f"\n输出文件: {output_path}")
+
+    # ── 分段耗时汇总 (profile) ──
+    print("\n=== 分段耗时 profile (两 mode 累加) ===")
+    _total = sum(_timings.values())
+    for label, secs in sorted(_timings.items(), key=lambda x: -x[1]):
+        pct = 100 * secs / _total if _total else 0
+        print(f"  {label:18} {secs:8.2f}s  ({pct:4.1f}%)")
+    print(f"  {'合计':18} {_total:8.2f}s")
+    # NOTE: 物料单价为空标黄的后处理跑 openpyxl 太慢 (15 MB / 100K 行 → 15 分钟+, 3GB+ 内存),
+    # 暂时关掉. 客户筛"价来源 = 无 (strict)" 就能定位缺价 SKU.
+    # 后续要做 → 改用 xlsxwriter format 在写入时同步标黄, 不要事后开 openpyxl.
     return 0
 
 

@@ -53,11 +53,14 @@ exports/*
 # 数据文件 ignore，但配置 YAML / reports 子目录跟着代码一起走
 resources/*
 !resources/.gitkeep
+!resources/config.yaml              # 唯一活配置 (统一后, 不再散落在 wallace.*/)
 !resources/reports/
 !resources/reports/**
 !resources/wallace.*/
 resources/wallace.*/*
-!resources/wallace.*/config.yaml
+!resources/wallace.*/config.yaml    # 兼容: 万一还有遗留, 仍跟踪 (新流程不再往这放)
+# 历史 config 不单独归档 — git history 就是审计真源:
+#   git show <commit>:resources/wallace.20260422/config.yaml
 
 # Logs
 *.log

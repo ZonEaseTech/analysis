@@ -1,0 +1,138 @@
+# 华莱士 Wallace 利润报表资源配置 —— 唯一活配置
+#
+# ⚠️ 这是全工作区唯一的 config. 报表脚本 load_config() 默认就读这份.
+#   - 统一前 config 散落在 resources/wallace.<日期>/config.yaml, 4 份并存,
+#     "哪个是活的"靠猜 → 每次导出都可能用错版本.
+#   - 统一后: config 只有 resources/config.yaml 一份; 历史版本靠 git history
+#     回溯 (git show <commit>:resources/wallace.<日期>/config.yaml).
+#   - 新数据文件 (BOM / 物料价 Excel) 仍按 resources/wallace.<日期>/ 归档,
+#     但 config 永远只改这一份, path 指过去.
+#
+# 历史沿革 (5/13 版基础上演进):
+#   • bom_sources priority 栈 (新格式), 不再用单源 fallback_bom
+#   • 核对版 BOM (profit_by_price_202603_核对版 BOM.xlsx) 是生产基线 priority=100
+#   • 2026-05-14 加 市场补充 BOM priority=200 (match_mode: exact)
+#   • 合并BOM_结构化.xlsx priority=50 兜底
+
+# ───────────────────────────────────────────────
+# 1. 门店名称映射
+# ───────────────────────────────────────────────
+store_name_mapping:
+  adapter: excel
+  path: "resources/wallace.20260410/销售业绩+物品消耗表（3月份）.xlsx"
+  sheet: 0
+  header_row: 1
+  mapping:
+    store_number: "门店编号"
+    store_name:
+      primary: "门店名称"
+      fallback: "名称"
+
+# ───────────────────────────────────────────────
+# 2. BOM 优先级栈 (新格式)
+#
+# 命中顺序: priority 从高到低逐层匹配, 首次命中即返回该层 BOM
+# (覆盖 BQ 原生)。任一层未命中 → 落到下一层。
+# 全栈未命中 → 使用 BQ 原生 BOM (ttpos_product_bom)。
+# 全部为空 → 行标记 BOM 来源 = "无"。
+#
+# ⚠️ 事实表归档规范 (必读):
+#   - 客户/市场每次给新事实表 → 立即在此处加 bom_sources 条目, 不能只放文件
+#   - priority 按时间倒序 (新数据高)
+#   - 跑报表前用上一次报表的 BOM来源 列 grep 一遍, 确认本 config 挂的事实表跟它一致
+#   - 任一改动 commit message 写明"加/删/调 priority 哪个"
+# ───────────────────────────────────────────────
+bom_sources:
+  # 2026-05-14: 市场补充 BOM (24 个商品), 覆盖 v14 报表里 164 行原"无"
+  # 原始文件: profit_by_price_202603_v14-补充BOM_原始.xlsx (市场上传, 留本地不进 git)
+  # 解析脚本: scripts/adhoc/clean_market_bom_202603.py (混乱 Sheet2 → 标准 CSV)
+  # 清洗产物: profit_by_price_202603_v14-补充BOM.csv (CSV 纯文本可 git diff, 进 git)
+  # match_mode: exact — 补充 BOM 的 key 是市场从报表 copy 的精确商品名,
+  #   必须精确匹配; 用模糊会让普通"鸡块"误命中"鸡块（电影票折扣）"(物料=薯条+鸡柳).
+  - name: profit_by_price_202603_v14-补充BOM.csv
+    priority: 200
+    match_mode: exact
+    adapter: csv
+    path: "resources/wallace.20260514/profit_by_price_202603_v14-补充BOM.csv"
+    mapping:
+      product_name: "商品名称"
+      material_code: "物品编号"
+      material_name: "物品名称"
+      qty: "单耗"
+      unit: "单位"
+
+  # 2026-05-13 同事调整版 BOM (当前生产基线)
+  - name: profit_by_price_202603_核对版 BOM.xlsx
+    priority: 100
+    adapter: excel
+    path: "resources/wallace.20260513/profit_by_price_202603_核对版 BOM.xlsx"
+    sheet: "BOM配方(解析结果)"
+    header_row: 1
+    mapping:
+      product_name: "商品名称"
+      material_code: "物品编号"
+      material_name: "物品名称"
+      qty: "单耗"
+      unit: "单位"
+
+  # 2026-05-06 客户合并 BOM (旧版, 覆盖未在核对版中的 SKU)
+  - name: 合并BOM_结构化.xlsx
+    priority: 50
+    adapter: excel
+    path: "resources/wallace.20260506/合并BOM_结构化.xlsx"
+    sheet: "BOM配方(解析结果)"
+    header_row: 1
+    mapping:
+      product_name: "商品名称"
+      material_code: "物品编号"
+      material_name: "物品名称"
+      qty: "单耗"
+      unit: "单位"
+
+# ───────────────────────────────────────────────
+# 2b. 物料单价 优先级栈 (独立于 BOM 数量栈)
+#
+# 命中顺序: 泰国采 (按编码) > 2026 进口 (按归一化物品名) → 留空 (strict 默认)
+# --strict-price 控制: 默认禁用 (允许 fallback ERPNext); 开启后缺失 → 0 + 价来源 '无 (strict)'
+#
+# 食材 走【泰国采】sheet, 73 个 (✅ 直读 col 10; 非 ✅ 算 销售单价/转换系数)
+# 包材 走【2026.1】sheet, 100+ 个 (col 17 销售无税 ÷ 规格 parser 算每箱最小单位数)
+# ───────────────────────────────────────────────
+material_price_sources:
+  - name: 所有成本价_含ItemCode.xlsx
+    priority: 100
+    adapter: cost_price_taixi
+    path: "resources/wallace.20260513/所有成本价_含ItemCode.xlsx"
+    sheet: "泰国采"
+    index_by: code          # 按 BOM 物料编码匹配
+
+  - name: 2026进口货物(2).xlsx
+    priority: 90
+    adapter: cost_price_import
+    path: "resources/wallace.20260513/2026进口货物(2).xlsx"
+    sheet: "2026.1"
+    index_by: name          # 按 BOM 物品中文名匹配 (去 '海外版' 后缀)
+
+# ───────────────────────────────────────────────
+# 3. 商家列表
+# ───────────────────────────────────────────────
+merchant_list:
+  adapter: excel
+  path: "resources/wallace.20260506/华莱士商家56家ID.xlsx"
+  sheet: 0
+  header_row: 1
+  mapping:
+    account: "账号"
+    uuid: "商家ID"
+
+# ───────────────────────────────────────────────
+# 4. 缓存配置
+# ───────────────────────────────────────────────
+cache:
+  store_names_ttl: 604800
+  fallback_bom_ttl: 86400
+  material_price_ttl: 86400        # 物料单价层 (独立于 BOM 数量栈)
+  erp_prices_ttl: 2592000  # 30 天 (SID 过期临时延长)
+  merchant_list_ttl: 86400
+  combo_structure_ttl: 604800
+  bom_ttl: 86400
