@@ -245,8 +245,10 @@ adhoc-export                        ← 入口
    │      └── 读 ttpos-server-go Go 源码 + mirror SQL
    ├── (客户给新事实表) → onboard-fact-table skill
    ├── (改完代码) → sync-docs skill  (commit 前文档同步)
-   └── (查 BQ 表结构) → bigquery-export skill
+   └── (查 BQ 表结构 / SQL 语法) → docs/bq-schema-reference.md + docs/bq-sql-patterns.md
 ```
+
+> `bigquery-export` skill 已合并归档. Schema 速查见 `docs/bq-schema-reference.md`, SQL 语法速查见 `docs/bq-sql-patterns.md`.
 
 ---
 

@@ -1,5 +1,8 @@
 # TTPOS BigQuery Schema 速查
 
+> 来源: `.claude/skills/bigquery-export/schema-reference.md` 迁移归档。
+> 本文件是数据库视角的参考手册, 跟 `docs/data-menu.md`(业务视角)互补。
+>
 > 所有表前缀 `ttpos_`，BigQuery 中引用格式：`` `{project}`.`{dataset}`.`ttpos_{table}` ``
 > 所有表均有 `uuid`(主键)、`create_time`、`update_time`、`delete_time`(软删除) 字段
 > 多语言字段存储 JSON：`{"zh":"中文","th":"ไทย","en":"English"}`
