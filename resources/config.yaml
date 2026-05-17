@@ -43,45 +43,20 @@ store_name_mapping:
 #   - 任一改动 commit message 写明"加/删/调 priority 哪个"
 # ───────────────────────────────────────────────
 bom_sources:
-  # 2026-05-14: 市场补充 BOM (24 个商品), 覆盖 v14 报表里 164 行原"无"
-  # 原始文件: profit_by_price_202603_v14-补充BOM_原始.xlsx (市场上传, 留本地不进 git)
-  # 解析脚本: scripts/adhoc/clean_market_bom_202603.py (混乱 Sheet2 → 标准 CSV)
-  # 清洗产物: profit_by_price_202603_v14-补充BOM.csv (CSV 纯文本可 git diff, 进 git)
-  # match_mode: exact — 补充 BOM 的 key 是市场从报表 copy 的精确商品名,
-  #   必须精确匹配; 用模糊会让普通"鸡块"误命中"鸡块（电影票折扣）"(物料=薯条+鸡柳).
-  - name: profit_by_price_202603_v14-补充BOM.csv
-    priority: 200
-    match_mode: exact
-    adapter: csv
-    path: "resources/wallace.20260514/profit_by_price_202603_v14-补充BOM.csv"
-    mapping:
-      product_name: "商品名称"
-      material_code: "物品编号"
-      material_name: "物品名称"
-      qty: "单耗"
-      unit: "单位"
-
-  # 2026-05-13 同事调整版 BOM (当前生产基线)
-  - name: profit_by_price_202603_核对版 BOM.xlsx
+  # 2026-05-14: 市场"最终 BOM和价格" — 成套替换 (以最新为准).
+  # 原始文件: 最终BOM和价格_原始.xlsx (市场上传 3 sheet: 单品/套餐/价格, 留本地不进 git)
+  # 解析脚本: scripts/adhoc/onboard_final_bom_202605.py (dedup 门店重复 → 标准 CSV)
+  # 清洗产物: 最终BOM_202605.csv (262 商品 / 3076 行, 单品+套餐合并)
+  # 替换历史: 删 补充BOM.csv(200) + 核对版BOM.xlsx(100) + 合并BOM(50) 三层,
+  #   新文件是它们的合并修订版 (补充BOM 24 商品已被完全覆盖).
+  # 代价: 29 个 3 月促销限定品在新文件里没有 → strict_bom 下标"无";
+  #   差异报告见 exports/diff_最终BOM价格_vs_现有.xlsx.
+  # match_mode: 默认 fuzzy — 新文件是唯一 BOM 层, 无"高 priority 促销层盖标准层"
+  #   结构, fuzzy 安全 (跟原核对版一致).
+  - name: 最终BOM_202605.csv
     priority: 100
-    adapter: excel
-    path: "resources/wallace.20260513/profit_by_price_202603_核对版 BOM.xlsx"
-    sheet: "BOM配方(解析结果)"
-    header_row: 1
-    mapping:
-      product_name: "商品名称"
-      material_code: "物品编号"
-      material_name: "物品名称"
-      qty: "单耗"
-      unit: "单位"
-
-  # 2026-05-06 客户合并 BOM (旧版, 覆盖未在核对版中的 SKU)
-  - name: 合并BOM_结构化.xlsx
-    priority: 50
-    adapter: excel
-    path: "resources/wallace.20260506/合并BOM_结构化.xlsx"
-    sheet: "BOM配方(解析结果)"
-    header_row: 1
+    adapter: csv
+    path: "resources/wallace.20260514/最终BOM_202605.csv"
     mapping:
       product_name: "商品名称"
       material_code: "物品编号"
@@ -92,26 +67,26 @@ bom_sources:
 # ───────────────────────────────────────────────
 # 2b. 物料单价 优先级栈 (独立于 BOM 数量栈)
 #
-# 命中顺序: 泰国采 (按编码) > 2026 进口 (按归一化物品名) → 留空 (strict 默认)
-# --strict-price 控制: 默认禁用 (允许 fallback ERPNext); 开启后缺失 → 0 + 价来源 '无 (strict)'
-#
-# 食材 走【泰国采】sheet, 73 个 (✅ 直读 col 10; 非 ✅ 算 销售单价/转换系数)
-# 包材 走【2026.1】sheet, 100+ 个 (col 17 销售无税 ÷ 规格 parser 算每箱最小单位数)
+# 2026-05-14: 市场"最终 BOM和价格"的价格 sheet — 成套替换 (以最新为准).
+#   替换历史: 删 泰国采(cost_price_taixi 100) + 2026进口(cost_price_import 90).
+#   关键修正: 现有泰国采对肉类算错口径 (把"每片"算成"每克"级), 肉类成本一直
+#     偏低 ~100 倍. 新文件 FR/CK 系列 11 个肉类价是修正值 (FR01001 0.14→16.8 等).
+#     → 含肉商品毛利率会大幅下降, 这是修正不是变差. 差异报告见
+#     exports/diff_最终BOM价格_vs_现有.xlsx.
+#   注意: 3 个新增物料价为 0/空 (SE04001 调味粉 / DE01011 辣番茄粉 / '-'),
+#     按"以最新为准"原样接入, strict 模式下这些物料行标黄.
+#   csv adapter: _load_material_price_layers 的 _loader 对 list records 自动
+#     转 {code: price}, 标准 csv 直接可用.
 # ───────────────────────────────────────────────
 material_price_sources:
-  - name: 所有成本价_含ItemCode.xlsx
+  - name: 最终价格_202605.csv
     priority: 100
-    adapter: cost_price_taixi
-    path: "resources/wallace.20260513/所有成本价_含ItemCode.xlsx"
-    sheet: "泰国采"
-    index_by: code          # 按 BOM 物料编码匹配
-
-  - name: 2026进口货物(2).xlsx
-    priority: 90
-    adapter: cost_price_import
-    path: "resources/wallace.20260513/2026进口货物(2).xlsx"
-    sheet: "2026.1"
-    index_by: name          # 按 BOM 物品中文名匹配 (去 '海外版' 后缀)
+    adapter: csv
+    path: "resources/wallace.20260514/最终价格_202605.csv"
+    index_by: code
+    mapping:
+      material_code: "物品编号"
+      unit_price: "物料单价"
 
 # ───────────────────────────────────────────────
 # 3. 商家列表
@@ -126,7 +101,83 @@ merchant_list:
     uuid: "商家ID"
 
 # ───────────────────────────────────────────────
-# 4. 缓存配置
+# 3b. 报表层订单排除 (外挂事实表, 不动生产 DB)
+#
+# 为啥不直接生产 UPDATE delete_time:
+#   - 软删 ttpos_takeout_order 全 56 店 0 例先例, 副作用大 (跟 Grab 对账差账,
+#     客服查不到, ERP 链路被传播, 法务合规风险)
+#   - ttpos_data_manage 只支持 type=0 (sale_bill), 外卖单进不去
+#   - 报表层 NOT IN 是唯一既可逆又零副作用的路
+#
+# CSV 列: store_num, channel, key_type, exclude_key, short_order_number, reason, added_at
+#   channel ∈ {dine, takeout}
+#   key_type 提示语义: takeout_uuid / sale_order_uuid / sale_bill_uuid (loader 不用, channel 决定)
+#   exclude_key: 雪花 uuid (NUMERIC). 全店唯一 → 跨 store dataset NOT IN 安全
+#
+# 加单子流程: 编辑 CSV 加行 → commit → 重跑 profit_by_price 该月即可生效, 全程可逆.
+# ───────────────────────────────────────────────
+order_excludes:
+  adapter: csv
+  path: resources/wallace.20260515/order_excludes.csv
+
+# ───────────────────────────────────────────────
+# 4. 渠道费率配置（净利润口径）
+#
+# 历史 (2026-05-15):
+#   - ttpos BQ 这 3 项费用字段全 0 (service_fee / payment_commission_fee /
+#     merchant_charge_fee), ttpos 业务层没启用 → 不能走"BQ SUM"路径.
+#   - 第一版用本块的费率 × revenue 近似估算 (PLACEHOLDER).
+#   - 同日接入了 platform_fees 外挂事实表 (见下面第 4b 块), 外卖平台抽佣
+#     切换到"事实金额按 SKU revenue 分摊"模式. 本块的 takeout_platform_fee_rate
+#     退化为 **fallback** (某店该月没对账单时才用).
+#
+# 仍在 PLACEHOLDER 的项:
+#   - dine_payment_fee_rate: 堂食支付通道费率 (银行收单), 还没拿到对账单
+#   - dine_service_fee_rate: 华莱士不收, 留 0
+#
+# 客户/财务核实后改本块即可, 报表会重新计算.
+# ───────────────────────────────────────────────
+channel_fees:
+  dine_payment_fee_rate: 0.008      # 堂食支付通道手续费率 (PLACEHOLDER, 待银行账单)
+  takeout_platform_fee_rate: 0.20   # FALLBACK 仅当 platform_fees 表查不到该店该月时用 (实测综合 ~18.37%)
+  dine_service_fee_rate: 0.0        # 堂食服务费率 (华莱士不收)
+  base: revenue                     # 费率计算基数
+
+# ───────────────────────────────────────────────
+# 4b. 外卖平台抽佣 事实表 (扩展销售侧)
+#
+# 来源: 市场每月给的 5 个对账单 → ingest 脚本规整成单 CSV
+#   - LINE MAN (1 文件)
+#   - Shopee Food (4 法人: TR / FF / JJFM / FBF)
+#   - Robinhood (1 文件)
+# Ingest: scripts/adhoc/onboard_platform_fees_<月>.py
+# 粒度: (store_num, year_month, platform) → 应收 + 佣金合计
+#
+# 报表层用法 (profit_by_price_report.py):
+#   1. 按 (store_num, year_month) 把同店多平台合并 → 店级当月总佣金
+#   2. 按 SKU 的 takeout revenue 比例分摊 → SKU 级平台抽佣事实
+#   订单号没法跟 BQ 1:1 对应, 只能用 (店, 月) 粒度.
+#
+# 每月新对账单来了:
+#   1. cp 原始 xlsx 到 resources/wallace.<日期>/
+#   2. 改 ingest 脚本月份 → 重跑 → 输出新 CSV
+#   3. 改本块 path 指向新 CSV → 重跑报表
+#
+# 2026-03 实测综合费率 18.37% (LINEMAN 20% / SHP 12.84% / RBH 1.66%)
+# ───────────────────────────────────────────────
+platform_fees:
+  - name: platform_fees_202603
+    adapter: csv
+    path: "resources/wallace.20260515/platform_fees_202603.csv"
+    mapping:
+      store_num: "store_num"
+      year_month: "year_month"
+      platform: "platform"
+      gross_revenue: "gross_revenue"
+      commission_total: "commission_total"
+
+# ───────────────────────────────────────────────
+# 5. 缓存配置
 # ───────────────────────────────────────────────
 cache:
   store_names_ttl: 604800

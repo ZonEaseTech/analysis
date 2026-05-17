@@ -29,6 +29,9 @@ triggers:
 | 用错报表 | 客户要 profit_by_price 我给 profit_margin | 跑了 3 版 profit_margin 才发现 |
 | 没看 ground truth | 凭印象动手, 没核对上一次报表的来源审计列 | v14 BOM来源列写的事实表跟我 config.yaml 不一致 |
 | 信任第一次 audit | 数据是错的, 我却基于错数据出"修复方案" | "鸡块" 51 店误匹其实是错链路引发, 不是真问题 |
+| 漏 audit 项 | 每次现写检查脚本, 漏了 BOM 抽查 | 用户提醒才补 → 步骤 6 改用固定脚本 audit_report.py |
+| 覆盖文件 | 手动 mv 加版本号, 覆盖了已存在的 v1 | mv/cp 不像 Write 会拦 → 步骤 5/7 走 auto-version 不手动编名 |
+| 交付物无指纹 | 改了文件用户看不出 / 不知道是 AI 没改还是自己下错版本 | 客服待隐藏订单_2026-03.xlsx 反复迭代用户区分不出 → 步骤 7 强制内部版本号 + MD5 |
 
 **根因**: AI 接到任务习惯"读需求 → 立即写代码", 跳过了"先看清楚现状"。
 本 skill 把"看清楚现状"做成强制 0-3 步, 不允许跳过.
@@ -103,7 +106,9 @@ cp `bq_reports/<已有最接近的>_report.py` → 新文件, 改 4 处:
 ### 步骤 5 — 跑 + 校验
 
 ```bash
-venv/bin/python -m bq_reports.<脚本> --month 2026-03 --output exports/...
+# ⚠️ 对外交付报表: 不传 --output, 走 auto-version (脚本自动 _v{N+1}).
+#    手动传 --output 自己编文件名 → 容易 mv/cp 覆盖已存在版本 (踩过).
+venv/bin/python -m bq_reports.<脚本> --month 2026-03
 # --config 不传 → 默认读 resources/config.yaml
 # 第一行日志 [Config] 加载: resources/config.yaml 是审计锚, 截图存档
 ```
@@ -112,14 +117,43 @@ venv/bin/python -m bq_reports.<脚本> --month 2026-03 --output exports/...
 
 ### 步骤 6 — 交付前 audit(必做, 不能跳)
 
-```python
-# 1. BOM来源 / 价来源分布:  跟上一次报表对比, 偏差 > 5% 要解释
-# 2. 物料单价 = 0 的 unique code 列表 (sort by 累计行数)
-# 3. 抽 3-5 个具体商品打开看, 看 COGS 数字是否合理
-# 4. 跟 v14 (ground truth) 用同一 (store, item) 比, 数值偏差 > 2% 要解释
+**跑 audit 脚本, 不要现写**(现写会漏项, 上次就漏了 BOM 抽查):
+
+```bash
+venv/bin/python scripts/audit_report.py exports/<刚跑的报表>.xlsx [更多...]
 ```
 
+一条命令出齐 4 项 + 交付说明草稿:
+1. BOM来源 / 价来源 分布 — 确认事实表来源符合预期
+2. 物料单价 <= 0 的 unique code — strict 模式缺价物料
+3. **BOM 抽查** — 每 sheet 抽 3 个商品, 打印物料明细 + COGS + 毛利率
+4. "无 BOM" 商品数 — 新事实表没覆盖的
+
 异常找到 → 别急着出 fix 方案, **先验证输入数据是不是对的**(踩过 4 次的坑).
+
+### 步骤 7 — 交付
+
+1. **文件名**: 走 auto-version (步骤 5 不传 --output 就自动了). 不要手动 mv 加版本号.
+2. **每个 xlsx 输出必须带指纹** — **不能省, 不管是正式报表还是 adhoc 临时表**:
+   - **文件名版本号**: 走 `_v{N}.xlsx` 命名 (跟 bq_reports/profit_by_price_report.py 的 `_next_version_path()` 一致).
+     扫 exports/ 已有版本 → max+1 → 新文件不覆盖旧版. **这是最显眼的版本标记, 优先用这个**.
+   - **内部版本号 (兜底)**: 同时把版本号写「说明」sheet A1 (红色加粗) + workbook title.
+     用户万一只盯文件内容不看文件名也能看出来.
+   - **console 打印**: 跑完最后一行 print MD5 + 大小 + 修改时间, 例如:
+     ```
+     输出: exports/<文件>.xlsx
+       内部版本: v3
+       修改时间: 2026-05-15 03:17:04
+       大小:     16691 bytes
+       MD5:      2dc59c52ea71b1829305b34403c63a3b
+     ```
+   - **回复用户时把 MD5 贴出来**. 用户能拿 MD5 自验下载到的就是你刚导的那份, 不是浏览器缓存 / SCP 残留.
+   - **参考实现**: `bq_reports/profit_by_price_report.py` 的 `_next_version_path()` (文件名版本号).
+   - **为什么强制**: 同文件名反复迭代时用户区分不出新旧 → 怀疑 AI 没改 / 自己下错 → 信任崩盘. 加这两个字段成本几乎为 0.
+3. **交付说明**: audit 脚本末尾的「交付说明草稿」自己核一遍, 补两类必说项:
+   - 换过事实表 → 毛利率变化是不是口径修正 (是修正不是变差, 要讲清楚)
+   - "无 BOM" / 缺价物料多的 → 那些商品成本虚高/偏低, 让市场别当真
+4. **交付物**: 报表 xlsx + 差异报告 (如有) + 交付说明 + MD5. 一起给.
 
 ---
 

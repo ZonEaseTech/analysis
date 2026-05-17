@@ -58,10 +58,21 @@ from utils.report_engine import ReportEngine, load_sheet_config
 # SQL: sale_event + JOIN to product_package for name; filter by product_type
 # ============================================================================
 
-_BY_PRICE_SQL_TPL = f"""
+def _build_sql_templates(dine_excludes=None, takeout_excludes=None):
+    """构造 (COMBO_SQL, SINGLE_SQL) — 把排除清单注入 sale_event CTE.
+
+    清单为空 → 跟模块加载时的零行为版本完全一致.
+    """
+    tpl = f"""
 WITH
-{sale_event.sale_event_cte()}
-SELECT
+{sale_event.sale_event_cte(dine_excludes, takeout_excludes)}
+{_BY_PRICE_SELECT_BODY}"""
+    return (tpl.replace("{product_type}", "1"),
+            tpl.replace("{product_type}", "0"))
+
+
+# SELECT 主体 (不含 WITH / CTE 部分) — 给 _build_sql_templates 复用
+_BY_PRICE_SELECT_BODY = """SELECT
   e.item_uuid,
   e.price,
   e.channel,
@@ -85,14 +96,46 @@ SELECT
     '未知'
   ), r'^\\s+|\\s+$', '') AS item_name
 FROM sale_event e
-JOIN `{{project}}`.`{{dataset}}`.`ttpos_product_package` pp
+JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
   ON pp.uuid = e.item_uuid
-WHERE pp.product_type = {{product_type}}
+WHERE pp.product_type = {product_type}
   AND e.qty > 0
 """
 
-COMBO_BY_PRICE_SQL = _BY_PRICE_SQL_TPL.replace("{product_type}", "1")
-SINGLE_BY_PRICE_SQL = _BY_PRICE_SQL_TPL.replace("{product_type}", "0")
+# 模块加载时构造默认 (空排除清单) 模板, 兼容老调用方
+COMBO_BY_PRICE_SQL, SINGLE_BY_PRICE_SQL = _build_sql_templates()
+
+
+def _load_order_excludes(config) -> tuple[set, set]:
+    """加载 config.order_excludes 指向的 CSV → (dine_set, takeout_set).
+
+    报表层排除清单 — 不动生产数据, 改 CSV 即可生效.
+    格式: store_num,channel,key_type,exclude_key,reason,added_at
+      channel ∈ {dine, takeout}
+      key_type ∈ {sale_order_uuid, takeout_uuid} (注释用, 由 channel 决定语义)
+      exclude_key: 雪花 uuid (NUMERIC). 全店唯一, 跨 dataset NOT IN 安全.
+    """
+    import csv as _csv
+    spec = (config or {}).get("order_excludes") or {}
+    path = spec.get("path")
+    if not path or not os.path.exists(path):
+        return set(), set()
+    dine, takeout = set(), set()
+    with open(path, encoding="utf-8-sig") as f:
+        for r in _csv.DictReader(f):
+            ch = (r.get("channel") or "").strip()
+            key = (r.get("exclude_key") or "").strip()
+            if not key:
+                continue
+            try:
+                k = int(key)
+            except ValueError:
+                continue
+            if ch == "dine":
+                dine.add(k)
+            elif ch == "takeout":
+                takeout.add(k)
+    return dine, takeout
 
 
 # ============================================================================
@@ -136,10 +179,57 @@ def _rollup_per_sku(fine_grouped: dict) -> dict:
     return by_sku
 
 
+def _load_platform_fees(config: dict, year_month: str) -> dict:
+    """加载外卖平台抽佣事实表 → {store_num: effective_rate}.
+
+    每店当月真实抽佣率 = Σ平台佣金 / Σ平台应收 (合并多平台对账单).
+    报表层: SKU 平台抽佣 = SKU takeout revenue × 该店真实费率.
+    粒度: (store_num, year_month) — 订单号对不上, 用月级聚合.
+
+    用"费率"而不是"金额按比例"模式的原因:
+      套餐 sheet 跟单品 sheet 共享同店总佣金, 直接金额分摊会算两次.
+      用费率每 sheet 独立, 加总 ≈ Σ(SKU 外卖 revenue) × rate ≈ 对账单总佣金.
+
+    Returns {} 当 config 没配 / 文件不存在 / 该月无数据 (caller fallback 到费率估算).
+    """
+    import csv
+    sources = config.get("platform_fees") or []
+    if not sources:
+        return {}
+    by_store: dict[str, dict] = {}
+    for src in sources:
+        path = src.get("path")
+        if not path:
+            continue
+        p = Path(path)
+        if not p.exists():
+            print(f"[Platform Fees] ⚠️ 文件不存在: {path}, 跳过")
+            continue
+        with p.open(encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("year_month") != year_month:
+                    continue
+                store = str(row.get("store_num", "")).strip()
+                if not store:
+                    continue
+                gross = float(row.get("gross_revenue") or 0)
+                commission = float(row.get("commission_total") or 0)
+                slot = by_store.setdefault(store, {"gross": 0.0, "commission": 0.0})
+                slot["gross"] += gross
+                slot["commission"] += commission
+    # 转成 {store: rate}
+    return {
+        store: (d["commission"] / d["gross"]) if d["gross"] > 0 else 0.0
+        for store, d in by_store.items()
+    }
+
+
 def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
                          bom_layers=None, uploaded_prices=None, erp_prices=None,
                          fallback_boms=None, price_layers=None, strict_price=False,
-                         strict_bom=False):
+                         strict_bom=False, revenue_by_channel=None, channel_fees=None,
+                         platform_fees_by_store=None, store_takeout_total=None):
     """Per-SKU + 横向价格档 + BOM 物料展开。
 
     输入: fine-grain (店, SKU, price) 聚合。
@@ -154,6 +244,15 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
     # 构造一次共享 price resolver, 避免 per-SKU/per-BOM-row 重建
     _price_resolver = _build_material_price_resolver(
         uploaded_prices, erp_prices, price_layers, strict=strict_price)
+
+    # 渠道费率 (堂食支付费 = PLACEHOLDER, 外卖平台抽佣 = fallback 当对账单缺失时用)
+    channel_fees = channel_fees or {}
+    dine_pay_rate = float(channel_fees.get("dine_payment_fee_rate", 0))
+    takeout_plat_rate_fallback = float(channel_fees.get("takeout_platform_fee_rate", 0))
+    dine_svc_rate = float(channel_fees.get("dine_service_fee_rate", 0))
+    revenue_by_channel = revenue_by_channel or {}
+    platform_fees_by_store = platform_fees_by_store or {}
+    store_takeout_total = store_takeout_total or {}
 
     by_sku = _rollup_per_sku(grouped)
     rows = []
@@ -213,15 +312,34 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             strict_bom=strict_bom, price_resolver=_price_resolver,
         )
 
-        # 利润 4 件套 + hidden uuid + 双审计列（suffix）
+        # 渠道分实收 — 用于算 3 项费用
+        rev_ch = revenue_by_channel.get((store_num, item_uuid_str), {})
+        revenue_dine = float(rev_ch.get("dine", 0))
+        revenue_takeout = float(rev_ch.get("takeout", 0))
+        payment_fee = revenue_dine * dine_pay_rate
+        service_fee_income = revenue_dine * dine_svc_rate
+        # 平台抽佣: 优先用对账单事实费率 (该店真实综合费率)
+        # fallback: 该店该月没对账单 → 用 config 费率估算
+        store_fact_rate = platform_fees_by_store.get(store_num)
+        if store_fact_rate is not None and store_fact_rate > 0:
+            platform_fee = revenue_takeout * store_fact_rate
+        else:
+            platform_fee = revenue_takeout * takeout_plat_rate_fallback
+
+        # 利润 4 件套 + hidden uuid + 双审计列 + 净利润 5 列（suffix）
         suffix = [
             None,                                   # 33 单份总成本    AH  (SUMPRODUCT)
             None,                                   # 34 单品毛利      AI  (formula)
             None,                                   # 35 总毛利        AJ  (formula)
-            None,                                   # 36 净利润率      AK  (formula)
-            item_uuid_str,                          # 37 hidden item_uuid
-            bom_source,                             # 38 BOM 数量来源
-            price_source,                           # 39 物料价来源
+            None,                                   # 36 毛利率        AK  (formula)
+            item_uuid_str,                          # 37 hidden item_uuid AL
+            bom_source,                             # 38 BOM 数量来源     AM
+            price_source,                           # 39 物料价来源       AN
+            round(payment_fee, 2),                  # 40 支付手续费       AO  (NEW)
+            round(platform_fee, 2),                 # 41 平台抽佣         AP  (NEW)
+            round(service_fee_income, 2),           # 42 服务费收入       AQ  (NEW)
+            None,                                   # 43 净利润           AR  (formula)
+            None,                                   # 44 净利率           AS  (formula)
         ]
 
         if not bom_list:
@@ -446,6 +564,25 @@ def main() -> int:
 
     print(f"[配置] {len(merchants)} 个门店，月份 {args.month}")
 
+    # 渠道费率 (堂食支付费 PLACEHOLDER, 外卖平台抽佣是 fallback)
+    channel_fees = config.get("channel_fees", {}) or {}
+    if channel_fees:
+        print(f"[Channel Fees] 堂食支付费率={channel_fees.get('dine_payment_fee_rate', 0)*100:.2f}% (PLACEHOLDER), "
+              f"外卖平台抽佣 fallback={channel_fees.get('takeout_platform_fee_rate', 0)*100:.2f}%, "
+              f"堂食服务费={channel_fees.get('dine_service_fee_rate', 0)*100:.2f}%")
+
+    # 外卖平台抽佣 事实表 (按 (店, 月) 落账, 报表层按 SKU revenue 比例分摊)
+    platform_fees_by_store = _load_platform_fees(config, args.month)
+    if platform_fees_by_store:
+        rates = list(platform_fees_by_store.values())
+        avg_rate = sum(rates) / len(rates) * 100
+        min_rate = min(rates) * 100
+        max_rate = max(rates) * 100
+        print(f"[Platform Fees] 加载 {len(platform_fees_by_store)} 店真实抽佣率: "
+              f"avg={avg_rate:.2f}% [{min_rate:.2f}% ~ {max_rate:.2f}%]")
+    else:
+        print(f"[Platform Fees] ⚠️ 未加载到 {args.month} 平台抽佣事实, 全部走 fallback 费率")
+
     combo_structure = _load_combo_structures(engine, merchants, start_ts, end_ts, config)
     bom_data = _load_boms(engine, merchants, config)
     bom_layers = _load_bom_layers(config)
@@ -464,6 +601,15 @@ def main() -> int:
     else:
         print(f"[BQ Native BOM Fallback] 允许 fallback BQ 内置 product_bom\n")
 
+    # 报表层订单排除 (外挂事实表, 不动生产)
+    dine_excl, takeout_excl = _load_order_excludes(config)
+    if dine_excl or takeout_excl:
+        print(f"[Order Excludes] 报表层排除: 堂食 {len(dine_excl)} 单 / 外卖 {len(takeout_excl)} 单 "
+              f"(源: {config['order_excludes']['path']})")
+        combo_sql_t, single_sql_t = _build_sql_templates(dine_excl, takeout_excl)
+    else:
+        combo_sql_t, single_sql_t = COMBO_BY_PRICE_SQL, SINGLE_BY_PRICE_SQL
+
     modes = ["combo", "single"] if args.mode == "both" else [args.mode]
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -480,7 +626,7 @@ def main() -> int:
 
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
-        sql_template = COMBO_BY_PRICE_SQL if mode == "combo" else SINGLE_BY_PRICE_SQL
+        sql_template = combo_sql_t if mode == "combo" else single_sql_t
         print(f"\n========== 处理 {item_label} ==========")
 
         raw_rows, errors = _timed("BQ 拉数", lambda: engine.query(
@@ -501,6 +647,22 @@ def main() -> int:
         grouped = _timed("聚合", lambda: aggregate_by_grain(
             raw_rows, FINE_GRAIN_KEYS, METRIC_KEYS))
 
+        # 渠道分实收 — 为净利润算 3 项费用 (key=(store_num, item_uuid_str))
+        # 同时算每店 takeout revenue 总额 — 平台抽佣事实按 SKU 比例分摊用
+        def _build_revenue_by_channel():
+            d = {}
+            store_tk_total: dict[str, float] = {}
+            for r in raw_rows:
+                key = (r.store_num, str(r.item_uuid))
+                slot = d.setdefault(key, {"dine": 0.0, "takeout": 0.0})
+                amt = float(r.actual_amount or 0)
+                slot[r.channel] = slot.get(r.channel, 0.0) + amt
+                if r.channel == "takeout":
+                    store_tk_total[r.store_num] = store_tk_total.get(r.store_num, 0.0) + amt
+            return d, store_tk_total
+        revenue_by_channel, store_takeout_total = _timed(
+            "渠道拆实收", _build_revenue_by_channel)
+
         # Flatten: per-SKU 行 + 横向价格档 + BOM 物料展开
         flat_rows = _timed("行构建+BOM展开", lambda: _build_by_price_rows(
             grouped, bom_data, combo_structure, mode,
@@ -508,6 +670,10 @@ def main() -> int:
             uploaded_prices=uploaded_prices, erp_prices=erp_prices,
             price_layers=price_layers, strict_price=strict_price,
             strict_bom=strict_bom,
+            revenue_by_channel=revenue_by_channel,
+            channel_fees=channel_fees,
+            platform_fees_by_store=platform_fees_by_store,
+            store_takeout_total=store_takeout_total,
         ))
 
         sheet_cfg = engine.load_sheet_config(args.column_config, item_label)
