@@ -53,44 +53,109 @@ from utils.resource_adapter import get_adapter
 # 门店名称映射加载
 # ============================================================================
 
-def _load_store_names(config: dict = None):
-    """从配置中指定的资源加载门店编号→名称映射。支持缓存。"""
+def _load_store_names_from_bq(client, merchant_records: list) -> dict:
+    """并发查 BQ 每个店的 ttpos_setting (key='store' → values.name).
+
+    BQ 是店名的权威真源 — 跟 POS 系统始终一致, 新店自动有名字.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _q(m):
+        uuid = m["uuid"]; code = m["store_num"]
+        sql = (
+            f"SELECT JSON_VALUE(values, '$.name') AS name "
+            f"FROM `{client.project}.shop{uuid}.ttpos_setting` "
+            f"WHERE key = 'store' AND delete_time = 0 LIMIT 1"
+        )
+        try:
+            for r in client.query(sql).result():
+                if r.name:
+                    return str(code).zfill(3), str(r.name).strip()
+        except Exception:
+            pass
+        return str(code).zfill(3), None
+
+    mapping = {}
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for f in as_completed([ex.submit(_q, m) for m in merchant_records]):
+            code, name = f.result()
+            if name:
+                mapping[code] = name
+                try:
+                    mapping[str(int(code))] = name
+                except ValueError:
+                    pass
+    return mapping
+
+
+def _load_store_names(config: dict = None, client=None):
+    """门店编号→名称映射. 优先 BQ ttpos_setting (权威源), Excel 作 fallback.
+
+    Args:
+        config: load_config() 返回值
+        client: BigQuery client (可选). 传入则走 BQ; 否则 fallback Excel.
+    """
     cfg = config or {}
+    cache_ttl = cfg.get("cache", {}).get("store_names_ttl", 604800)
+
+    # 路径 1: BQ ttpos_setting (主源)
+    if client is not None:
+        # 加载商户基础列表 (account + uuid + store_num) — 不依赖 store_name
+        merchant_spec = cfg.get("merchant_list")
+        if merchant_spec:
+            try:
+                from utils.resource_adapter import get_adapter as _ga
+                ad = _ga(merchant_spec["adapter"])
+                records_raw = ad.load(merchant_spec)
+                merchants = []
+                for r in records_raw:
+                    acc = r.get("account") or ""
+                    uuid = r.get("uuid") or ""
+                    if not uuid: continue
+                    # account 形如 admin-001@wallace.com → 抽 store_num
+                    import re as _re
+                    m = _re.search(r"admin-(\d+)", str(acc))
+                    if not m: continue
+                    merchants.append({"account": acc, "uuid": str(uuid),
+                                      "store_num": m.group(1).zfill(3)})
+                key = cache_key("store_names_bq_v1",
+                                {"uuids": sorted([m["uuid"] for m in merchants])})
+                cached = get_cache(key, ttl_seconds=cache_ttl)
+                if cached is not None:
+                    print(f"[Store Names] BQ 缓存命中: {len(set(cached.values()))} 个")
+                    return cached
+                mapping = _load_store_names_from_bq(client, merchants)
+                set_cache(key, mapping)
+                print(f"[Store Names] 从 BQ ttpos_setting 加载 "
+                      f"{len(set(mapping.values()))} 个门店名称")
+                return mapping
+            except Exception as e:
+                print(f"[警告] BQ 加载店名失败, fallback Excel: {e}")
+
+    # 路径 2: Excel fallback (旧逻辑)
     mapping_config = cfg.get("store_name_mapping")
     if not mapping_config:
         return {}
-
-    cache_ttl = cfg.get("cache", {}).get("store_names_ttl", 604800)
-    # v2: 同时存原值与去前导 0 的归一化 key（"001" 与 "1" 都能匹配）
     key = cache_key("store_names_v2", {"path": mapping_config.get("path", "")})
     cached = get_cache(key, ttl_seconds=cache_ttl)
     if cached is not None:
-        print(f"[Store Names] 缓存命中: {len(cached)} 个")
+        print(f"[Store Names] Excel 缓存命中: {len(cached)} 个")
         return cached
-
     try:
         adapter = get_adapter(mapping_config["adapter"])
         records = adapter.load(mapping_config)
         mapping = {}
         for r in records:
-            num = r.get("store_number")
-            name = r.get("store_name")
-            if num is None or not name:
-                continue
+            num = r.get("store_number"); name = r.get("store_name")
+            if num is None or not name: continue
             s = str(num).strip()
-            if not s:
-                continue
+            if not s: continue
             clean_name = str(name).strip()
             mapping[s] = clean_name
-            # 数字编号同时存归一化版本，避免 "001" / "1" 互不匹配
-            try:
-                mapping[str(int(s))] = clean_name
-            except ValueError:
-                pass
+            try: mapping[str(int(s))] = clean_name
+            except ValueError: pass
         set_cache(key, mapping)
-        # 用去重数计真实门店数
-        unique_names = len(set(mapping.values()))
-        print(f"[Store Names] 加载 {unique_names} 个门店名称（{len(mapping)} 个 key）")
+        print(f"[Store Names] Excel 加载 {len(set(mapping.values()))} 个门店名称")
         return mapping
     except Exception as e:
         print(f"[警告] 加载门店名称失败: {e}")
@@ -352,7 +417,7 @@ def _fetch_store_names_from_bq(uuids, project_id):
             sql = f"""
             SELECT
               JSON_EXTRACT_SCALAR(`values`, '$.store_code') AS code,
-              JSON_EXTRACT_SCALAR(`values`, '$.store_name') AS name
+              JSON_EXTRACT_SCALAR(`values`, '$.name') AS name
             FROM `{project_id}`.`shop{uuid_str}`.`ttpos_setting`
             WHERE `key` = 'store' AND delete_time = 0
             LIMIT 1
@@ -1408,7 +1473,7 @@ def main():
         print()
 
     # 加载门店名称映射
-    store_names = _load_store_names(config)
+    store_names = _load_store_names(config, client=engine.client)
 
     # 加载商家列表
     merchants = _load_merchants(config, store_names, override_path=args.merchants,

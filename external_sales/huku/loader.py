@@ -122,22 +122,22 @@ class HukuLoader(ExternalSalesSource):
     # ── 内部 ───────────────────────────────────────────────
 
     def _build_store_map(self, wb, config) -> tuple[dict, set]:
-        """弧酷店名 → BQ 店编 (3 位)."""
+        """弧酷店名 → BQ 店编 (3 位).
+
+        BQ ttpos_setting 是店名权威源, 覆盖所有 56 店.
+        旧版从 Excel 加载会缺 030 等漏录的店, 已切换.
+        """
         if config is None:
             from bq_reports.profit_margin_report import load_config
             config = load_config()
-        spec = config["store_name_mapping"]
-        wb2 = openpyxl.load_workbook(spec["path"], data_only=True)
-        ws = wb2.worksheets[spec["sheet"]]
-        hdr = [c.value for c in ws[spec["header_row"]]]
-        bq_all = {}
-        for row in ws.iter_rows(min_row=spec["header_row"] + 1, values_only=True):
-            d = dict(zip(hdr, row))
-            code = d.get(spec["mapping"]["store_number"])
-            name = (d.get(spec["mapping"]["store_name"]["primary"])
-                    or d.get(spec["mapping"]["store_name"]["fallback"]))
-            if code:
-                bq_all[str(code).zfill(3)] = (name or "").strip()
+        # 从 BQ 加载 (需要 bq_client, 通过 self._bq_client_for_names 临时取)
+        from bq_reports.utils.bq_client import setup_proxy, get_bq_client
+        from bq_reports.profit_margin_report import _load_store_names
+        setup_proxy()
+        client = get_bq_client()
+        names = _load_store_names(config, client=client)
+        # names dict 已含 "001" 和 "1" 两种形式; 取 zfill(3) 版本作 BQ_all
+        bq_all = {k: v for k, v in names.items() if len(k) == 3}
         self._bq_all = bq_all
         bqc = {c: clean_bq_store_name(n) for c, n in bq_all.items()}
 

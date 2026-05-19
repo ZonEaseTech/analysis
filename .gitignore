@@ -86,3 +86,7 @@ htmlcov/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# 清洗产物 csv 一律入库 (xlsx 原始文件本地保留)
+# ⚠️ 放末尾以确保覆盖前面的 resources/wallace.*/* 规则 — 在 line 62 附近放不生效
+!resources/wallace.*/*.csv

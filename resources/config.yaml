@@ -15,13 +15,15 @@
 #   • 合并BOM_结构化.xlsx priority=50 兜底
 
 # ───────────────────────────────────────────────
-# 1. 门店名称映射
+# 1. 门店名称映射 (fallback — 主源是 BQ ttpos_setting)
+#
+# 2026-05-19 起店名权威源切到 BQ ttpos_setting.values.name —
+# 自动覆盖全部 56 店, 新店不用维护配置. 这份 csv 仅作 BQ 不可用时兜底.
+# 缺 030 等少数店 (3 月业绩表里没出现), 升级到 BQ 后已修复.
 # ───────────────────────────────────────────────
 store_name_mapping:
-  adapter: excel
-  path: "resources/wallace.20260410/销售业绩+物品消耗表（3月份）.xlsx"
-  sheet: 0
-  header_row: 1
+  adapter: csv
+  path: "resources/wallace.20260410/销售业绩+物品消耗表_202603.csv"
   mapping:
     store_number: "门店编号"
     store_name:
@@ -64,6 +66,20 @@ bom_sources:
       qty: "单耗"
       unit: "单位"
 
+  # 2026-05-19: 弧酷补充 BOM (Sheet1/2/3) — 给 1月报表用, 跟现有 csv 重名的不覆盖
+  # 来源: 市场提供的弧酷补充 xlsx, 清洗脚本 scripts/adhoc/onboard_huku_supplement_202601.py
+  # priority < 100 — 现有最终BOM 优先, 这层只补缺失的
+  - name: huku_补充BOM_202601.csv
+    priority: 90
+    adapter: csv
+    path: "resources/wallace.20260514/huku_补充BOM_202601.csv"
+    mapping:
+      product_name: "商品名称"
+      material_code: "物品编号"
+      material_name: "物品名称"
+      qty: "单耗"
+      unit: "单位"
+
 # ───────────────────────────────────────────────
 # 2b. 物料单价 优先级栈 (独立于 BOM 数量栈)
 #
@@ -92,10 +108,8 @@ material_price_sources:
 # 3. 商家列表
 # ───────────────────────────────────────────────
 merchant_list:
-  adapter: excel
-  path: "resources/wallace.20260506/华莱士商家56家ID.xlsx"
-  sheet: 0
-  header_row: 1
+  adapter: csv
+  path: "resources/wallace.20260506/华莱士商家56家ID.csv"
   mapping:
     account: "账号"
     uuid: "商家ID"

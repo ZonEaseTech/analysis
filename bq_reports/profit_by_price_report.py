@@ -557,7 +557,7 @@ def main() -> int:
         erp_ttl = 0 if args.no_cache else config.get("cache", {}).get("erp_prices_ttl", 3600)
         erp_prices = _try_load_erp_prices(price_list=args.erp_price_list, cache_ttl=erp_ttl)
 
-    store_names = _load_store_names(config)
+    store_names = _load_store_names(config, client=engine.client)
     merchants = _load_merchants(config, store_names,
                                  override_path=args.merchants, project_id=args.project)
     if not merchants:

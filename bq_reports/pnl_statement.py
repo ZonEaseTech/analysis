@@ -1311,7 +1311,7 @@ def main():
     engine = ReportEngine(project_id=args.project)
     start_ts, end_ts = month_to_ts_range(args.month)
 
-    store_names = _load_store_names(config)
+    store_names = _load_store_names(config, client=engine.client)
     merchants = _load_merchants(
         config, store_names, override_path=args.merchants, project_id=args.project
     )
