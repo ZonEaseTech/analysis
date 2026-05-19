@@ -17,10 +17,20 @@
 """
 
 
-def sale_event_cte() -> str:
+def sale_event_cte(dine_excludes=None, takeout_excludes=None) -> str:
     """Returns `sale_event AS (...)` body. Same占位符 ({project}/{dataset}/{start_ts}/{end_ts})
-    as sale_line/takeout_line — drop-in compatible with engine.query()."""
-    return """sale_event AS (
+    as sale_line/takeout_line — drop-in compatible with engine.query().
+
+    dine_excludes: set[int] of ttpos_statistics_product.sale_order_uuid to drop
+    takeout_excludes: set[int] of ttpos_takeout_order.uuid to drop
+    """
+    def _not_in(field: str, ids) -> str:
+        if not ids:
+            return ""
+        return f"    AND {field} NOT IN ({', '.join(str(int(x)) for x in ids)})\n"
+    dine_filter = _not_in("sp.sale_order_uuid", dine_excludes)
+    takeout_filter = _not_in("t.uuid", takeout_excludes)
+    return ("""sale_event AS (
   -- 堂食按 (item, sale_price) 拆 —— 每个不同的价格档单独一行
   SELECT
     sp.product_package_uuid AS item_uuid,
@@ -51,7 +61,7 @@ def sale_event_cte() -> str:
     ON pp.uuid = sp.product_package_uuid
   WHERE sp.complete_time >= {start_ts}
     AND sp.complete_time < {end_ts}
-  GROUP BY item_uuid, price
+""" + dine_filter + """  GROUP BY item_uuid, price
 
   UNION ALL
 
@@ -88,8 +98,8 @@ def sale_event_cte() -> str:
       (t.order_state = 40 AND t.completed_time >= {start_ts} AND t.completed_time < {end_ts})
       OR (t.order_state != 40 AND t.accepted_time >= {start_ts} AND t.accepted_time < {end_ts})
     )
-  GROUP BY item_uuid, price
-)"""
+""" + takeout_filter + """  GROUP BY item_uuid, price
+)""")
 
 
 # Metric column names produced by sale_event. Used by aggregate_by_grain to know
