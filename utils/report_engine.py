@@ -75,6 +75,7 @@ class ColumnConfig:
     negative_red: bool = False          # 负值标红（基于预计算值）
     positive_red: bool = False          # 正值标红（用于"异常损失"等"非零即异常"列；通过条件格式）
     zero_yellow: bool = False           # 0 值标黄（用于"应有值却缺失"列，如 strict 模式下物料单价=0）
+    hidden: bool = False                # 列隐藏（客户报表收敛视图，audit 脚本仍可读）
     comment: str = ""                   # 表头悬停备注（字段语义 / 取数说明）
 
 
@@ -289,8 +290,9 @@ def write_configured_sheet(workbook, sheet_name: str, sheet_config: SheetConfig,
             })
 
     if not rows:
-        ws.set_column(0, max(0, len(columns) - 1), 15)
-        # 冻结首行
+        for col_idx, col_cfg in enumerate(columns):
+            ws.set_column(col_idx, col_idx, 15, None,
+                          {"hidden": True} if col_cfg.hidden else {})
         if sheet_config.freeze_panes:
             ws.freeze_panes(1, 0)
         return
@@ -306,7 +308,8 @@ def write_configured_sheet(workbook, sheet_name: str, sheet_config: SheetConfig,
         except Exception:
             data_max = 0
         width = min(max(data_max, len(col_cfg.name)) + 4, 50)
-        ws.set_column(col_idx, col_idx, width)
+        ws.set_column(col_idx, col_idx, width, None,
+                      {"hidden": True} if col_cfg.hidden else {})
 
     # 3. 检测 block
     blocks = _detect_blocks(rows, merge_key_indices)
@@ -470,6 +473,7 @@ def load_sheet_config(yaml_path: str, sheet_name: str) -> SheetConfig:
             negative_red=c.get("negative_red", False),
             positive_red=c.get("positive_red", False),
             zero_yellow=c.get("zero_yellow", False),
+            hidden=c.get("hidden", False),
             comment=c.get("comment", ""),
         ))
 

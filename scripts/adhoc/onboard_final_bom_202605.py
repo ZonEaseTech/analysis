@@ -35,6 +35,19 @@ OUT_BOM = "resources/wallace.20260514/最终BOM_202605.csv"
 OUT_PRICE = "resources/wallace.20260514/最终价格_202605.csv"
 DIFF_XLSX = "exports/diff_最终BOM价格_vs_现有.xlsx"
 
+# POS 简称 → BOM 文件里全称的别名映射 (5/18 跟市场对齐结果).
+# 这些 SKU 在销售里用简称, BOM 文件里只有全称, fuzzy 匹不上.
+# 清洗时把全称那行 BOM 复制一份, 以简称为 key 落 csv.
+# 新版 BOM 文件来了重跑本脚本, alias 自动保留.
+PRODUCT_ALIASES = {
+    "辣番茄2": "辣番茄套餐 2",
+    "合艾狂热1": "合艾狂热 1",           # ⚠️ BOM 漏录, 待市场补 → 当前 alias 不生效, 仍标"无"
+    "合艾狂热2": "合艾狂热 2",           # POS 简称版 future-proof (当前销售未出现)
+    "新店开业套餐1": "新店开业促销，满意十足，10%特别折扣",
+    "冰淇淋 0泰铢 - Google评论": "冰淇淋 0฿",
+    "套餐满足1经典  旧": "套餐满足1经典 旧",   # 双空格 vs 单空格
+}
+
 
 def load_new():
     """读原始 xlsx → (bom_dict, price_dict).
@@ -42,7 +55,7 @@ def load_new():
     bom_dict: {商品: [(code, name, qty, unit), ...]}  (carry-forward + dedup)
     price_dict: {code: (name, price, unit)}
     """
-    wb = openpyxl.load_workbook(RAW, data_only=True, read_only=True)
+    wb = openpyxl.load_workbook(RAW, data_only=True)
     bom = {}
     for sn in ("单品", "套餐"):
         ws = wb[sn]
@@ -67,6 +80,16 @@ def load_new():
         code = str(r[1]).strip()
         if code and code not in price:
             price[code] = (str(r[0] or "").strip(), r[2], str(r[3] or "").strip())
+
+    # 应用 POS 简称别名 — 复制全称行到简称 key
+    missing = []
+    for alias, target in PRODUCT_ALIASES.items():
+        if target in bom and alias not in bom:
+            bom[alias] = list(bom[target])
+        elif target not in bom:
+            missing.append((alias, target))
+    if missing:
+        print(f"⚠️ alias 目标在 BOM 中找不到 (skip): {missing}")
     return bom, price
 
 
