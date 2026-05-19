@@ -526,6 +526,8 @@ def main() -> int:
     parser.add_argument("--allow-erp-fallback", action="store_true",
                         help="允许 fallback ERPNext (默认禁用)。默认: 缺失即留空, 报表里标黄。")
     # BOM 默认 strict: 只走 bom_sources, 缺失 → BOM来源="无". 跟 profit_margin 对称.
+    parser.add_argument("--external", default=None,
+                        help="外部销售源, 格式 'provider:key=val', e.g. 'huku:path=/path/to/file.xlsx'")
     parser.add_argument("--allow-bq-native-bom", action="store_true",
                         help="允许 fallback BQ 内置 BOM (默认禁用)。默认: BOM 只走 bom_sources, "
                              "缺失即标 BOM来源='无', 成本列空。")
@@ -624,6 +626,22 @@ def main() -> int:
         _timings[label] = _timings.get(label, 0.0) + time.perf_counter() - t0
         return out
 
+    # ── 外部销售源 (可选) — 不传 --external 时跑法跟纯 BQ 一致 ──────────
+    external_rows = []
+    if args.external:
+        from external_sales import load_external
+        print(f"\n========== 外部销售源 {args.external} ==========")
+        external_rows = _timed("外部源加载", lambda: load_external(
+            args.external,
+            bq_client=engine.client, merchants=merchants,
+            month=args.month, config=config,
+        ))
+        ext_rev_total = sum(r.revenue for r in external_rows)
+        ext_matched = sum(r.revenue for r in external_rows if not r.is_unmatched)
+        print(f"  [外部源] {len(external_rows)} SKU 行, "
+              f"实收 {ext_rev_total:,.0f} 泰铢, "
+              f"高置信 {ext_matched:,.0f} ({ext_matched/ext_rev_total*100:.1f}%)")
+
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = combo_sql_t if mode == "combo" else single_sql_t
@@ -676,10 +694,19 @@ def main() -> int:
             store_takeout_total=store_takeout_total,
         ))
 
+        # 外部源 SKU 行: append 到该 mode 的 flat_rows 末尾
+        if external_rows:
+            from external_sales import to_profit_by_price_rows
+            ext_flat = to_profit_by_price_rows(external_rows, mode)
+            bq_n = len(flat_rows)
+            flat_rows = flat_rows + ext_flat
+            print(f"[{item_label}] BQ {bq_n} 行 + 外部 {len(ext_flat)} 行 = {len(flat_rows)} 行")
+
         sheet_cfg = engine.load_sheet_config(args.column_config, item_label)
         _timed("写 Excel", lambda: engine.write_sheet(
             wb, item_label, sheet_cfg, flat_rows))
-        print(f"[{item_label}] {len(flat_rows)} 行")
+        if not external_rows:
+            print(f"[{item_label}] {len(flat_rows)} 行")
 
         # Accounting-identity validation (per fine-grain key — finer = 更严)
         check_rows = [
