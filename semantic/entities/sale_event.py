@@ -17,26 +17,53 @@
 """
 
 
-def sale_event_cte(dine_excludes=None, takeout_excludes=None) -> str:
+from semantic.dimensions.test_business import (
+    dine_test_business_clause,
+    takeout_test_business_clause,
+)
+
+
+def sale_event_cte(dine_excludes=None, takeout_excludes=None,
+                   exclude_test_business: bool = False,
+                   with_business_date: bool = False) -> str:
     """Returns `sale_event AS (...)` body. Same占位符 ({project}/{dataset}/{start_ts}/{end_ts})
     as sale_line/takeout_line — drop-in compatible with engine.query().
 
     dine_excludes: set[int] of ttpos_statistics_product.sale_order_uuid to drop
     takeout_excludes: set[int] of ttpos_takeout_order.uuid to drop
+    exclude_test_business: True 时对齐 ttpos 后台口径排除「测试营业时段」内的订单。
+    with_business_date: True 时多加一列 business_date (DATE, BKK 时区) 并加入 GROUP BY,
+        让上层报表能按日聚合 (e.g. 每日趋势 / 环比). 默认 False 保持向后兼容.
     """
+    bd_select_dine = (
+        "    DATE(TIMESTAMP_SECONDS(sp.complete_time), 'Asia/Bangkok') AS business_date,\n"
+        if with_business_date else ""
+    )
+    bd_select_takeout = (
+        "    DATE(TIMESTAMP_SECONDS(IF(t.order_state = 40, t.completed_time, t.accepted_time)),"
+        " 'Asia/Bangkok') AS business_date,\n"
+        if with_business_date else ""
+    )
+    bd_group = ", business_date" if with_business_date else ""
     def _not_in(field: str, ids) -> str:
         if not ids:
             return ""
         return f"    AND {field} NOT IN ({', '.join(str(int(x)) for x in ids)})\n"
     dine_filter = _not_in("sp.sale_order_uuid", dine_excludes)
     takeout_filter = _not_in("t.uuid", takeout_excludes)
+    sb_join = ("""LEFT JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
+    ON sb.uuid = sp.sale_bill_uuid AND sb.delete_time = 0
+  """ if exclude_test_business else "")
+    dine_tb = ("    " + dine_test_business_clause("sb") + "\n") if exclude_test_business else ""
+    takeout_tb = ("    " + takeout_test_business_clause("t") + "\n") if exclude_test_business else ""
     return ("""sale_event AS (
   -- 堂食按 (item, sale_price) 拆 —— 每个不同的价格档单独一行
   SELECT
     sp.product_package_uuid AS item_uuid,
     sp.product_sale_price AS price,
     'dine' AS channel,
-    SUM(sp.product_num) AS qty,
+    'pos' AS sub_channel,
+""" + bd_select_dine + """    SUM(sp.product_num) AS qty,
     -- 营业额：标价 × 销量
     SUM(sp.product_sale_price * sp.product_num) AS sales_price,
     -- 标准金额：商品管理标价 × 销量
@@ -57,11 +84,11 @@ def sale_event_cte(dine_excludes=None, takeout_excludes=None) -> str:
     0 AS cancelled_qty,
     0 AS cancelled_amount
   FROM `{project}`.`{dataset}`.`ttpos_statistics_product` sp
-  LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
+  """ + sb_join + """LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
     ON pp.uuid = sp.product_package_uuid
   WHERE sp.complete_time >= {start_ts}
     AND sp.complete_time < {end_ts}
-""" + dine_filter + """  GROUP BY item_uuid, price
+""" + dine_tb + dine_filter + """  GROUP BY item_uuid, price, sub_channel""" + bd_group + """
 
   UNION ALL
 
@@ -70,7 +97,9 @@ def sale_event_cte(dine_excludes=None, takeout_excludes=None) -> str:
     toi.ttpos_product_package_uuid AS item_uuid,
     toi.price AS price,
     'takeout' AS channel,
-    SUM(toi.quantity) AS qty,
+    -- 外卖子渠道：grab/lineman/shopee/foodpanda/... 或 POS 本地下单 → 'pos_takeout'
+    IFNULL(NULLIF(t.platform, ''), 'pos_takeout') AS sub_channel,
+""" + bd_select_takeout + """    SUM(toi.quantity) AS qty,
     SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) AS sales_price,
     SUM(IF(t.order_state IN (10,20,30,40), IFNULL(pp.price, 0) * toi.quantity, 0)) AS original_amount,
     SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) AS actual_amount,
@@ -98,7 +127,7 @@ def sale_event_cte(dine_excludes=None, takeout_excludes=None) -> str:
       (t.order_state = 40 AND t.completed_time >= {start_ts} AND t.completed_time < {end_ts})
       OR (t.order_state != 40 AND t.accepted_time >= {start_ts} AND t.accepted_time < {end_ts})
     )
-""" + takeout_filter + """  GROUP BY item_uuid, price
+""" + takeout_tb + takeout_filter + """  GROUP BY item_uuid, price, sub_channel""" + bd_group + """
 )""")
 
 
@@ -121,4 +150,4 @@ METRIC_COLUMNS = [
 ]
 
 # Dimension columns naturally available on every sale_event row.
-DIMENSION_COLUMNS = ["item_uuid", "price", "channel"]
+DIMENSION_COLUMNS = ["item_uuid", "price", "channel", "sub_channel"]
