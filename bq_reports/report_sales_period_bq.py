@@ -42,6 +42,7 @@ import xlsxwriter
 from semantic.entities.sale_event import sale_event_cte
 from semantic.validators import check, print_result
 from semantic.validators.identities import DEFAULT_IDENTITIES
+from semantic.reconciliation.checks.ttpos_anchor import TTPOS_NET_SALES_SQL
 
 PROJECT_ID = "diyl-407103"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "exports"
@@ -200,6 +201,92 @@ def query_one_store(client, store_num, store_uuid, start_ts, end_ts):
     except Exception as e:
         log(f"[{store_num}] query FAILED: {e}")
     return rows
+
+
+def query_ttpos_anchor(start_ts, end_ts, store_list, workers=8) -> dict:
+    """跑 ttpos 后台首页营业总览等价 SQL (CountProductSale + CountTakeoutSale.platform_total).
+    返回 {store_num: 营业总览金额} — 用于跟我们 sale_event 的 actual_amount 对账.
+
+    存在意义: 防止未来 ttpos 启用税/服务费/商家折扣后, 我们数字偏离首页营业总览
+    而客户没发现 → 信任崩盘. 这一层是"对账自动监控", 不是数据计算.
+    """
+    setup_proxy()
+    client = bigquery.Client(project=PROJECT_ID, credentials=get_creds())
+    result = {}
+    def _query(sn, su):
+        ds = f"shop{su}"
+        sql = TTPOS_NET_SALES_SQL.format(project=PROJECT_ID, dataset=ds,
+                                          start_ts=start_ts, end_ts=end_ts)
+        try:
+            r = list(client.query(sql).result())[0]
+            return sn, float(r.ttpos_net_sales or 0)
+        except Exception as e:
+            log(f"  [anchor {sn}] FAILED: {e}")
+            return sn, None
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_query, sn, su) for sn, su in store_list]
+        for fut in as_completed(futures):
+            sn, v = fut.result()
+            if v is not None:
+                result[sn] = v
+    return result
+
+
+def write_sheet_anchor(wb, anchor_by_store: dict, rows: list):
+    """Sheet「ttpos 对账锚」: 逐店列 ttpos 营业总览口径 vs 我们 actual_amount.
+    任一店差异 > 0.1% 标红, 0.01-0.1% 标黄, < 0.01% 绿.
+    """
+    ws = wb.add_worksheet("ttpos对账锚")
+    hdr = _header_fmt(wb); money = _money_fmt(wb); title = _title_fmt(wb)
+    pct_fmt = wb.add_format({"num_format": "0.0000%"})
+    green = wb.add_format({"bg_color": "#C6EFCE"})
+    yellow = wb.add_format({"bg_color": "#FFEB9C"})
+    red = wb.add_format({"bg_color": "#FFC7CE", "bold": True})
+
+    ws.merge_range(0, 0, 0, 5, "ttpos 后台营业总览口径 vs 本报表实收对账", title)
+    ws.write(1, 0, "意义: ttpos 后台首页用 CountTakeoutSale (platform_total) 算外卖; "
+                    "本报表用 RankTakeoutProduct (price×qty). 华莱士现状两者一致 = 0 差异; "
+                    "未来启用税/服务费/商家折扣后会偏离, 本表自动监控.")
+    cols = ["门店编号", "ttpos营业总览口径", "本报表实收", "差异", "差异率", "状态"]
+    for i, c in enumerate(cols):
+        ws.write(3, i, c, hdr)
+
+    ours_by_store = {}
+    for r in rows:
+        ours_by_store[r["store_num"]] = ours_by_store.get(r["store_num"], 0) + (r.get("actual_amount") or 0)
+
+    ri = 4
+    tot_a = 0.0; tot_o = 0.0
+    breaches = []
+    for sn in sorted(set(anchor_by_store.keys()) | set(ours_by_store.keys()),
+                     key=lambda s: int(s) if s.isdigit() else 999):
+        a = anchor_by_store.get(sn, 0.0)
+        o = ours_by_store.get(sn, 0.0)
+        diff = a - o
+        rate = (diff / a) if a else 0.0
+        if abs(rate) < 0.0001:   # < 0.01%
+            status, fmt = "✅ 一致", green
+        elif abs(rate) < 0.001:  # < 0.1%
+            status, fmt = "⚠️ 需复核", yellow
+            breaches.append((sn, diff, rate))
+        else:
+            status, fmt = "🔴 必查", red
+            breaches.append((sn, diff, rate))
+        ws.write(ri, 0, sn, fmt)
+        ws.write(ri, 1, a, money); ws.write(ri, 2, o, money)
+        ws.write(ri, 3, diff, money); ws.write(ri, 4, rate, pct_fmt)
+        ws.write(ri, 5, status, fmt)
+        tot_a += a; tot_o += o
+        ri += 1
+    # 总计
+    diff_t = tot_a - tot_o
+    rate_t = (diff_t / tot_a) if tot_a else 0.0
+    ws.write(ri, 0, "TOTAL", _title_fmt(wb))
+    ws.write(ri, 1, tot_a, money); ws.write(ri, 2, tot_o, money)
+    ws.write(ri, 3, diff_t, money); ws.write(ri, 4, rate_t, pct_fmt)
+    ws.write(ri, 5, "✅ 全店一致" if not breaches else f"⚠️ {len(breaches)} 店偏离", _title_fmt(wb))
+    ws.set_column(0, 0, 10); ws.set_column(1, 4, 18); ws.set_column(5, 5, 12)
+    return breaches, diff_t, rate_t
 
 
 def query_all(start_ts, end_ts, store_list, workers=8) -> list:
@@ -517,6 +604,20 @@ def main():
         wb, curr_rows, prev_rows,
         curr_period=f"{sd}~{ed}", prev_period=f"{prev_sd}~{prev_ed}",
     )
+
+    # ttpos 营业总览口径对账锚 — 防止未来口径偏离不被发现
+    log("\n[anchor] 跑 ttpos 营业总览口径对账...")
+    anchor_by_store = query_ttpos_anchor(to_ts(sd), to_ts(ed, end_of_day=True), store_list, workers)
+    breaches, diff_t, rate_t = write_sheet_anchor(wb, anchor_by_store, curr_rows)
+    totals["ttpos对账锚"] = len(anchor_by_store)
+    if breaches:
+        log(f"  ⚠️  {len(breaches)} 店偏离 ttpos 营业总览口径:")
+        for sn, d, r in breaches[:10]:
+            log(f"     店{sn} 差异 {d:>10,.2f}  rate={r*100:.4f}%")
+        log("  排查方向: 是否启用了税/商家服务费/商家折扣? 见 docs/ttpos-algorithms-mirror.md §2.1")
+    else:
+        log(f"  ✅ 全 {len(anchor_by_store)} 店跟 ttpos 营业总览 byte-equal 一致 (差额 {diff_t:,.2f}, {rate_t*100:.4f}%)")
+
     write_meta_sheet(wb, version, sd, ed, prev_sd, prev_ed, totals)
     wb.close()
 
