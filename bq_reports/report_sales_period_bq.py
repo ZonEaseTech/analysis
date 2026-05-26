@@ -90,6 +90,49 @@ METRIC_LABELS = {
 # 渠道展示顺序 (堂食优先, 外卖按平台字母序, pos_takeout 兜底最后)
 SUBCH_PRIORITY = {"pos": 0, "pos_takeout": 99}
 
+# 渠道 / 子渠道中文翻译 — 财务/运营看不懂英文 ID, 报表展示用
+CHANNEL_LABEL = {"dine": "堂食", "takeout": "外卖"}
+SUBCH_LABEL = {
+    "pos": "POS堂食",
+    "pos_takeout": "外卖POS自接",
+    "grab": "Grab", "lineman": "Lineman", "shopee": "Shopee",
+    "foodpanda": "FoodPanda", "robinhood": "Robinhood",
+}
+
+
+def fmt_channel(ch: str) -> str:
+    return CHANNEL_LABEL.get(ch, ch or "")
+
+
+def fmt_subch(sc: str) -> str:
+    return SUBCH_LABEL.get(sc, sc or "")
+
+
+def fetch_store_names(store_list, workers=10) -> dict:
+    """从 BQ ttpos_setting 拉门店名 (权威源, 跟 POS 实时一致).
+    返回 {store_num: store_name}. 任一店查不到不致命, 报表那行显示空字符串.
+    """
+    setup_proxy()
+    client = bigquery.Client(project=PROJECT_ID, credentials=get_creds())
+    mapping = {}
+    def _q(sn, su):
+        sql = (f"SELECT JSON_VALUE(values, '$.name') AS name "
+               f"FROM `{PROJECT_ID}.shop{su}.ttpos_setting` "
+               f"WHERE key='store' AND delete_time=0 LIMIT 1")
+        try:
+            for r in client.query(sql).result():
+                if r.name:
+                    return sn, str(r.name).strip()
+        except Exception:
+            pass
+        return sn, ""
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for f in as_completed([ex.submit(_q, sn, su) for sn, su in store_list]):
+            sn, name = f.result()
+            if name:
+                mapping[sn] = name
+    return mapping
+
 
 def log(msg: str):
     print(msg, flush=True)
@@ -351,41 +394,77 @@ def _title_fmt(wb):
     return wb.add_format({"bold": True, "font_size": 12, "bg_color": "#FFF2CC"})
 
 
-def write_sheet1_period_long(wb, rows):
-    """Sheet 1: 区间汇总-长表, 行=商品×门店×渠道×子渠道."""
+def write_sheet1_period_long(wb, rows, store_names: dict):
+    """Sheet 1: 区间汇总-长表, 行=商品×门店×渠道×子渠道, 含门店小计 + 总计."""
     ws = wb.add_worksheet("区间汇总-长表")
     hdr = _header_fmt(wb); money = _money_fmt(wb); int_f = _int_fmt(wb)
-    cols = ["门店编号", "商品名", "item_uuid", "渠道", "子渠道"] + [METRIC_LABELS[m] for m in METRICS]
+    sub = wb.add_format({"bold": True, "bg_color": "#FFF2CC", "num_format": "#,##0.00"})
+    sub_i = wb.add_format({"bold": True, "bg_color": "#FFF2CC", "num_format": "#,##0"})
+    gtotal = wb.add_format({"bold": True, "bg_color": "#D9E1F2", "num_format": "#,##0.00", "border": 1})
+    gtotal_i = wb.add_format({"bold": True, "bg_color": "#D9E1F2", "num_format": "#,##0", "border": 1})
+
+    cols = ["门店编号", "门店名", "商品名", "item_uuid", "渠道", "子渠道"] + [METRIC_LABELS[m] for m in METRICS]
     for i, c in enumerate(cols):
         ws.write(0, i, c, hdr)
     agg = aggregate(rows, ["store_num", "item_uuid", "channel", "sub_channel"])
-    agg.sort(key=lambda r: (r["store_num"], r["item_name"] or "", r["channel"], r["sub_channel"]))
-    for ri, r in enumerate(agg, start=1):
+    agg.sort(key=lambda r: (int(r["store_num"]) if r["store_num"].isdigit() else 999,
+                              r["item_name"] or "", r["channel"], r["sub_channel"]))
+    ri = 1
+    grand = {m: 0.0 for m in METRICS}
+    store_agg = {m: 0.0 for m in METRICS}
+    cur_store = None
+    def _flush_store_subtotal(target_row, sn):
+        ws.write(target_row, 0, f"{sn} 小计", sub)
+        ws.write(target_row, 1, store_names.get(sn, ""), sub)
+        ws.write(target_row, 2, "", sub); ws.write(target_row, 3, "", sub)
+        ws.write(target_row, 4, "", sub); ws.write(target_row, 5, "", sub)
+        for ci, m in enumerate(METRICS, start=6):
+            ws.write(target_row, ci, store_agg[m], sub_i if m.endswith("_qty") else sub)
+    for r in agg:
+        if cur_store is not None and r["store_num"] != cur_store:
+            _flush_store_subtotal(ri, cur_store)
+            ri += 1
+            store_agg = {m: 0.0 for m in METRICS}
+        cur_store = r["store_num"]
         ws.write(ri, 0, r["store_num"])
-        ws.write(ri, 1, r.get("item_name", "") or "")
-        ws.write(ri, 2, str(r["item_uuid"]))
-        ws.write(ri, 3, r["channel"])
-        ws.write(ri, 4, r["sub_channel"])
-        for ci, m in enumerate(METRICS, start=5):
+        ws.write(ri, 1, store_names.get(r["store_num"], ""))
+        ws.write(ri, 2, r.get("item_name", "") or "")
+        ws.write(ri, 3, str(r["item_uuid"]))
+        ws.write(ri, 4, fmt_channel(r["channel"]))
+        ws.write(ri, 5, fmt_subch(r["sub_channel"]))
+        for ci, m in enumerate(METRICS, start=6):
             fmt = int_f if m.endswith("_qty") else money
-            ws.write(ri, ci, r.get(m, 0), fmt)
-    ws.freeze_panes(1, 5)
-    ws.set_column(0, 0, 8); ws.set_column(1, 1, 30); ws.set_column(2, 2, 18)
-    ws.set_column(3, 4, 10); ws.set_column(5, 4 + len(METRICS), 14)
+            v = r.get(m, 0) or 0
+            ws.write(ri, ci, v, fmt)
+            grand[m] += v; store_agg[m] += v
+        ri += 1
+    if cur_store is not None:
+        _flush_store_subtotal(ri, cur_store)
+        ri += 1
+    # 总计行
+    ws.write(ri, 0, "总计", gtotal)
+    for ci in range(1, 6): ws.write(ri, ci, "", gtotal)
+    for ci, m in enumerate(METRICS, start=6):
+        ws.write(ri, ci, grand[m], gtotal_i if m.endswith("_qty") else gtotal)
+    ws.freeze_panes(1, 6)
+    ws.set_column(0, 0, 8); ws.set_column(1, 1, 18); ws.set_column(2, 2, 30)
+    ws.set_column(3, 3, 18); ws.set_column(4, 5, 11); ws.set_column(6, 5 + len(METRICS), 14)
     return len(agg)
 
 
-def write_sheet2_store_pivot(wb, rows):
-    """Sheet 2: 单店汇总, 行=门店, 列=子渠道横向展开核心指标."""
+def write_sheet2_store_pivot(wb, rows, store_names: dict):
+    """Sheet 2: 单店汇总, 行=门店, 列=子渠道横向展开核心指标 + 总计行."""
     ws = wb.add_worksheet("单店汇总")
     hdr = _header_fmt(wb); money = _money_fmt(wb); int_f = _int_fmt(wb)
+    gtotal = wb.add_format({"bold": True, "bg_color": "#D9E1F2", "num_format": "#,##0.00", "border": 1})
+    gtotal_i = wb.add_format({"bold": True, "bg_color": "#D9E1F2", "num_format": "#,##0", "border": 1})
+
     subchs = collect_subchannels(rows)
-    # 核心 3 指标横向展开: 销量/营业额/实收
     core_metrics = ["qty", "sales_price", "actual_amount"]
-    cols = ["门店编号"]
+    cols = ["门店编号", "门店名"]
     for sc in subchs:
         for m in core_metrics:
-            cols.append(f"{sc}·{METRIC_LABELS[m]}")
+            cols.append(f"{fmt_subch(sc)}·{METRIC_LABELS[m]}")
     cols += ["总" + METRIC_LABELS[m] for m in core_metrics]
     for i, c in enumerate(cols):
         ws.write(0, i, c, hdr)
@@ -393,60 +472,79 @@ def write_sheet2_store_pivot(wb, rows):
     by_store = {}
     for r in agg:
         by_store.setdefault(r["store_num"], {})[r["sub_channel"]] = r
-    for ri, store_num in enumerate(sorted(by_store.keys()), start=1):
+    grand_pivot = {sc: {m: 0.0 for m in core_metrics} for sc in subchs}
+    grand_total = {m: 0.0 for m in core_metrics}
+    sorted_stores = sorted(by_store.keys(), key=lambda s: int(s) if s.isdigit() else 999)
+    for ri, store_num in enumerate(sorted_stores, start=1):
         ws.write(ri, 0, store_num)
-        ci = 1
+        ws.write(ri, 1, store_names.get(store_num, ""))
+        ci = 2
         totals = {m: 0.0 for m in core_metrics}
         for sc in subchs:
             r = by_store[store_num].get(sc, {})
             for m in core_metrics:
                 v = r.get(m, 0) or 0
-                totals[m] += v
+                totals[m] += v; grand_pivot[sc][m] += v
                 fmt = int_f if m.endswith("_qty") else money
                 ws.write(ri, ci, v, fmt); ci += 1
         for m in core_metrics:
             fmt = int_f if m.endswith("_qty") else money
             ws.write(ri, ci, totals[m], fmt); ci += 1
-    ws.freeze_panes(1, 1)
-    ws.set_column(0, 0, 10); ws.set_column(1, len(cols)-1, 14)
+            grand_total[m] += totals[m]
+    # 总计行
+    ri = len(sorted_stores) + 1
+    ws.write(ri, 0, "总计", gtotal); ws.write(ri, 1, "", gtotal)
+    ci = 2
+    for sc in subchs:
+        for m in core_metrics:
+            ws.write(ri, ci, grand_pivot[sc][m], gtotal_i if m.endswith("_qty") else gtotal); ci += 1
+    for m in core_metrics:
+        ws.write(ri, ci, grand_total[m], gtotal_i if m.endswith("_qty") else gtotal); ci += 1
+    ws.freeze_panes(1, 2)
+    ws.set_column(0, 0, 10); ws.set_column(1, 1, 18); ws.set_column(2, len(cols)-1, 14)
     return len(by_store)
 
 
-def write_sheet3_daily(wb, rows):
-    """Sheet 3: 每日明细, 行=日期×商品×门店×渠道×子渠道."""
+def write_sheet3_daily(wb, rows, store_names: dict):
+    """Sheet 3: 每日明细, 行=日期×商品×门店×渠道×子渠道 (不加小计, 行数太多)."""
     ws = wb.add_worksheet("每日明细")
     hdr = _header_fmt(wb); money = _money_fmt(wb); int_f = _int_fmt(wb)
-    cols = ["日期", "门店编号", "商品名", "item_uuid", "渠道", "子渠道"] + [METRIC_LABELS[m] for m in METRICS]
+    cols = ["日期", "门店编号", "门店名", "商品名", "item_uuid", "渠道", "子渠道"] + [METRIC_LABELS[m] for m in METRICS]
     for i, c in enumerate(cols):
         ws.write(0, i, c, hdr)
     agg = aggregate(rows, ["business_date", "store_num", "item_uuid", "channel", "sub_channel"])
-    agg.sort(key=lambda r: (r["business_date"], r["store_num"], r["item_name"] or "", r["channel"], r["sub_channel"]))
+    agg.sort(key=lambda r: (r["business_date"],
+                              int(r["store_num"]) if r["store_num"].isdigit() else 999,
+                              r["item_name"] or "", r["channel"], r["sub_channel"]))
     for ri, r in enumerate(agg, start=1):
         ws.write(ri, 0, r["business_date"])
         ws.write(ri, 1, r["store_num"])
-        ws.write(ri, 2, r.get("item_name", "") or "")
-        ws.write(ri, 3, str(r["item_uuid"]))
-        ws.write(ri, 4, r["channel"])
-        ws.write(ri, 5, r["sub_channel"])
-        for ci, m in enumerate(METRICS, start=6):
+        ws.write(ri, 2, store_names.get(r["store_num"], ""))
+        ws.write(ri, 3, r.get("item_name", "") or "")
+        ws.write(ri, 4, str(r["item_uuid"]))
+        ws.write(ri, 5, fmt_channel(r["channel"]))
+        ws.write(ri, 6, fmt_subch(r["sub_channel"]))
+        for ci, m in enumerate(METRICS, start=7):
             fmt = int_f if m.endswith("_qty") else money
             ws.write(ri, ci, r.get(m, 0), fmt)
-    ws.freeze_panes(1, 6)
-    ws.set_column(0, 0, 12); ws.set_column(1, 1, 8); ws.set_column(2, 2, 30)
-    ws.set_column(3, 3, 18); ws.set_column(4, 5, 10); ws.set_column(6, 5+len(METRICS), 14)
+    ws.freeze_panes(1, 7)
+    ws.set_column(0, 0, 12); ws.set_column(1, 1, 8); ws.set_column(2, 2, 18)
+    ws.set_column(3, 3, 30); ws.set_column(4, 4, 18); ws.set_column(5, 6, 11)
+    ws.set_column(7, 6 + len(METRICS), 14)
     return len(agg)
 
 
-def write_sheet4_variance(wb, curr_rows, prev_rows, curr_period, prev_period):
-    """Sheet 4: 环比分析 — 当期 vs 前推等长区间.
-
-    grain = 商品×门店×渠道×子渠道. 计算 当期/上期 + 总差异 + 量差 + 价差.
-    """
+def write_sheet4_variance(wb, curr_rows, prev_rows, curr_period, prev_period, store_names: dict):
+    """Sheet 4: 环比分析 — 当期 vs 前推等长区间. 加门店名 + 行类型 (新品/停售/同期对比)."""
     ws = wb.add_worksheet("环比分析")
     hdr = _header_fmt(wb); money = _money_fmt(wb); int_f = _int_fmt(wb); title = _title_fmt(wb)
-    ws.merge_range(0, 0, 0, 8, f"环比: 当期 {curr_period} vs 上期 {prev_period}", title)
+    pct_fmt = wb.add_format({"num_format": "0.00%"})
+    new_f = wb.add_format({"bg_color": "#E2EFDA"})  # 绿: 新品
+    gone_f = wb.add_format({"bg_color": "#FCE4D6"})  # 橙: 停售
+
+    ws.merge_range(0, 0, 0, 12, f"环比: 当期 {curr_period} vs 上期 {prev_period}", title)
     cols = [
-        "门店编号", "商品名", "渠道", "子渠道",
+        "门店编号", "门店名", "商品名", "渠道", "子渠道", "行类型",
         "当期销量", "上期销量", "当期营业额", "上期营业额",
         "总差异", "量差", "价差", "差异占比",
     ]
@@ -461,66 +559,117 @@ def write_sheet4_variance(wb, curr_rows, prev_rows, curr_period, prev_period):
             m[k] = r
         return m
 
-    curr_map = keymap(curr_rows)
-    prev_map = keymap(prev_rows)
-    all_keys = sorted(set(curr_map.keys()) | set(prev_map.keys()))
+    curr_map = keymap(curr_rows); prev_map = keymap(prev_rows)
+    all_keys = sorted(set(curr_map.keys()) | set(prev_map.keys()),
+                      key=lambda k: (int(k[0]) if k[0].isdigit() else 999, k[1], k[2], k[3]))
 
     ri = 2
     for k in all_keys:
-        cur = curr_map.get(k, {})
-        prv = prev_map.get(k, {})
+        cur = curr_map.get(k, {}); prv = prev_map.get(k, {})
         item_name = cur.get("item_name") or prv.get("item_name") or ""
-        cq = cur.get("qty", 0) or 0
-        pq = prv.get("qty", 0) or 0
-        cr = cur.get("sales_price", 0) or 0
-        pr = prv.get("sales_price", 0) or 0
+        cq = cur.get("qty", 0) or 0; pq = prv.get("qty", 0) or 0
+        cr = cur.get("sales_price", 0) or 0; pr = prv.get("sales_price", 0) or 0
+        # 行类型 + 整行底色
+        if pq == 0 and cq > 0:
+            row_type = "🆕 新品"; row_fmt = new_f
+        elif cq == 0 and pq > 0:
+            row_type = "❌ 停售"; row_fmt = gone_f
+        else:
+            row_type = "同期对比"; row_fmt = None
         total_diff = cr - pr
-        # 量差 = ΔQ × 上期均价；价差 = ΔP × 当期销量 (剩余)
         prev_avg_price = (pr / pq) if pq else 0
         volume_var = (cq - pq) * prev_avg_price
         price_var = total_diff - volume_var
         pct = (total_diff / pr) if pr else None
-        ws.write(ri, 0, k[0])
-        ws.write(ri, 1, item_name)
-        ws.write(ri, 2, k[2])
-        ws.write(ri, 3, k[3])
-        ws.write(ri, 4, cq, int_f); ws.write(ri, 5, pq, int_f)
-        ws.write(ri, 6, cr, money); ws.write(ri, 7, pr, money)
-        ws.write(ri, 8, total_diff, money)
-        ws.write(ri, 9, volume_var, money)
-        ws.write(ri, 10, price_var, money)
+
+        def W(col, val, fmt=None):
+            if row_fmt and fmt is None:
+                ws.write(ri, col, val, row_fmt)
+            elif fmt is not None:
+                ws.write(ri, col, val, fmt)
+            else:
+                ws.write(ri, col, val)
+        W(0, k[0]); W(1, store_names.get(k[0], "")); W(2, item_name)
+        W(3, fmt_channel(k[2])); W(4, fmt_subch(k[3])); W(5, row_type)
+        W(6, cq, int_f); W(7, pq, int_f)
+        W(8, cr, money); W(9, pr, money)
+        W(10, total_diff, money); W(11, volume_var, money); W(12, price_var, money)
         if pct is not None:
-            ws.write(ri, 11, pct, wb.add_format({"num_format": "0.00%"}))
+            W(13, pct, pct_fmt)
         ri += 1
-    ws.freeze_panes(2, 4)
-    ws.set_column(0, 0, 8); ws.set_column(1, 1, 30); ws.set_column(2, 3, 10)
-    ws.set_column(4, 11, 14)
+    ws.freeze_panes(2, 6)
+    ws.set_column(0, 0, 8); ws.set_column(1, 1, 18); ws.set_column(2, 2, 30)
+    ws.set_column(3, 4, 11); ws.set_column(5, 5, 11); ws.set_column(6, 13, 14)
     return ri - 2
 
 
 def write_meta_sheet(wb, version: int, start, end, prev_start, prev_end, totals: dict):
     ws = wb.add_worksheet("说明")
-    bold_red = wb.add_format({"bold": True, "font_color": "red", "font_size": 14})
-    ws.write(0, 0, f"区间销售对账报表 — 内部版本 v{version}", bold_red)
-    ws.write(2, 0, "当期区间"); ws.write(2, 1, f"{start} ~ {end}")
-    ws.write(3, 0, "上期区间"); ws.write(3, 1, f"{prev_start} ~ {prev_end}")
-    ws.write(4, 0, "生成时间"); ws.write(4, 1, datetime.now().isoformat(timespec="seconds"))
-    ws.write(6, 0, "Sheet 行数统计:")
-    r = 7
+    title = wb.add_format({"bold": True, "font_color": "red", "font_size": 14})
+    section = wb.add_format({"bold": True, "bg_color": "#FFF2CC", "font_size": 11})
+    label = wb.add_format({"bold": True})
+    wrap = wb.add_format({"text_wrap": True, "valign": "top"})
+
+    ws.write(0, 0, f"区间销售对账报表 — 内部版本 v{version}", title)
+    ws.write(2, 0, "当期区间", label); ws.write(2, 1, f"{start} ~ {end}")
+    ws.write(3, 0, "上期区间", label); ws.write(3, 1, f"{prev_start} ~ {prev_end}")
+    ws.write(4, 0, "生成时间", label); ws.write(4, 1, datetime.now().isoformat(timespec="seconds"))
+
+    r = 6
+    ws.merge_range(r, 0, r, 1, "Sheet 行数统计", section); r += 1
     for k, v in totals.items():
-        ws.write(r, 0, k); ws.write(r, 1, v)
-        r += 1
-    ws.write(r + 1, 0, "口径说明:")
+        ws.write(r, 0, k); ws.write(r, 1, v); r += 1
+
+    r += 1
+    ws.merge_range(r, 0, r, 1, "1. 会计口径声明 (mirror 自 ttpos CountProductSale / RankTakeoutProduct)", section); r += 1
     notes = [
-        "1. sub_channel: 'pos'=堂食 POS, 'pos_takeout'=外卖 POS 本地下单, 其余=外卖平台(grab/lineman/...)",
-        "2. 营业额=标价×销量; 实收金额=ttpos CountProductSale 真实口径 (扣赠送/退款/用成交价)",
-        "3. 外卖无赠送/折扣概念, 对应字段固定 0; 取消单独算 cancelled_*",
-        "4. 环比: 当期 vs 前推等长天数. 量差=ΔQ×上期均价, 价差=总差异-量差",
-        "5. 校验器跑销量+金额恒等式 (DEFAULT_IDENTITIES), 详见 console 日志",
+        ("业务日归属", "按结账时间 (complete_time, BKK 时区) 归属当日. 凌晨订单归当前自然日, 不按业务日切分."),
+        ("退款归属", "退款数/金额按【原订单日】冲减, 不按退款发生日. 跟 ttpos 后台一致."),
+        ("外卖取消", "外卖 order_state=60 取消单独立列 cancelled_* 字段, 不计入正常销售."),
+        ("赠送/免单", "免单(free)/赠送(give)发生时实收金额归零, 但销量正常计."),
+        ("隐藏单", "本报表不排除 hide_bill_time≠0 的隐藏订单. 跟 ttpos 后台「商品销售」一致, 跟「主统计」可能差 1-3%."),
+        ("对账锚监控", "见 sheet「ttpos对账锚」: 自动对比 ttpos 首页营业总览口径与本报表实收. 差异 < 0.01% ✅; 0.01-0.1% ⚠️; > 0.1% 🔴."),
     ]
-    for n in notes:
-        r += 1; ws.write(r, 0, n)
-    ws.set_column(0, 0, 16); ws.set_column(1, 1, 60)
+    for k, v in notes:
+        ws.write(r, 0, k, label); ws.write(r, 1, v, wrap); r += 1
+
+    r += 1
+    ws.merge_range(r, 0, r, 1, "2. 指标含义解释", section); r += 1
+    field_notes = [
+        ("销量 (qty)", "实际下单的总件数 (含赠送/免单/退款/取消, 是『毛销量』)."),
+        ("营业额 (sales_price)", "订单实际标价 × 销量. 含折扣前金额, 不含税."),
+        ("标准金额 (original_amount)", "商品后台标价 × 销量. 临时改价或会员折时跟营业额不同."),
+        ("实收金额 (actual_amount)", "ttpos 真实收款 (赠送归零, 扣退款, 用成交价). 这是进账的钱."),
+        ("退单数/退单金额", "已结账后退款的件数/金额 (按原订单日)."),
+        ("免单数/免单金额 (free)", "整单免单 - 销量正常计, 实收为 0."),
+        ("赠送数/赠送金额 (give)", "单品赠送 - 销量正常计, 实收为 0."),
+        ("折扣金额 (discount)", "实际成交价低于标价的差额 (营业额 - 实收 - 退款 - 免单 - 赠送)."),
+        ("取消数/取消金额 (cancelled)", "外卖 state=60 取消单. 堂食固定为 0."),
+    ]
+    for k, v in field_notes:
+        ws.write(r, 0, k, label); ws.write(r, 1, v, wrap); r += 1
+
+    r += 1
+    ws.merge_range(r, 0, r, 1, "3. 渠道/子渠道说明", section); r += 1
+    ch_notes = [
+        ("堂食 (dine)", "POS 收银台直接结账的订单. 子渠道固定为『POS堂食』."),
+        ("外卖 (takeout)", "外卖订单. 按平台拆分: Grab / Lineman / Shopee / FoodPanda / 外卖POS自接(平台为空, 是 POS 上手动开的外卖单)."),
+    ]
+    for k, v in ch_notes:
+        ws.write(r, 0, k, label); ws.write(r, 1, v, wrap); r += 1
+
+    r += 1
+    ws.merge_range(r, 0, r, 1, "4. 校验器", section); r += 1
+    ws.write(r, 0, "销量恒等式", label)
+    ws.write(r, 1, "qty = (qty - 免 - 赠 - 退 - 取消) + 免 + 赠 + 退 + 取消", wrap); r += 1
+    ws.write(r, 0, "金额恒等式", label)
+    ws.write(r, 1, "营业额 = 实收 + 退单金额 + 免单金额 + 赠送金额 + 折扣金额", wrap); r += 1
+    ws.write(r, 0, "对账锚", label)
+    ws.write(r, 1, "ttpos 营业总览口径 ≈ 本报表实收 (华莱士现状 byte-equal)", wrap); r += 1
+
+    ws.set_column(0, 0, 20); ws.set_column(1, 1, 90)
+    for row_i in range(6, r):
+        ws.set_row(row_i, 32)
 
 
 def run_validators(rows, label: str):
@@ -577,6 +726,10 @@ def main():
         store_list = [(sn, su) for sn, su in store_list if sn.lstrip("0") in wanted]
         log(f"门店过滤: {len(store_list)} 家")
 
+    log("\n[0/2] 查门店名 (BQ ttpos_setting 权威源)...")
+    store_names = fetch_store_names(store_list, workers)
+    log(f"  拿到 {len(store_names)}/{len(store_list)} 家店名")
+
     log("\n[1/2] 查当期数据...")
     curr_rows = query_all(to_ts(sd), to_ts(ed, end_of_day=True), store_list, workers)
     log(f"\n[2/2] 查上期数据 (用于环比)...")
@@ -597,12 +750,13 @@ def main():
 
     wb = xlsxwriter.Workbook(out_path)
     totals = {}
-    totals["区间汇总-长表"] = write_sheet1_period_long(wb, curr_rows)
-    totals["单店汇总"] = write_sheet2_store_pivot(wb, curr_rows)
-    totals["每日明细"] = write_sheet3_daily(wb, curr_rows)
+    totals["区间汇总-长表"] = write_sheet1_period_long(wb, curr_rows, store_names)
+    totals["单店汇总"] = write_sheet2_store_pivot(wb, curr_rows, store_names)
+    totals["每日明细"] = write_sheet3_daily(wb, curr_rows, store_names)
     totals["环比分析"] = write_sheet4_variance(
         wb, curr_rows, prev_rows,
         curr_period=f"{sd}~{ed}", prev_period=f"{prev_sd}~{prev_ed}",
+        store_names=store_names,
     )
 
     # ttpos 营业总览口径对账锚 — 防止未来口径偏离不被发现
