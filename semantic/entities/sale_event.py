@@ -84,7 +84,11 @@ def sale_event_cte(dine_excludes=None, takeout_excludes=None,
     0 AS cancelled_qty,
     0 AS cancelled_amount
   FROM `{project}`.`{dataset}`.`ttpos_statistics_product` sp
-  """ + sb_join + """LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
+  """ + sb_join + """LEFT JOIN (
+    SELECT uuid, ANY_VALUE(price) AS price
+    FROM `{project}`.`{dataset}`.`ttpos_product_package`
+    GROUP BY uuid
+  ) pp
     ON pp.uuid = sp.product_package_uuid
   WHERE sp.complete_time >= {start_ts}
     AND sp.complete_time < {end_ts}
@@ -117,7 +121,11 @@ def sale_event_cte(dine_excludes=None, takeout_excludes=None,
   FROM `{project}`.`{dataset}`.`ttpos_takeout_order_item` toi
   JOIN `{project}`.`{dataset}`.`ttpos_takeout_order` t
     ON t.uuid = toi.takeout_order_uuid AND t.delete_time = 0
-  LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
+  LEFT JOIN (
+    SELECT uuid, ANY_VALUE(price) AS price
+    FROM `{project}`.`{dataset}`.`ttpos_product_package`
+    GROUP BY uuid
+  ) pp
     ON pp.uuid = toi.ttpos_product_package_uuid
   WHERE toi.delete_time = 0
     AND toi.ttpos_product_package_uuid > 0
