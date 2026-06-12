@@ -1553,6 +1553,10 @@ def main():
         print(f"\n[Test Business] 排除测试营业时段, 影响 {len(tb_stores)} 店")
 
     watermarked = False  # 多 mode 循环只打一次水印
+    from semantic.validators.gate import (
+        add_watermark_sheet_xlsxwriter, validate_and_gate)
+    from semantic.validators.identities import FULL_IDENTITIES
+
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = COMBO_ORDERS_SQL if mode == "combo" else SINGLE_ORDERS_SQL
@@ -1611,10 +1615,6 @@ def main():
         # 零容差闸门: 校验恒等式 + 来源完整性 + 业务合理性 (FULL_IDENTITIES)
         # agg_data 已带 bom_source / price_source (P2 annotation)
         # 闸门在 wb.close() 前执行 — 有 MUST_FIX 且无 --force 则 exit(2), 不落盘
-        from semantic.validators.gate import (
-            add_watermark_sheet_xlsxwriter, validate_and_gate)
-        from semantic.validators.identities import FULL_IDENTITIES
-
         check_rows = [
             {"store_num": store_num, "item_name": item_name, **data}
             for (store_num, _store_name, _uuid, item_name), data

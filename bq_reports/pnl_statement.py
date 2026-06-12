@@ -64,7 +64,7 @@ SELECT
     '未知'
   ), r'^\\s+|\\s+$', '') AS item_name,
   IFNULL(pp.product_type, 0) AS product_type,
-  se.price, se.channel, se.qty, se.sales_price, se.original_amount, se.actual_amount,
+  se.price, se.channel, se.qty, se.sales_price, se.gross_amount, se.original_amount, se.actual_amount,
   se.refund_qty, se.refund_amount, se.free_qty, se.give_qty,
   se.free_amount, se.give_amount, se.discount_amount,
   se.cancelled_qty, se.cancelled_amount

@@ -660,6 +660,10 @@ def main() -> int:
               f"高置信 {ext_matched:,.0f} ({ext_matched/ext_rev_total*100:.1f}%)")
 
     watermarked = False  # 多 mode 循环只打一次水印
+    from semantic.validators.gate import (
+        add_watermark_sheet_xlsxwriter, validate_and_gate)
+    from semantic.validators.identities import FULL_IDENTITIES
+
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = combo_sql_t if mode == "combo" else single_sql_t
@@ -736,9 +740,6 @@ def main() -> int:
         # 零容差闸门: 校验恒等式 + sanity (FULL_IDENTITIES)
         # fine-grain (店, SKU, price) 粒度检查 — 更严
         # 闸门在 wb.close() 前执行 — 有 MUST_FIX 且无 --force 则 exit(2), 不落盘
-        from semantic.validators.gate import (
-            add_watermark_sheet_xlsxwriter, validate_and_gate)
-
         check_rows = [
             {
                 "store_num": k[0], "item_name": k[3], "price": k[4],
