@@ -13,17 +13,30 @@ Returns 4 chained CTEs comma-separated (no trailing comma):
   price_top3           ← pivots ranks 1-3 + sums rank>3 into other_qty
 """
 
+from semantic.dimensions.test_business import (
+    dine_test_business_clause,
+    takeout_test_business_clause,
+)
 
-def price_top3_ctes() -> str:
-    """Returns 4 CTEs joined by commas; caller adds the outer comma/`WITH`."""
+
+def price_top3_ctes(exclude_test_business: bool = False) -> str:
+    """Returns 4 CTEs joined by commas; caller adds the outer comma/`WITH`.
+
+    exclude_test_business=True 时排除测试营业时段订单 (对齐 ttpos 后台口径)。
+    """
+    sb_join = ("""LEFT JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
+    ON sb.uuid = sp.sale_bill_uuid AND sb.delete_time = 0
+  """ if exclude_test_business else "")
+    dine_tb = ("\n    " + dine_test_business_clause("sb")) if exclude_test_business else ""
+    takeout_tb = ("\n    " + takeout_test_business_clause("t")) if exclude_test_business else ""
     return """price_breakdown_raw AS (
   SELECT
     sp.product_package_uuid AS item_uuid,
     sp.product_sale_price AS price,
     sp.product_num AS qty
   FROM `{project}`.`{dataset}`.`ttpos_statistics_product` sp
-  WHERE sp.complete_time >= {start_ts}
-    AND sp.complete_time < {end_ts}
+  """ + sb_join + """WHERE sp.complete_time >= {start_ts}
+    AND sp.complete_time < {end_ts}""" + dine_tb + """
   UNION ALL
   -- 外卖端：排除 state=60 取消订单（让价格档加总能跟营业额对账；取消数另列展示）
   SELECT
@@ -40,7 +53,7 @@ def price_top3_ctes() -> str:
     AND (
       (t.order_state = 40 AND t.completed_time >= {start_ts} AND t.completed_time < {end_ts})
       OR (t.order_state != 40 AND t.accepted_time >= {start_ts} AND t.accepted_time < {end_ts})
-    )
+    )""" + takeout_tb + """
 ),
 price_breakdown AS (
   SELECT item_uuid, price, SUM(qty) AS qty

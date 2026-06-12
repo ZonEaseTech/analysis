@@ -21,10 +21,22 @@ Returned fields per item_uuid:
   cancelled_amount   ── 堂食固定 0（POS 直接成交，无取消单概念）
 """
 
+from semantic.dimensions.test_business import dine_test_business_clause
 
-def shop_sales_cte() -> str:
+
+def shop_sales_cte(exclude_test_business: bool = False) -> str:
     """Returns `shop_sales AS (...)` body with {project}/{dataset}/{start_ts}/{end_ts}
-    placeholders intact for downstream `.format()` per shop."""
+    placeholders intact for downstream `.format()` per shop.
+
+    exclude_test_business=True 时多 JOIN ttpos_sale_bill 并加 NOT EXISTS 排除
+    sale_bill.create_time 落在 ttpos_business_status_period 区间内的记录
+    (对齐 ttpos 后台 ExcludeTestBusinessByBillSQL 口径)。仅对店启用了测试营业开关
+    的 dataset 传 True; 普通店传 False 避免无谓 JOIN。
+    """
+    sb_join = """LEFT JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
+    ON sb.uuid = sp.sale_bill_uuid AND sb.delete_time = 0
+  """ if exclude_test_business else ""
+    tb_clause = ("\n    " + dine_test_business_clause("sb")) if exclude_test_business else ""
     return """shop_sales AS (
   -- ttpos 源码: ttpos-server-go/main/app/repository/statistics.go:1980-2046 (CountProductSale - ExportProductSales 接口真实算法)
   --   GET /statistics/product_sales/export 路由 → service/business.go:845 ExportProductSales
@@ -56,9 +68,9 @@ def shop_sales_cte() -> str:
     0 AS cancelled_qty,
     0 AS cancelled_amount
   FROM `{project}`.`{dataset}`.`ttpos_statistics_product` sp
-  LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
+  """ + sb_join + """LEFT JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
     ON pp.uuid = sp.product_package_uuid
   WHERE sp.complete_time >= {start_ts}
-    AND sp.complete_time < {end_ts}
+    AND sp.complete_time < {end_ts}""" + tb_clause + """
   GROUP BY sp.product_package_uuid
 )"""

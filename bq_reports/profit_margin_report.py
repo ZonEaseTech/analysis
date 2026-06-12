@@ -537,14 +537,19 @@ def _load_merchants(config: dict, store_names: dict, override_path: str = None,
 # because the outer f-string only resolves its own `{…}` expressions). The final
 # `{{product_type}}` is escaped to a literal `{product_type}` so engine.query()
 # can still substitute it per-call via `.replace()` below.
-_PROFIT_SALES_TPL = f"""
+def _build_profit_sales_tpl(exclude_test_business: bool = False) -> str:
+    """生成 profit margin 主 SQL 模板。exclude_test_business=True 对齐 ttpos 后台口径。"""
+    return f"""
 WITH
 -- 价格拆分：取前3个主要价格档（按销量降序），其余归到"其他"
 -- 必须同时覆盖堂食 + 外卖，否则销量/营业额拆分对不上下游 shop_sales+takeout_sales 合并值
-{price_breakdown.price_top3_ctes()},
-{sale_line.shop_sales_cte()},
-{takeout_line.takeout_sales_cte()},
-{total_line.merged_cte()}
+{price_breakdown.price_top3_ctes(exclude_test_business=exclude_test_business)},
+{sale_line.shop_sales_cte(exclude_test_business=exclude_test_business)},
+{takeout_line.takeout_sales_cte(exclude_test_business=exclude_test_business)},
+{total_line.merged_cte()}{_PROFIT_SALES_BODY}"""
+
+
+_PROFIT_SALES_BODY = """
 SELECT
   m.item_uuid,
   -- 部分商品名末尾带回车/换行/制表符等不可见字符（前端 trim 显示无异，但 BQ 取出来会带）
@@ -584,14 +589,19 @@ FROM merged m
 LEFT JOIN price_top3 p3 ON p3.item_uuid = m.item_uuid
 -- ttpos 导出用 LEFT JOIN，不过滤 pp.delete_time（已删除的商品也算销售）
 -- 但本报表必须按 product_type 区分套餐/单品 sheet，所以仍 INNER JOIN，去掉 delete_time 过滤
-JOIN `{{project}}`.`{{dataset}}`.`ttpos_product_package` pp
+JOIN `{project}`.`{dataset}`.`ttpos_product_package` pp
   ON pp.uuid = m.item_uuid
-WHERE pp.product_type = {{product_type}}
+WHERE pp.product_type = {product_type}
   AND m.qty > 0
 """
 
+_PROFIT_SALES_TPL = _build_profit_sales_tpl(exclude_test_business=False)
+_PROFIT_SALES_TPL_TB = _build_profit_sales_tpl(exclude_test_business=True)
+
 COMBO_ORDERS_SQL = _PROFIT_SALES_TPL.replace("{product_type}", "1")
 SINGLE_ORDERS_SQL = _PROFIT_SALES_TPL.replace("{product_type}", "0")
+COMBO_ORDERS_SQL_TB = _PROFIT_SALES_TPL_TB.replace("{product_type}", "1")
+SINGLE_ORDERS_SQL_TB = _PROFIT_SALES_TPL_TB.replace("{product_type}", "0")
 
 # 产品 BOM + 套餐结构 SQL 真源在 semantic.entities.{bom,combo}
 BOM_SQL = bom.bom_sql()
@@ -1528,11 +1538,23 @@ def main():
     import xlsxwriter
     wb = xlsxwriter.Workbook(str(output_path))
 
+    # 测试营业时段过滤 (对齐 ttpos 后台 ExcludeTestBusinessByBillSQL 口径)
+    from semantic.dimensions.test_business import get_stores_with_test_business
+    tb_stores = get_stores_with_test_business(
+        engine.client, [m[1] for m in merchants])
+    if tb_stores:
+        print(f"\n[Test Business] 排除测试营业时段, 影响 {len(tb_stores)} 店")
+
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = COMBO_ORDERS_SQL if mode == "combo" else SINGLE_ORDERS_SQL
+        sql_template_tb = COMBO_ORDERS_SQL_TB if mode == "combo" else SINGLE_ORDERS_SQL_TB
         print(f"\n========== 开始处理 {item_label} ==========\n")
 
+        sql_factory = (
+            (lambda u: sql_template_tb if u in tb_stores else sql_template)
+            if tb_stores else None
+        )
         # 并发查询聚合后的订单
         raw_rows, errors = engine.query(
             sql_template=sql_template,
@@ -1545,6 +1567,7 @@ def main():
                 "account": acc, "store_num": num, "store_name": name,
             })(),
             label=item_label,
+            sql_template_factory=sql_factory,
         )
 
         # 聚合（订单 + BOM）

@@ -12,9 +12,16 @@ Takeout has no native free/give/refund concept, so those fields are zeroed;
 avg_member_discount defaults to 1.0 (no discount).
 """
 
+from semantic.dimensions.test_business import takeout_test_business_clause
 
-def takeout_sales_cte() -> str:
-    """Returns `takeout_sales AS (...)` body with placeholders intact."""
+
+def takeout_sales_cte(exclude_test_business: bool = False) -> str:
+    """Returns `takeout_sales AS (...)` body with placeholders intact.
+
+    exclude_test_business=True 时加 NOT EXISTS 排除 takeout_order.create_time 落在
+    ttpos_business_status_period 内的记录 (对齐 ttpos 后台口径)。
+    """
+    tb_clause = ("\n    " + takeout_test_business_clause("t")) if exclude_test_business else ""
     return """takeout_sales AS (
   -- ttpos 源码: ttpos-server-go/main/app/repository/statistics_takeout.go:451-502 (RankTakeoutProduct)
   -- 时间过滤是 dynamic time condition: state=40 用 completed_time, 其他用 accepted_time
@@ -52,6 +59,6 @@ def takeout_sales_cte() -> str:
     AND (
       (t.order_state = 40 AND t.completed_time >= {start_ts} AND t.completed_time < {end_ts})
       OR (t.order_state != 40 AND t.accepted_time >= {start_ts} AND t.accepted_time < {end_ts})
-    )
+    )""" + tb_clause + """
   GROUP BY item_uuid
 )"""
