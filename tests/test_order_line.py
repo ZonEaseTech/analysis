@@ -36,6 +36,8 @@ class TestOrderLineCte(unittest.TestCase):
     def test_measures(self):
         self.assertIn("SUM(sop.num) AS voucher_qty", self.sql)
         self.assertIn("SUM(sop.sale_price * sop.num) AS voucher_gross", self.sql)
+        self.assertIn("SUM(sop.total_price) AS voucher_net", self.sql)
+        self.assertIn("SUM(sop.discount_fee) AS voucher_discount", self.sql)
         self.assertIn("GROUP BY item_uuid", self.sql)
 
 

@@ -13,6 +13,8 @@
   - 三表全部过 delete_time = 0 (ttpos 软删约定).
   - voucher_gross 用 sop.sale_price (折前标价) × num, 对齐统计账
     sales_price = product_sale_price × product_num 的折前口径.
+  - sop.status (送厨状态) 不过滤: sb.status=1 已完成账单的商品行定义上已送厨,
+    显式说明此处是有意省略, 非遗漏.
 """
 
 
