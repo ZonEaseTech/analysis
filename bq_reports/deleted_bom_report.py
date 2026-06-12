@@ -296,20 +296,37 @@ def write_excel(combo_rows, single_rows, store_name: str, output_path: str,
     from semantic.validators.identities import (
         make_required_fields_identity, make_unique_key_identity)
 
+    outcomes = []
+
+    # Sheet 1「已删除套餐组成」: 已删除套餐的组成明细 — 空=可能合法(当月无已删除套餐), min_rows=0
+    combo_check_rows = [
+        {"combo_name": r.combo_name or "", "child_name": r.child_name or ""}
+        for r in combo_rows
+    ]
+    outcomes.append(validate_and_gate(
+        combo_check_rows,
+        [make_required_fields_identity(("combo_name", "child_name"), name="已删除套餐组成必填")],
+        force=force, report_name="deleted_bom/combo",
+        row_label=lambda r: f"{r.get('combo_name', '')} / {r.get('child_name', '')}",
+        min_rows=0,  # 空=可能合法(当月无已删除套餐)
+    ))
+
+    # Sheet 2「已删除单品BOM」: 已删除单品及其 BOM 明细 — 空=可能合法(当月无已删除单品), min_rows=0
     uniq_ident, prepare = make_unique_key_identity(
         ("product_name", "material_name"), name="商品+物料主键唯一")
     check_rows = prepare([
         {"product_name": r.product_name or "", "material_name": r.material_name or ""}
         for r in single_rows
     ])
-    outcome = validate_and_gate(
+    outcomes.append(validate_and_gate(
         check_rows,
         [make_required_fields_identity(
             ("product_name",), name="已删除BOM必填字段"),
          uniq_ident],
-        force=force, report_name="deleted_bom_report",
+        force=force, report_name="deleted_bom/single",
         row_label=lambda r: f"{r.get('product_name', '')} / {r.get('material_name', '')}",
-    )
+        min_rows=0,  # 空=可能合法(当月无已删除单品)
+    ))
 
     wb = Workbook()
 
@@ -320,8 +337,9 @@ def write_excel(combo_rows, single_rows, store_name: str, output_path: str,
     ws_single = wb.create_sheet("已删除单品BOM")
     _write_single_sheet(ws_single, single_rows, store_name)
 
-    if outcome.needs_watermark:
-        add_watermark_sheet_openpyxl(wb, outcome.watermark_lines())
+    if any(o.needs_watermark for o in outcomes):
+        first_wm = next(o for o in outcomes if o.needs_watermark)
+        add_watermark_sheet_openpyxl(wb, first_wm.watermark_lines())
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)

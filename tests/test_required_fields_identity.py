@@ -29,6 +29,11 @@ class TestRequiredFields(unittest.TestCase):
         result = check([{"item_name": "汉堡"}], [self.ident])
         self.assertTrue(result.violations)
 
+    def test_whitespace_only_field_must_fix(self):
+        result = check([{"item_name": "汉堡", "material_name": "   "}], [self.ident])
+        self.assertTrue(any(v.severity == Severity.MUST_FIX
+                            for v in result.violations))
+
 
 class TestUniqueKey(unittest.TestCase):
     def test_duplicate_key_fires(self):
