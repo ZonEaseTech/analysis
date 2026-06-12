@@ -53,6 +53,10 @@ def _qty_classify(delta: float, lhs: float) -> Severity:
 
 # ─── The two identities ──────────────────────────────────────────────
 
+# ⚠️ 定义式守卫, 非对账. 报表层的 net_qty 是 `qty − 其他桶` 减法推导的,
+# 本恒等式在这种 row 上代数永真 (见 tests/test_identity_perturbation.py
+# TestSalesQtyIsDefinitional). 它的价值仅剩: 防字段缺失 / schema 漂移.
+# 真实检测力 = CROSS_LEDGER_IDENTITIES (统计账 vs 凭证账互证).
 SALES_QTY_IDENTITY = Identity(
     name="销量恒等式",
     description="qty = net_qty + free_qty + give_qty + refund_qty + cancelled_qty",
@@ -60,6 +64,7 @@ SALES_QTY_IDENTITY = Identity(
     rhs=lambda r: (r["net_qty"] + r["free_qty"] + r["give_qty"]
                    + r["refund_qty"] + r["cancelled_qty"]),
     classify=_qty_classify,
+    fields=("qty", "net_qty", "free_qty", "give_qty", "refund_qty", "cancelled_qty"),
 )
 
 AMOUNT_IDENTITY = Identity(
@@ -67,13 +72,14 @@ AMOUNT_IDENTITY = Identity(
     description=(
         "sales_price = revenue + refund + free + give + discount\n"
         "（cancelled_amount 不参与：ttpos sales_price 已按 state=60 排除，"
-        "取消件价格独立审计）"
+        "取消件价格由 GROSS_AMOUNT_IDENTITY 闭环审计）"
     ),
     lhs=lambda r: r["sales_price"],
     rhs=lambda r: (r["revenue"] + r["refund_amount"]
                    + r["free_amount"] + r["give_amount"]
                    + r["discount_amount"]),
     classify=_money_classify,
+    fields=("sales_price", "revenue", "refund_amount", "free_amount", "give_amount", "discount_amount"),
 )
 
 
