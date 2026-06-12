@@ -256,6 +256,48 @@ SANITY_BAND_IDENTITIES = [
 
 
 # ═══════════════════════════════════════════════════════════════════
+# A1 — Cross-Ledger Identities (跨账本互证: 统计账 vs 凭证账)
+#
+# row 由 semantic/validators/cross_ledger.build_cross_ledger_rows 构建.
+# ⚠️ 独立 bundle, 不进 FULL_IDENTITIES / 不进导出闸门 — 时间语义对齐度
+# (sp.complete_time vs sb.finish_time) 由 2026-05 观察跑实测后才决定升级
+# (spec §11 PR-A 验收线; 决策记录见 docs/audit/2026-06-cross-ledger-baseline.md).
+# ═══════════════════════════════════════════════════════════════════
+
+CROSS_LEDGER_QTY = Identity(
+    name="跨账本销量互证",
+    description="统计账 qty == 凭证账 SUM(num) — 两本账独立写入, 互相可证伪",
+    lhs=lambda r: r["stat_qty"],
+    rhs=lambda r: r["voucher_qty"],
+    classify=lambda d, lhs: (Severity.NEGLIGIBLE if d == 0 else Severity.MUST_FIX),
+    fields=("stat_qty", "voucher_qty"),
+)
+
+CROSS_LEDGER_GROSS = Identity(
+    name="跨账本毛额互证",
+    description="统计账 gross_amount == 凭证账 SUM(sale_price×num) — PR-B 整数化后收零容差",
+    lhs=lambda r: r["stat_gross"],
+    rhs=lambda r: r["voucher_gross"],
+    classify=_money_classify,
+    fields=("stat_gross", "voucher_gross"),
+)
+
+VOUCHER_COVERAGE = Identity(
+    name="凭证账覆盖完整性",
+    description=(
+        "统计账有销量 (stat_qty > 0) 的 (store, item) 必须在凭证账有行.\n"
+        "违反语义是「该数字未经互证」, 不是「数字错了」— console 文案要区分."
+    ),
+    lhs=lambda r: 1.0 if (r["stat_qty"] > 0 and r["voucher_present"] == 0.0) else 0.0,
+    rhs=lambda r: 0.0,
+    classify=_coverage_classify,
+    fields=("stat_qty", "voucher_present"),
+)
+
+CROSS_LEDGER_IDENTITIES = [CROSS_LEDGER_QTY, CROSS_LEDGER_GROSS, VOUCHER_COVERAGE]
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Combined bundles
 # ═══════════════════════════════════════════════════════════════════
 
