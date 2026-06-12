@@ -124,7 +124,7 @@ def classify_money_severity(
     NEGLIGIBLE:   abs < negligible_abs (绝对小, 无条件放过)
                   或 (abs < review_abs 且 rel < negligible_rel) (相对极小且绝对不大)
     MUST_FIX:     rel > fatal_rel, 或 base=0 且 abs >= review_abs (无基数可比的大差额)
-    NEEDS_REVIEW: 其它超过 review 线的
+    NEEDS_REVIEW: 其它超过 review 线的 (abs > review_abs 或 rel > review_rel)
 
     修复记录: 旧版 `abs_d < negligible_abs or rel < negligible_rel` 在 base=0 时
     rel=0.0 恒小于阈值, 任意大差额被放过 (spec §1 问题 5). rel 现在只在
