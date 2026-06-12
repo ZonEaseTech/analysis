@@ -17,6 +17,7 @@ from .core import Identity, Severity, Result, check, print_result
 from . import identities
 from .gate import (
     GateOutcome,
+    GateSpec,
     add_watermark_sheet_openpyxl,
     add_watermark_sheet_xlsxwriter,
     validate_and_gate,
@@ -26,6 +27,7 @@ __all__ = [
     "Identity", "Severity", "Result", "check", "print_result",
     "identities",
     "GateOutcome",
+    "GateSpec",
     "add_watermark_sheet_openpyxl",
     "add_watermark_sheet_xlsxwriter",
     "validate_and_gate",

@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from .core import Identity, Result, Severity, check, print_result
@@ -97,6 +97,25 @@ def add_watermark_sheet_xlsxwriter(workbook, lines: list[str]):
     ws.activate()
     ws.set_first_sheet()
     return ws
+
+
+@dataclass
+class GateSpec:
+    """打包闸门配置, 给集中式写盘层 (bq_exporter) 用 — 脚本声明, exporter 执行.
+
+    build_check_rows: 把 exporter 查到的原始行转成恒等式可读的 check_rows.
+    """
+    identities: list
+    force: bool
+    report_name: str
+    build_check_rows: Callable[[list], list]
+    row_label: Callable[[dict], str] = field(default=staticmethod(lambda r: str(r)))
+
+    def run(self, raw_rows: list) -> GateOutcome:
+        return validate_and_gate(
+            self.build_check_rows(raw_rows), self.identities,
+            force=self.force, report_name=self.report_name,
+            row_label=self.row_label)
 
 
 def add_watermark_sheet_openpyxl(workbook, lines: list[str]):
