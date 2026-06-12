@@ -100,11 +100,12 @@ class MoneySeverityTests(unittest.TestCase):
         self.assertEqual(sev, ReconciliationSeverity.MUST_FIX)
 
     def test_zero_base(self):
-        # base = 0 时 rel=0, 不该崩
+        # base = 0 时 rel 无意义，走纯绝对值判断
         sev = classify_money_severity(abs_delta=10, base=0)
-        # |abs|=10 > 1 negligible_abs; rel=0 < negligible_rel → NEGLIGIBLE
-        # 实现里先判 abs < negligible_abs, 然后 rel; 10 > 1 跳过, rel=0 < 0.0001 → NEGLIGIBLE
-        self.assertEqual(sev, ReconciliationSeverity.NEGLIGIBLE)
+        # |abs|=10 > 1 (negligible_abs) 且 < 100 (review_abs) → NEEDS_REVIEW
+        # 旧版错误地走 rel 路径，rel=0 < negligible_rel 被判 NEGLIGIBLE (spec §1 问题 5)
+        # 修复后必须走 base=0 分支，返回 NEEDS_REVIEW
+        self.assertEqual(sev, ReconciliationSeverity.NEEDS_REVIEW)
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -121,13 +121,24 @@ def classify_money_severity(
 ) -> ReconciliationSeverity:
     """金额对账的通用 severity 分类.
 
-    NEGLIGIBLE:   |abs| < negligible_abs 或 (rel < negligible_rel)
-    MUST_FIX:     rel > fatal_rel
-    NEEDS_REVIEW: 其它
+    NEGLIGIBLE:   abs < negligible_abs (绝对小, 无条件放过)
+                  或 (abs < review_abs 且 rel < negligible_rel) (相对极小且绝对不大)
+    MUST_FIX:     rel > fatal_rel, 或 base=0 且 abs >= review_abs (无基数可比的大差额)
+    NEEDS_REVIEW: 其它超过 review 线的
+
+    修复记录: 旧版 `abs_d < negligible_abs or rel < negligible_rel` 在 base=0 时
+    rel=0.0 恒小于阈值, 任意大差额被放过 (spec §1 问题 5). rel 现在只在
+    base != 0 时有意义; base=0 走纯绝对值判断.
     """
     abs_d = abs(abs_delta)
-    rel = (abs_d / abs(base)) if base else 0.0
-    if abs_d < negligible_abs or rel < negligible_rel:
+    if abs_d < negligible_abs:
+        return ReconciliationSeverity.NEGLIGIBLE
+    if not base:
+        # 无基数: 只能按绝对值判, 大差额必查
+        return (ReconciliationSeverity.MUST_FIX if abs_d >= review_abs
+                else ReconciliationSeverity.NEEDS_REVIEW)
+    rel = abs_d / abs(base)
+    if abs_d < review_abs and rel < negligible_rel:
         return ReconciliationSeverity.NEGLIGIBLE
     if rel > fatal_rel:
         return ReconciliationSeverity.MUST_FIX
