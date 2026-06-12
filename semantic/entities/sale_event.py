@@ -66,6 +66,8 @@ def sale_event_cte(dine_excludes=None, takeout_excludes=None,
 """ + bd_select_dine + """    SUM(sp.product_num) AS qty,
     -- 营业额：标价 × 销量
     SUM(sp.product_sale_price * sp.product_num) AS sales_price,
+    -- 毛额 (守恒闭环锚): 堂食无 state, 与 sales_price 同式
+    SUM(sp.product_sale_price * sp.product_num) AS gross_amount,
     -- 标准金额：商品管理标价 × 销量
     SUM(IFNULL(pp.price, 0) * sp.product_num) AS original_amount,
     -- 实收金额：ttpos CountProductSale 真实口径（赠送归零、扣退款、用成交价）
@@ -105,6 +107,9 @@ def sale_event_cte(dine_excludes=None, takeout_excludes=None,
     IFNULL(NULLIF(t.platform, ''), 'pos_takeout') AS sub_channel,
 """ + bd_select_takeout + """    SUM(toi.quantity) AS qty,
     SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) AS sales_price,
+    -- 毛额: 不分 state 全量. GROSS_AMOUNT 恒等式据此审计 state 枚举完备性 —
+    -- 若 ttpos 新增 state, 金额从 sales_price/cancelled 之间漏掉, 恒等式立刻 fire
+    SUM(toi.price * toi.quantity) AS gross_amount,
     SUM(IF(t.order_state IN (10,20,30,40), IFNULL(pp.price, 0) * toi.quantity, 0)) AS original_amount,
     SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) AS actual_amount,
     0 AS refund_qty,
@@ -144,6 +149,7 @@ def sale_event_cte(dine_excludes=None, takeout_excludes=None,
 METRIC_COLUMNS = [
     "qty",
     "sales_price",
+    "gross_amount",
     "original_amount",
     "actual_amount",
     "refund_qty",

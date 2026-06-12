@@ -9,7 +9,7 @@ import tests._setup  # noqa: F401
 
 from semantic.validators import check
 from semantic.validators.core import Severity
-from semantic.validators.identities import SALES_QTY_IDENTITY, AMOUNT_IDENTITY
+from semantic.validators.identities import SALES_QTY_IDENTITY, AMOUNT_IDENTITY, GROSS_AMOUNT_IDENTITY
 
 
 def _passing_sales_row():
@@ -20,6 +20,7 @@ def _passing_sales_row():
         "sales_price": 1000.0, "revenue": 800.0, "refund_amount": 60.0,
         "free_amount": 50.0, "give_amount": 50.0, "discount_amount": 40.0,
         "cancelled_amount": 30.0,
+        "gross_amount": 1030.0,  # = sales_price(1000) + cancelled_amount(30)
     }
 
 
@@ -35,7 +36,7 @@ MONEY_FIELDS = {
 
 
 class TestIdentityPerturbation(unittest.TestCase):
-    PERTURBABLE = [SALES_QTY_IDENTITY, AMOUNT_IDENTITY]
+    PERTURBABLE = [SALES_QTY_IDENTITY, AMOUNT_IDENTITY, GROSS_AMOUNT_IDENTITY]
 
     def test_identities_declare_fields(self):
         for ident in self.PERTURBABLE:

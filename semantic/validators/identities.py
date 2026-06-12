@@ -83,8 +83,23 @@ AMOUNT_IDENTITY = Identity(
 )
 
 
+GROSS_AMOUNT_IDENTITY = Identity(
+    name="毛额守恒恒等式",
+    description=(
+        "gross_amount = sales_price + cancelled_amount\n"
+        "守恒闭环: 把被金额恒等式排除的取消金额纳入审计 (spec §5 A3). 外卖侧"
+        " gross 不分 state 全量, 本式审计 state 枚举完备性 — ttpos 若新增 state,"
+        " 金额漏桶立刻 fire."
+    ),
+    lhs=lambda r: r["gross_amount"],
+    rhs=lambda r: r["sales_price"] + r["cancelled_amount"],
+    classify=_money_classify,
+    fields=("gross_amount", "sales_price", "cancelled_amount"),
+)
+
+
 # Default bundle for the profit_margin / sku_profit_summary reports.
-DEFAULT_IDENTITIES = [SALES_QTY_IDENTITY, AMOUNT_IDENTITY]
+DEFAULT_IDENTITIES = [SALES_QTY_IDENTITY, AMOUNT_IDENTITY, GROSS_AMOUNT_IDENTITY]
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -23,11 +23,12 @@ from semantic.validators.identities import (
 
 
 def clean_row(**overrides):
-    """A row that satisfies both built-in identities exactly."""
+    """A row that satisfies all built-in identities exactly."""
     row = dict(
         qty=10, net_qty=8, free_qty=1, give_qty=1, refund_qty=0, cancelled_qty=0,
         sales_price=100.0, revenue=80.0, refund_amount=0,
         free_amount=10, give_amount=10, cancelled_amount=0, discount_amount=0,
+        gross_amount=100.0,  # = sales_price(100) + cancelled_amount(0)
     )
     row.update(overrides)
     return row
@@ -124,6 +125,7 @@ class CheckFunctionTests(unittest.TestCase):
             refund_amount=0,
             free_amount=0, give_amount=0, discount_amount=0,
             cancelled_amount=78,
+            gross_amount=78,         # = sales_price(0) + cancelled_amount(78)
         )
         res = check([row], DEFAULT_IDENTITIES)
         self.assertEqual(res.violations, [],
@@ -138,6 +140,7 @@ class CheckFunctionTests(unittest.TestCase):
             revenue=780,             # all active paid
             refund_amount=0, free_amount=0, give_amount=0, discount_amount=0,
             cancelled_amount=78,     # 2 × ¥39
+            gross_amount=858,        # = sales_price(780) + cancelled_amount(78)
         )
         res = check([row], DEFAULT_IDENTITIES)
         self.assertEqual(res.violations, [],
@@ -145,10 +148,10 @@ class CheckFunctionTests(unittest.TestCase):
 
     def test_filter_by_severity(self):
         rows = [
-            clean_row(),                              # clean
-            clean_row(sales_price=101.5),             # money NEEDS_REVIEW
-            clean_row(net_qty=7),                     # qty MUST_FIX
-            clean_row(sales_price=600),               # money MUST_FIX
+            clean_row(),                                                   # clean
+            clean_row(sales_price=101.5, gross_amount=101.5),              # money NEEDS_REVIEW (AMOUNT only)
+            clean_row(net_qty=7),                                          # qty MUST_FIX (SALES_QTY only)
+            clean_row(sales_price=600, gross_amount=600),                  # money MUST_FIX (AMOUNT only)
         ]
         res = check(rows, DEFAULT_IDENTITIES)
         self.assertEqual(len(res.by_severity(Severity.NEEDS_REVIEW)), 1)

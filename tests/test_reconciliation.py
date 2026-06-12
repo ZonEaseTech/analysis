@@ -122,6 +122,7 @@ class InternalConsistencyTests(unittest.TestCase):
             "sales_price": 1000, "revenue": 1000,
             "refund_amount": 0, "free_amount": 0, "give_amount": 0,
             "discount_amount": 0, "cancelled_amount": 0,
+            "gross_amount": 1000,  # = sales_price(1000) + cancelled_amount(0)
         }
 
     def test_clean_rows_no_discrepancies(self):
