@@ -25,6 +25,9 @@ def _passing_sales_row():
 
 QTY_DELTA = 1.0
 MONEY_DELTA = 200.0  # > _MUST_FIX_ABS, 保证穿透 A 阶段容忍带
+# cancelled_amount / gross_amount 是前向条目: GROSS_AMOUNT_IDENTITY (计划 Task 3)
+# 的 fields 会引用它们, 金额路由必须就位. 新增金额恒等式时同步维护本集合 —
+# 路由错了 test_every_field_perturbation_fires 会因扰动量不穿透容忍带而失败.
 MONEY_FIELDS = {
     "sales_price", "revenue", "refund_amount", "free_amount",
     "give_amount", "discount_amount", "cancelled_amount", "gross_amount",
