@@ -1,0 +1,81 @@
+"""结构性覆盖: 报表脚本必须接导出闸门 (CLAUDE.md 第 3 节"无例外"的机制化)。
+
+PENDING 是未接脚本的收缩名单 — 只许删不许加. 新脚本不接闸门, 本测试直接挂.
+"""
+import ast
+import unittest
+from pathlib import Path
+
+import tests._setup  # noqa: F401
+from tests._setup import REPO_ROOT
+
+# 收缩名单: Task 9-11 每接一个脚本删一行. 全空后删除本常量与豁免逻辑.
+PENDING = {
+    # Task 9 (engine 系)
+    "pnl_statement.py",
+    "profit_margin_report.py",
+    "profit_by_price_report.py",
+    "report_sales_period_bq.py",
+    # Task 10 (bq_exporter 系)
+    "report_bom_sales_bq.py",
+    "report_daily_sales_bq.py",
+    "report_material_stats_bq.py",
+    "report_orders_by_nationality_bq.py",
+    "report_sales_consumption_bq.py",
+    # Task 11 (standalone 系)
+    "bom_export_report.py",
+    "deleted_bom_report.py",
+    "deleted_combo_bom_report.py",
+    "deleted_single_bom_report.py",
+    "export_all_menu_bilingual.py",
+    "menu_no_bom_bilingual.py",
+    "menu_no_bom_from_sales.py",
+    "report_daily_item_sales_bq.py",
+    "report_item_sales_weekly_bq.py",
+    "report_sales_simple_bq.py",
+}
+
+
+def _uses_gate(path: Path) -> bool:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and \
+                "semantic.validators" in node.module:
+            if any(a.name in ("validate_and_gate", "gate") for a in node.names):
+                return True
+        if isinstance(node, ast.Name) and node.id == "validate_and_gate":
+            return True
+        if isinstance(node, ast.Attribute) and node.attr == "validate_and_gate":
+            return True
+    return False
+
+
+class TestValidatorCoverage(unittest.TestCase):
+    def _report_scripts(self):
+        return sorted(p for p in (REPO_ROOT / "bq_reports").glob("*.py")
+                      if p.name != "__init__.py")
+
+    def test_inventory_matches(self):
+        """脚本清单变动 (新增/删除) 必须显式过本测试 — 防 PENDING 名单失效."""
+        names = {p.name for p in self._report_scripts()}
+        unknown = PENDING - names
+        self.assertFalse(unknown, f"PENDING 里有不存在的脚本: {unknown}")
+
+    def test_wired_scripts_use_gate(self):
+        for p in self._report_scripts():
+            if p.name in PENDING:
+                continue
+            self.assertTrue(_uses_gate(p),
+                            f"{p.name} 必须接导出闸门 (validate_and_gate) — "
+                            f"CLAUDE.md 第 3 节, 无例外")
+
+    def test_pending_scripts_actually_pending(self):
+        """防名单过期: 已接的脚本必须从 PENDING 删掉."""
+        for p in self._report_scripts():
+            if p.name in PENDING:
+                self.assertFalse(_uses_gate(p),
+                                 f"{p.name} 已接闸门, 从 PENDING 删除它")
+
+
+if __name__ == "__main__":
+    unittest.main()
