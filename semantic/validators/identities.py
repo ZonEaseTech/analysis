@@ -317,8 +317,9 @@ def _capped_review_money(delta: float, lhs: float) -> Severity:
 TAKEOUT_TIEOUT_IDENTITY = Identity(
     name="外卖订单勾稽",
     description=(
-        "platform_total == SUM(toi.price×quantity) + merchant_charge_fee"
-        " + merchant_discount (符号待观察跑校准, 华莱士当前 merchant 字段恒 0).\n"
+        "外卖订单级勾稽. 符号待观察跑校准 — 当前假设:\n"
+        "platform_total == item_sum − merchant_charge_fee − merchant_discount\n"
+        "(华莱士当前 merchant 字段恒 0, 两种符号数值等价; 字段启用时以实测为准).\n"
         "封顶 🟡: 升 MUST_FIX 须等口径校准 (docs/audit/2026-06-cross-ledger-baseline.md)."
     ),
     lhs=lambda r: r["platform_total"],

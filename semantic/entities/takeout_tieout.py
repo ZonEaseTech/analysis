@@ -24,9 +24,9 @@ def takeout_tieout_cte() -> str:
   SELECT
     t.uuid AS order_uuid,
     t.order_state AS order_state,
-    t.platform_total AS platform_total,
-    t.merchant_charge_fee AS merchant_charge_fee,
-    t.merchant_discount AS merchant_discount,
+    IFNULL(t.platform_total, 0) AS platform_total,
+    IFNULL(t.merchant_charge_fee, 0) AS merchant_charge_fee,
+    IFNULL(t.merchant_discount, 0) AS merchant_discount,
     SUM(toi.price * toi.quantity) AS item_sum
   FROM `{project}`.`{dataset}`.`ttpos_takeout_order` t
   JOIN `{project}`.`{dataset}`.`ttpos_takeout_order_item` toi
