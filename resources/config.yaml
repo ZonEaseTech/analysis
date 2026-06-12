@@ -109,7 +109,7 @@ material_price_sources:
 # ───────────────────────────────────────────────
 merchant_list:
   adapter: csv
-  path: "resources/wallace.20260506/华莱士商家56家ID.csv"
+  path: "resources/wallace.20260525/华莱士商家60家ID.csv"
   mapping:
     account: "账号"
     uuid: "商家ID"
