@@ -1103,6 +1103,8 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
             "net_qty": net_qty,
             "revenue": val["revenue"],
             "sales_price": val["sales_price"],
+            # 定义式补齐 (sale_line/takeout_line 未投影 gross_amount), 真校验在 sale_event 报表
+            "gross_amount": val["gross_amount"],
             "original_amount": val["original_amount"],
             "refund_qty": val["refund_qty"],
             "refund_amount": val["refund_amount"],
