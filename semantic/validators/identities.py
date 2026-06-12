@@ -269,7 +269,7 @@ CROSS_LEDGER_QTY = Identity(
     description="统计账 qty == 凭证账 SUM(num) — 两本账独立写入, 互相可证伪",
     lhs=lambda r: r["stat_qty"],
     rhs=lambda r: r["voucher_qty"],
-    classify=lambda d, lhs: (Severity.NEGLIGIBLE if d == 0 else Severity.MUST_FIX),
+    classify=lambda d, lhs: (Severity.NEGLIGIBLE if d == 0 else Severity.MUST_FIX),  # qty 是 int 转 float, 精确相等安全; 若引入小数计量需改判别
     fields=("stat_qty", "voucher_qty"),
 )
 

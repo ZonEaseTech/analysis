@@ -40,6 +40,15 @@ class TestBuildCrossLedgerRows(unittest.TestCase):
         by_store = {r["store_num"]: r for r in rows}
         self.assertEqual(by_store["002"]["voucher_qty"], 5.0)
 
+    def test_voucher_only_orphan_emitted(self):
+        """凭证账有行而统计账没有 = 统计侧丢写入 — 必须产出孤儿行而非静默丢弃."""
+        rows = build_cross_ledger_rows([], [_voucher(qty=3.0, gross=30.0)])
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["stat_qty"], 0.0)
+        self.assertEqual(r["voucher_qty"], 3.0)
+        self.assertEqual(r["voucher_present"], 1.0)
+
 
 class TestCrossLedgerIdentities(unittest.TestCase):
     def test_balanced_rows_pass(self):
@@ -67,6 +76,19 @@ class TestCrossLedgerIdentities(unittest.TestCase):
         result = check(rows, CROSS_LEDGER_IDENTITIES)
         self.assertEqual([v for v in result.violations
                           if v.identity.name == "凭证账覆盖完整性"], [])
+
+    def test_voucher_only_orphan_fires_qty_identity(self):
+        rows = build_cross_ledger_rows([], [_voucher(qty=3.0, gross=30.0)])
+        result = check(rows, CROSS_LEDGER_IDENTITIES)
+        self.assertTrue(any(v.severity == Severity.MUST_FIX
+                            and v.identity.name == "跨账本销量互证"
+                            for v in result.violations))
+
+    def test_gross_drift_fires(self):
+        rows = build_cross_ledger_rows([_stat(gross=100.0)], [_voucher(gross=400.0)])
+        result = check(rows, CROSS_LEDGER_IDENTITIES)
+        self.assertTrue(any(v.identity.name == "跨账本毛额互证"
+                            for v in result.violations))
 
 
 if __name__ == "__main__":
