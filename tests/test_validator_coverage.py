@@ -12,9 +12,6 @@ from tests._setup import REPO_ROOT
 # 收缩名单: Task 9-11 每接一个脚本删一行. 全空后删除本常量与豁免逻辑.
 PENDING = {
     # Task 11 (standalone 系)
-    "export_all_menu_bilingual.py",
-    "menu_no_bom_bilingual.py",
-    "menu_no_bom_from_sales.py",
     "report_daily_item_sales_bq.py",
     "report_item_sales_weekly_bq.py",
     "report_sales_simple_bq.py",
