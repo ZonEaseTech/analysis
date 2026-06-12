@@ -21,20 +21,23 @@ def main():
                         help="商家列表 Excel 路径")
     parser.add_argument("--output", required=True, help="输出 Excel 文件路径")
     parser.add_argument("--project", default="diyl-407103", help="GCP 项目 ID")
-    
+    parser.add_argument("--external", default=None,
+                        help="外部销售源, 格式 'provider:key=val', e.g. 'huku:path=/path/to/file.xlsx'")
+
     args = parser.parse_args()
-    
+
     print(f"开始导出 {args.month} 月的销售业绩和物品消耗报表...")
-    
+
     exporter = ReportExporter(
         project_id=args.project,
         output_path=args.output
     )
-    
+
     result = exporter.export_sales_and_consumption(
         month=args.month,
         merchant_xlsx=args.merchants,
-        output_path=args.output
+        output_path=args.output,
+        external_spec=args.external,
     )
     
     print(f"\n导出完成!")

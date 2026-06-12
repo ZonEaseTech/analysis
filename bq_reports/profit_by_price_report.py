@@ -58,14 +58,16 @@ from utils.report_engine import ReportEngine, load_sheet_config
 # SQL: sale_event + JOIN to product_package for name; filter by product_type
 # ============================================================================
 
-def _build_sql_templates(dine_excludes=None, takeout_excludes=None):
+def _build_sql_templates(dine_excludes=None, takeout_excludes=None,
+                         exclude_test_business=False):
     """构造 (COMBO_SQL, SINGLE_SQL) — 把排除清单注入 sale_event CTE.
 
     清单为空 → 跟模块加载时的零行为版本完全一致.
+    exclude_test_business=True → 对齐 ttpos 后台 ExcludeTestBusinessByBillSQL 口径.
     """
     tpl = f"""
 WITH
-{sale_event.sale_event_cte(dine_excludes, takeout_excludes)}
+{sale_event.sale_event_cte(dine_excludes, takeout_excludes, exclude_test_business=exclude_test_business)}
 {_BY_PRICE_SELECT_BODY}"""
     return (tpl.replace("{product_type}", "1"),
             tpl.replace("{product_type}", "0"))
@@ -612,6 +614,19 @@ def main() -> int:
     else:
         combo_sql_t, single_sql_t = COMBO_BY_PRICE_SQL, SINGLE_BY_PRICE_SQL
 
+    # 测试营业时段过滤 (对齐 ttpos 后台口径 ExcludeTestBusinessByBillSQL)
+    # 只对存在 ttpos_business_status_period 表的店启用 → 按店切换 SQL 模板
+    from semantic.dimensions.test_business import get_stores_with_test_business
+    merchant_uuids = [m[1] for m in merchants]
+    tb_stores = get_stores_with_test_business(engine.client, merchant_uuids)
+    if tb_stores:
+        print(f"[Test Business] 排除测试营业时段, 影响 {len(tb_stores)} 店: "
+              f"{sorted(tb_stores)}")
+        combo_sql_tb, single_sql_tb = _build_sql_templates(
+            dine_excl, takeout_excl, exclude_test_business=True)
+    else:
+        combo_sql_tb = single_sql_tb = None
+
     modes = ["combo", "single"] if args.mode == "both" else [args.mode]
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
@@ -645,8 +660,14 @@ def main() -> int:
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = combo_sql_t if mode == "combo" else single_sql_t
+        sql_template_tb = combo_sql_tb if mode == "combo" else single_sql_tb
         print(f"\n========== 处理 {item_label} ==========")
 
+        # 按 store 切换: 启用测试营业过滤的店用 _tb 版, 其他用普通版
+        sql_factory = (
+            (lambda u: sql_template_tb if u in tb_stores else sql_template)
+            if tb_stores else None
+        )
         raw_rows, errors = _timed("BQ 拉数", lambda: engine.query(
             sql_template=sql_template,
             merchants=merchants,
@@ -658,6 +679,7 @@ def main() -> int:
                 "account": acc, "store_num": num, "store_name": name,
             })(),
             label=item_label,
+            sql_template_factory=sql_factory,
         ))
 
         # Fine-grain (店, SKU, price) 聚合 — 用于收集每 SKU 价格档列表

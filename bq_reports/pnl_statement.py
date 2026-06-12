@@ -53,8 +53,9 @@ from utils.report_engine import ReportEngine
 # 拿 item_name + product_type, 让 COGS 计算能区分套餐/单品并应用 fallback_bom 覆盖.
 # Python 后续做双重聚合: (a) channel-level for aggregate_sales_by_channel,
 # (b) (item, channel) for COGS. 一次 BQ 查询, 省费.
-_PNL_SALES_SQL = f"""
-WITH {sale_event.sale_event_cte()}
+def _build_pnl_sales_sql(exclude_test_business: bool = False) -> str:
+    return f"""
+WITH {sale_event.sale_event_cte(exclude_test_business=exclude_test_business)}
 SELECT
   se.item_uuid,
   REGEXP_REPLACE(COALESCE(
@@ -62,26 +63,19 @@ SELECT
     JSON_EXTRACT_SCALAR(pp.name, '$.en'),
     '未知'
   ), r'^\\s+|\\s+$', '') AS item_name,
-  IFNULL(pp.product_type, 0) AS product_type,  -- 0=单品, 1=套餐
-  se.price,
-  se.channel,
-  se.qty,
-  se.sales_price,
-  se.original_amount,
-  se.actual_amount,
-  se.refund_qty,
-  se.refund_amount,
-  se.free_qty,
-  se.give_qty,
-  se.free_amount,
-  se.give_amount,
-  se.discount_amount,
-  se.cancelled_qty,
-  se.cancelled_amount
+  IFNULL(pp.product_type, 0) AS product_type,
+  se.price, se.channel, se.qty, se.sales_price, se.original_amount, se.actual_amount,
+  se.refund_qty, se.refund_amount, se.free_qty, se.give_qty,
+  se.free_amount, se.give_amount, se.discount_amount,
+  se.cancelled_qty, se.cancelled_amount
 FROM sale_event se
 LEFT JOIN `{{project}}`.`{{dataset}}`.`ttpos_product_package` pp
   ON pp.uuid = se.item_uuid
 """
+
+
+_PNL_SALES_SQL = _build_pnl_sales_sql(exclude_test_business=False)
+_PNL_SALES_SQL_TB = _build_pnl_sales_sql(exclude_test_business=True)
 
 
 def _fetch_ttpos_net_sales(engine, merchants, start_ts, end_ts) -> float:
@@ -107,7 +101,16 @@ def _fetch_pnl_sales_rows(engine, merchants, start_ts, end_ts):
 
     每行附带 store_num / store_name (由 row_proxy_factory 注入).
     返回的 rows 直接喂给 aggregate_sales_by_channel + _compute_cogs_from_rows.
+    对启用测试营业开关的店, 按店切换到带过滤的 SQL (对齐 ttpos 后台口径).
     """
+    from semantic.dimensions.test_business import get_stores_with_test_business
+    tb_stores = get_stores_with_test_business(
+        engine.client, [m[1] for m in merchants])
+    sql_factory = (
+        (lambda u: _PNL_SALES_SQL_TB if u in tb_stores else _PNL_SALES_SQL)
+        if tb_stores else None
+    )
+
     raw_rows, errors = engine.query(
         sql_template=_PNL_SALES_SQL,
         merchants=merchants,
@@ -119,6 +122,7 @@ def _fetch_pnl_sales_rows(engine, merchants, start_ts, end_ts):
             "account": acc, "store_num": num, "store_name": name,
         })(),
         label="P&L 销售",
+        sql_template_factory=sql_factory,
     )
     if errors:
         print(f"[警告] {len(errors)} 店查询失败 (可能没 takeout 表)")

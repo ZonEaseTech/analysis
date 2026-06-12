@@ -83,6 +83,7 @@ ss_dedup AS (
     WHERE delete_time = 0
       AND complete_time >= {start_ts} AND complete_time < {end_ts}
       {exclude_test_business_ss}
+      {exclude_dine_orders}
   )
   WHERE _rn = 1
 ),
@@ -97,6 +98,8 @@ ss_per_bill AS (
 pos_per_bill AS (
   -- sale_bill 是订单事实表；statistics_sale 缺时用 sale_bill 兜底
   -- (兜底默认无退款，因为漏的单往往是 ttpos 后端 bug，未触发退款流程)
+  -- 注意: order_excludes 排除的 sale_order_uuid 需要通过 sale_order 表映射到
+  -- sale_bill_uuid，否则 sale_bill 兜底会把排除的金额补回来。
   SELECT
     COALESCE(ss.ss_amount, sb.amount) AS turnover,
     COALESCE(ss.ss_received, sb.payment_amount) AS received
@@ -105,6 +108,8 @@ pos_per_bill AS (
   WHERE sb.delete_time = 0 AND sb.status = 1
     AND sb.finish_time >= {start_ts} AND sb.finish_time < {end_ts}
     {exclude_test_business_sb}
+    -- order_excludes 兜底：被排除的 sale_order_uuid 对应的 sale_bill 也排除
+    {exclude_dine_sale_bills}
 ),
 pos_summary AS (
   SELECT
@@ -130,6 +135,7 @@ takeout_sales AS (
     AND order_state IN (10, 20, 30, 40, 60)
     AND platform IN ('grab', 'lineman', 'shopee')
     AND accepted_time > 0
+    {exclude_takeout_orders}
     AND (
       CASE
         WHEN order_state = 40 AND completed_time > 0 THEN completed_time

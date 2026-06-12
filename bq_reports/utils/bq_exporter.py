@@ -236,27 +236,31 @@ class MultiShopExporter(BaseExporter):
         client: Optional[bigquery.Client] = None
     ):
         super().__init__(project_id, output_path, client)
-        self.merchants: List[Tuple[str, str]] = []  # [(account, uuid), ...]
+        self.merchants: List[Tuple[str, str, str]] = []  # [(account, uuid, store_num), ...]
         self.progress_callback: Optional[Callable[[int, int, str, Dict], None]] = None
     
     def load_merchants(self, merchant_xlsx: Union[str, Path]):
         """
         从 Excel 加载商家列表
-        
+
         Excel 格式：每行包含 [序号, 账号, UUID]
+        门店编号从账号 (admin-XXX@wallace.com) 解析，用于外部销售源的日期切割。
         """
+        import re
         from openpyxl import load_workbook
-        
+
         wb = load_workbook(merchant_xlsx, data_only=True)
         ws = wb.active
-        
+
         self.merchants = []
         for row in ws.iter_rows(min_row=2, values_only=True):
             if len(row) >= 3 and row[1] and row[2]:
                 account = str(row[1]).strip()
                 uuid_str = str(row[2]).strip()
-                self.merchants.append((account, uuid_str))
-        
+                m = re.search(r'admin-(\d+)@', account)
+                store_num = m.group(1) if m else account
+                self.merchants.append((account, uuid_str, store_num))
+
         wb.close()
         return self
     
@@ -300,7 +304,7 @@ class MultiShopExporter(BaseExporter):
         results = []
         errors = []
         
-        for idx, (account, uuid_str) in enumerate(self.merchants, 1):
+        for idx, (account, uuid_str, _) in enumerate(self.merchants, 1):
             dataset = f"shop{uuid_str}"
             
             # 格式化 SQL
@@ -578,16 +582,18 @@ class ReportExporter(MultiShopExporter):
         self,
         month: str,
         merchant_xlsx: Union[str, Path],
-        output_path: Optional[Union[str, Path]] = None
+        output_path: Optional[Union[str, Path]] = None,
+        external_spec: Optional[str] = None,
     ) -> ExportResult:
         """
         销售业绩 + 物品消耗报表（对应 report.sh）
-        
+
         Args:
             month: 月份 (YYYY-MM)
             merchant_xlsx: 商家列表 Excel 路径
             output_path: 可选，自定义输出路径
-            
+            external_spec: 可选，外部销售源规格，如 'huku:path=/path/to/file.xlsx'
+
         Returns:
             ExportResult 包含两个 sheet：
             - 销售业绩: 总营业额、实收金额、订单数
@@ -629,13 +635,49 @@ class ReportExporter(MultiShopExporter):
         payment_sql = get_template('payment_breakdown')
         payment_daily_sql = get_template('payment_breakdown_daily')
 
+        # --- order_excludes: 加载报表层排除清单（与利润表对齐） ---
+        dine_excludes: set[int] = set()
+        takeout_excludes: set[int] = set()
+        _order_excludes_cfg = getattr(self, '_config', None) or {}
+        if not _order_excludes_cfg:
+            import yaml
+            cfg_path = Path("resources/config.yaml")
+            if cfg_path.exists():
+                with open(cfg_path, encoding="utf-8") as f:
+                    _order_excludes_cfg = yaml.safe_load(f) or {}
+        _oe_spec = _order_excludes_cfg.get("order_excludes") or {}
+        _oe_path = _oe_spec.get("path")
+        if _oe_path and Path(_oe_path).exists():
+            import csv as _csv
+            with open(_oe_path, encoding="utf-8-sig") as f:
+                for r in _csv.DictReader(f):
+                    ch = (r.get("channel") or "").strip()
+                    key = (r.get("exclude_key") or "").strip()
+                    if not key:
+                        continue
+                    try:
+                        k = int(key)
+                    except ValueError:
+                        continue
+                    if ch == "dine":
+                        dine_excludes.add(k)
+                    elif ch == "takeout":
+                        takeout_excludes.add(k)
+            print(f"[Order Excludes] 加载 {len(dine_excludes)} 单堂食排除 / {len(takeout_excludes)} 单外卖排除")
+
+        def _build_exclude_orders_clause(uuids: set[int], field: str) -> str:
+            if not uuids:
+                return ""
+            ids_str = ", ".join(str(u) for u in sorted(uuids))
+            return f"AND {field} NOT IN ({ids_str})"
+
         # 探测哪些店有 ttpos_business_status_period 表（测试营业时段需要排除，对齐 ttpos UI）
         # 一次 UNION ALL 查 INFORMATION_SCHEMA，避免 53 次串行 RTT
         union_parts = [
             f"SELECT '{uuid_str}' AS uuid, COUNT(*) AS has_table "
             f"FROM `{self.project_id}.shop{uuid_str}.INFORMATION_SCHEMA.TABLES` "
             f"WHERE table_name = 'ttpos_business_status_period'"
-            for _, uuid_str in self.merchants
+            for _, uuid_str, _ in self.merchants
         ]
         check_sql = " UNION ALL ".join(union_parts)
         has_test_period_table = {
@@ -667,11 +709,25 @@ class ReportExporter(MultiShopExporter):
 
         def _query_sales(account, uuid_str):
             dataset = f"shop{uuid_str}"
+            _dine_clause = _build_exclude_orders_clause(dine_excludes, 'sale_order_uuid')
+            _dine_bill_clause = ""
+            if dine_excludes:
+                ids_str = ", ".join(str(u) for u in sorted(dine_excludes))
+                _dine_bill_clause = (
+                    f"AND sb.uuid NOT IN ("
+                    f"  SELECT _so.sale_bill_uuid "
+                    f"  FROM `{self.project_id}.{dataset}.ttpos_sale_order` _so"
+                    f"  WHERE _so.uuid IN ({ids_str}) AND _so.delete_time = 0"
+                    f")"
+                )
             sql = sales_sql.format(
                 project=self.project_id, dataset=dataset,
                 start_ts=start_ts, end_ts=end_ts,
                 exclude_test_business_ss=_build_exclude_test_business(uuid_str, 'sale_bill_uuid'),
                 exclude_test_business_sb=_build_exclude_test_business(uuid_str, 'uuid'),
+                exclude_dine_orders=_dine_clause,
+                exclude_takeout_orders=_build_exclude_orders_clause(takeout_excludes, 'uuid'),
+                exclude_dine_sale_bills=_dine_bill_clause,
             )
             rows = list(self.client.query(sql).result())
             if not rows:
@@ -807,27 +863,27 @@ class ReportExporter(MultiShopExporter):
         with ThreadPoolExecutor(max_workers=10) as ex:
             sales_futures = {
                 ex.submit(_query_sales, account, uuid_str): account
-                for account, uuid_str in self.merchants
+                for account, uuid_str, _ in self.merchants
             }
             cons_wh_futures = {
                 ex.submit(_query_consumption_warehouse, account, uuid_str): account
-                for account, uuid_str in self.merchants
+                for account, uuid_str, _ in self.merchants
             }
             cons_bom_futures = {
                 ex.submit(_query_consumption_bom, account, uuid_str): account
-                for account, uuid_str in self.merchants
+                for account, uuid_str, _ in self.merchants
             }
             bom_sales_futures = {
                 ex.submit(_query_bom_sales, account, uuid_str): account
-                for account, uuid_str in self.merchants
+                for account, uuid_str, _ in self.merchants
             }
             payment_futures = {
                 ex.submit(_query_payment, account, uuid_str): account
-                for account, uuid_str in self.merchants
+                for account, uuid_str, _ in self.merchants
             }
             payment_daily_futures = {
                 ex.submit(_query_payment_daily, account, uuid_str): account
-                for account, uuid_str in self.merchants
+                for account, uuid_str, _ in self.merchants
             }
 
             for fut in as_completed(sales_futures):
@@ -876,6 +932,47 @@ class ReportExporter(MultiShopExporter):
                     payment_daily_results.extend(items)
                 except Exception as e:
                     errors.append({"account": account, "type": "payment_daily", "error": str(e)})
+
+        # ── 外部销售源（可选）：加载并合并到销售业绩 ──
+        if external_spec:
+            from external_sales import load_external
+            print(f"\n[External] 加载外部源: {external_spec}")
+            ext_rows = load_external(
+                external_spec,
+                bq_client=self.client,
+                merchants=[(acc, uuid_str, store_num, "") for acc, uuid_str, store_num in self.merchants],
+                month=month,
+            )
+            # 按门店聚合（外部源是 SKU 级，需要 rollup 到店级）
+            ext_by_store: Dict[str, Dict[str, Any]] = {}
+            for r in ext_rows:
+                code = str(r.store_num).zfill(3)
+                slot = ext_by_store.setdefault(code, {
+                    "store_name": r.store_name,
+                    "turnover": 0.0,
+                    "received": 0.0,
+                })
+                # 外部源没有 gross_amount/标准金额概念，用 revenue 近似营业额
+                slot["turnover"] += r.revenue
+                slot["received"] += r.revenue
+            print(f"[External] 合并 {len(ext_by_store)} 店, "
+                  f"实收合计 {sum(d['received'] for d in ext_by_store.values()):,.2f}")
+            # 合并到 sales_results
+            sales_by_code = {r["门店编号"]: r for r in sales_results}
+            for code, data in ext_by_store.items():
+                if code in sales_by_code:
+                    rec = sales_by_code[code]
+                    rec["总营业额"] = round(rec.get("总营业额", 0) + data["turnover"], 2)
+                    rec["实收金额"] = round(rec.get("实收金额", 0) + data["received"], 2)
+                    # 订单数保持 BQ 值（外部源没有订单数维度）
+                else:
+                    sales_results.append({
+                        "门店编号": code,
+                        "门店名称": data["store_name"] or code,
+                        "总营业额": round(data["turnover"], 2),
+                        "实收金额": round(data["received"], 2),
+                        "订单数": 0,  # 外部源无订单数
+                    })
 
         # ===== Python 层后处理 =====
         # 1. 商品销量：决定每行是否显示规格后缀（同 store + 同 package 有多个 bom_uuid 才带规格）
@@ -1121,7 +1218,7 @@ class ReportExporter(MultiShopExporter):
         
         sql = get_template('bom_product_sales')
         
-        for idx, (account, uuid_str) in enumerate(self.merchants, 1):
+        for idx, (account, uuid_str, _) in enumerate(self.merchants, 1):
             dataset = f"shop{uuid_str}"
             
             try:
@@ -1219,7 +1316,7 @@ class ReportExporter(MultiShopExporter):
         # 构建 code 字符串
         codes_str = ", ".join(f"'{c}'" for c in material_codes)
         
-        for idx, (account, uuid_str) in enumerate(self.merchants, 1):
+        for idx, (account, uuid_str, _) in enumerate(self.merchants, 1):
             dataset = f"shop{uuid_str}"
             
             try:
@@ -1324,7 +1421,7 @@ class ReportExporter(MultiShopExporter):
         
         sql = get_template('daily_item_sales')
         
-        for idx, (account, uuid_str) in enumerate(self.merchants, 1):
+        for idx, (account, uuid_str, _) in enumerate(self.merchants, 1):
             dataset = f"shop{uuid_str}"
             
             try:

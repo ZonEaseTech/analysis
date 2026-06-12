@@ -30,9 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from google.cloud import bigquery
 from google.oauth2.credentials import Credentials
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-from openpyxl.utils import get_column_letter
+import xlsxwriter
 
 PROJECT_ID = "diyl-407103"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "exports"
@@ -57,6 +55,9 @@ STORE_LIST = [
     ("51", "2618629820416000"), ("52", "2788834676736000"), ("53", "2992442970112000"),
     ("54", "3169446793216000"), ("55", "3367514411008000"), ("56", "3662462062592000"),
     ("58", "4053593493504000"), ("59", "4197894328320000"), ("61", "3087884357632000"),
+    # 2026-05-25: 新增 4 家 (商家 60 家 ID 名单)
+    ("43", "1167111229440000"), ("63", "2499830353920000"),
+    ("67", "5752387276800000"), ("72", "3469788319744000"),
 ]
 
 
@@ -115,12 +116,37 @@ def next_version(out_dir: Path, prefix: str) -> int:
     return (max(used) + 1) if used else 1
 
 
-def query_shop(client, dataset_id, start_ts, end_ts):
+def query_shop(client, dataset_id, start_ts, end_ts, has_bsp=False):
     """
     返回行：(sale_date, row_type, product_uuid, name_zh, name_en, name_th,
             cat_zh, cat_en, cat_th, total_qty, total_amount)
       row_type: '套餐' / '单品'
+    has_bsp: 该 dataset 是否有 ttpos_business_status_period 表(部分店无测试期不建表)
     """
+    # 测试营业期排除子句 (对齐 ttpos repo: applyExcludeTestBusiness / ExcludeTestBusinessByBillSQL)
+    # 堂食按 sale_bill.create_time 判断, 外卖按 takeout_order.create_time
+    if has_bsp:
+        bsp_dine = f"""
+          AND NOT EXISTS (
+              SELECT 1
+              FROM `{PROJECT_ID}.{dataset_id}.ttpos_sale_bill` _sb
+              JOIN `{PROJECT_ID}.{dataset_id}.ttpos_business_status_period` bsp
+                ON bsp.delete_time = 0
+               AND _sb.create_time >= bsp.start_time
+               AND (bsp.end_time = 0 OR _sb.create_time <= bsp.end_time)
+              WHERE _sb.uuid = sp.sale_bill_uuid AND _sb.delete_time = 0
+          )"""
+        bsp_takeout = f"""
+          AND NOT EXISTS (
+              SELECT 1
+              FROM `{PROJECT_ID}.{dataset_id}.ttpos_business_status_period` bsp
+              WHERE bsp.delete_time = 0
+                AND tko.create_time >= bsp.start_time
+                AND (bsp.end_time = 0 OR tko.create_time <= bsp.end_time)
+          )"""
+    else:
+        bsp_dine = ""
+        bsp_takeout = ""
     # 商品名多语言
     pp_zh = "JSON_EXTRACT_SCALAR(pp.name, '$.zh')"
     pp_en = "JSON_EXTRACT_SCALAR(pp.name, '$.en')"
@@ -136,16 +162,28 @@ def query_shop(client, dataset_id, start_ts, end_ts):
     sop_en = "JSON_EXTRACT_SCALAR(sop.name, '$.en')"
     sop_th = "JSON_EXTRACT_SCALAR(sop.name, '$.th')"
 
-    # toi.item_name 通常是已渲染的字符串（非 JSON），优先 join pp，回退 toi.item_name
+    # toi.item_name 实际是 JSON 快照 (历史注释写"渲染字符串"是错的, 已踩坑).
+    # 当 pp join 失败 (商品已删/未建) 时, 必须从 toi.item_name JSON 里再提一次,
+    # 否则整段 JSON 当字符串塞进报表, 看起来像"商品名是 raw JSON".
     toi_zh = (
-        "COALESCE(NULLIF(JSON_EXTRACT_SCALAR(pp.name, '$.zh'), 'null'), toi.item_name)"
+        "COALESCE("
+        "NULLIF(JSON_EXTRACT_SCALAR(pp.name, '$.zh'), 'null'), "
+        "NULLIF(JSON_EXTRACT_SCALAR(toi.item_name, '$.zh'), 'null')"
+        ")"
     )
     toi_en = (
-        "COALESCE(NULLIF(JSON_EXTRACT_SCALAR(pp.name, '$.en'), 'null'), "
-        "NULLIF(JSON_EXTRACT_SCALAR(pp.name, '$.zh'), 'null'), toi.item_name)"
+        "COALESCE("
+        "NULLIF(JSON_EXTRACT_SCALAR(pp.name, '$.en'), 'null'), "
+        "NULLIF(JSON_EXTRACT_SCALAR(toi.item_name, '$.en'), 'null'), "
+        "NULLIF(JSON_EXTRACT_SCALAR(pp.name, '$.zh'), 'null'), "
+        "NULLIF(JSON_EXTRACT_SCALAR(toi.item_name, '$.zh'), 'null')"
+        ")"
     )
     toi_th = (
-        "COALESCE(NULLIF(JSON_EXTRACT_SCALAR(pp.name, '$.th'), 'null'), toi.item_name)"
+        "COALESCE("
+        "NULLIF(JSON_EXTRACT_SCALAR(pp.name, '$.th'), 'null'), "
+        "NULLIF(JSON_EXTRACT_SCALAR(toi.item_name, '$.th'), 'null')"
+        ")"
     )
 
     query = f"""
@@ -169,38 +207,48 @@ def query_shop(client, dataset_id, start_ts, end_ts):
         LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_category` pc
             ON pc.uuid = pp.category_uuid AND pc.delete_time = 0
         WHERE sp.delete_time = 0
-          AND sp.complete_time BETWEEN {start_ts} AND {end_ts}
+          AND sp.complete_time BETWEEN {start_ts} AND {end_ts}{bsp_dine}
     ),
     dine_subitem AS (
         -- B. 堂食 套餐子品 → 算到「单品」
+        -- ⚠ 对齐 ttpos repo statistics.go:CountPackageDetailProductSale (2237-2538)
+        -- 起点必须是 statistics_product 套餐主行, 然后 JOIN parent_sop + child_sop
+        -- 不能直接从 sale_order_product 起 (会带入退款/异常套餐的子品 → 虚增数倍)
+        -- 数量: getSubItemNum 三选一 (copy_num > unit_num > num)
         SELECT
-            DATE(TIMESTAMP_SECONDS(
-                COALESCE(NULLIF(sb.finish_time, 0), so.finish_time)
-            )) AS sale_date,
+            DATE(TIMESTAMP_SECONDS(sp.complete_time)) AS sale_date,
             '单品' AS row_type,
-            sop.product_package_uuid AS product_uuid,
-            COALESCE({pp_zh}, {sop_zh}) AS name_zh,
-            COALESCE({pp_en}, {sop_en}) AS name_en,
-            COALESCE({pp_th}, {sop_th}) AS name_th,
-            {pc_zh} AS cat_zh,
-            {pc_en} AS cat_en,
-            {pc_th} AS cat_th,
-            CAST(sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num) AS FLOAT64) AS qty,
-            CAST(COALESCE(sop.price, 0) * sop.num * sop.copy_num * IF(sop.unit_num = 0, 1, sop.unit_num) AS FLOAT64) AS amount
-        FROM `{PROJECT_ID}.{dataset_id}.ttpos_sale_order_product` sop
-        INNER JOIN `{PROJECT_ID}.{dataset_id}.ttpos_sale_bill` sb
-            ON sb.uuid = sop.sale_bill_uuid AND sb.delete_time = 0
-        LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_sale_order` so
-            ON so.uuid = sop.sale_order_uuid AND so.delete_time = 0
-        LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_package` pp
-            ON pp.uuid = sop.product_package_uuid AND pp.delete_time = 0
-        LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_category` pc
-            ON pc.uuid = pp.category_uuid AND pc.delete_time = 0
-        WHERE sop.delete_time = 0
-          AND sop.cancel_time = 0
-          AND sb.status = 1
-          AND sop.product_type = 2
-          AND COALESCE(NULLIF(sb.finish_time, 0), so.finish_time) BETWEEN {start_ts} AND {end_ts}
+            child_sop.product_package_uuid AS product_uuid,
+            JSON_EXTRACT_SCALAR(sub_pp.name, '$.zh') AS name_zh,
+            JSON_EXTRACT_SCALAR(sub_pp.name, '$.en') AS name_en,
+            JSON_EXTRACT_SCALAR(sub_pp.name, '$.th') AS name_th,
+            JSON_EXTRACT_SCALAR(sub_pc.name, '$.zh') AS cat_zh,
+            JSON_EXTRACT_SCALAR(sub_pc.name, '$.en') AS cat_en,
+            JSON_EXTRACT_SCALAR(sub_pc.name, '$.th') AS cat_th,
+            CAST(COALESCE(NULLIF(child_sop.copy_num, 0), NULLIF(child_sop.unit_num, 0), child_sop.num) AS FLOAT64) AS qty,
+            -- 金额: 子品原价(sub_pp.price 最新售价, 缺则 child_sop.product_price - sauce_price) × qty + sauce_price × qty
+            CAST(
+                (COALESCE(NULLIF(sub_pp.price, 0), child_sop.product_price - COALESCE(child_sop.sauce_price, 0))
+                 + COALESCE(child_sop.sauce_price, 0))
+                * COALESCE(NULLIF(child_sop.copy_num, 0), NULLIF(child_sop.unit_num, 0), child_sop.num)
+            AS FLOAT64) AS amount
+        FROM `{PROJECT_ID}.{dataset_id}.ttpos_statistics_product` sp
+        INNER JOIN `{PROJECT_ID}.{dataset_id}.ttpos_sale_order_product` parent_sop
+            ON parent_sop.sale_order_uuid = sp.sale_order_uuid
+           AND parent_sop.product_package_uuid = sp.product_package_uuid
+           AND parent_sop.product_type = 1  -- ProductTypePackage
+           AND parent_sop.delete_time = 0
+        INNER JOIN `{PROJECT_ID}.{dataset_id}.ttpos_sale_order_product` child_sop
+            ON child_sop.package_uuid = parent_sop.uuid
+           AND child_sop.product_type = 2  -- ProductTypePackageSubProduct
+           AND child_sop.delete_time = 0
+        LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_package` sub_pp
+            ON sub_pp.uuid = child_sop.product_package_uuid AND sub_pp.delete_time = 0
+        LEFT JOIN `{PROJECT_ID}.{dataset_id}.ttpos_product_category` sub_pc
+            ON sub_pc.uuid = sub_pp.category_uuid AND sub_pc.delete_time = 0
+        WHERE sp.delete_time = 0
+          AND sp.product_type = 1  -- 套餐主行
+          AND sp.complete_time BETWEEN {start_ts} AND {end_ts}{bsp_dine}
     ),
     takeout AS (
         -- C. 外卖
@@ -232,7 +280,7 @@ def query_shop(client, dataset_id, start_ts, end_ts):
               (tko.order_state = 40 AND tko.completed_time BETWEEN {start_ts} AND {end_ts})
               OR
               (tko.order_state != 40 AND tko.accepted_time BETWEEN {start_ts} AND {end_ts})
-          )
+          ){bsp_takeout}
     ),
     unioned AS (
         SELECT * FROM dine_main
@@ -286,7 +334,7 @@ def get_store_name(client, dataset_id):
 
 
 def process_one(args):
-    idx, total, store_no_cfg, uuid, start_ts, end_ts = args
+    idx, total, store_no_cfg, uuid, start_ts, end_ts, has_bsp = args
     dataset_id = f"shop{uuid}"
     try:
         client = bigquery.Client(project=PROJECT_ID, credentials=get_creds())
@@ -300,7 +348,7 @@ def process_one(args):
         store_name = store_code or f"门店_{uuid[:12]}"
 
     t0 = time.time()
-    rows = query_shop(client, dataset_id, start_ts, end_ts)
+    rows = query_shop(client, dataset_id, start_ts, end_ts, has_bsp=has_bsp)
     elapsed = time.time() - t0
     return {
         "idx": idx, "store_no": store_no, "store_name": store_name,
@@ -320,7 +368,7 @@ def pick_name(name_zh, name_en, name_th, prefer):
     return ""
 
 
-def write_sheet(ws, lang, rows):
+def write_sheet(wb, ws, lang, rows, fmt_header, fmt_text, fmt_qty, fmt_money):
     """
     rows: (store_no, store_name, sale_date, row_type, category, product_name, qty, amount)
     lang: 'zh' or 'en'
@@ -329,59 +377,36 @@ def write_sheet(ws, lang, rows):
         headers = ["门店编号", "门店名称", "日期", "类型", "分类", "商品名称", "销量"]
         type_map = {"单品": "单品", "套餐": "套餐"}
         has_amount = False
+        widths = [12, 28, 12, 10, 18, 45, 12]
     else:
         headers = ["Store Code", "Store Name", "Date", "Type", "Category", "Product Name", "Qty", "Unit Price", "Total Price"]
         type_map = {"单品": "Single Item", "套餐": "Combo"}
         has_amount = True
+        widths = [12, 28, 12, 10, 18, 45, 12, 12, 12]
 
-    header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    header_font = Font(bold=True, size=11, color="FFFFFF")
-    thin = Border(
-        left=Side(style="thin", color="D9D9D9"),
-        right=Side(style="thin", color="D9D9D9"),
-        top=Side(style="thin", color="D9D9D9"),
-        bottom=Side(style="thin", color="D9D9D9"),
-    )
-    for ci, h in enumerate(headers, 1):
-        c = ws.cell(row=1, column=ci, value=h)
-        c.font = header_font
-        c.fill = header_fill
-        c.border = thin
-        c.alignment = Alignment(horizontal="center")
+    for i, w in enumerate(widths):
+        ws.set_column(i, i, w)
+    ws.write_row(0, 0, headers, fmt_header)
+    ws.freeze_panes(1, 0)
 
-    for ri, row in enumerate(rows, 2):
+    for ri, row in enumerate(rows, 1):
         if has_amount:
             store_no, store_name, sale_date, row_type, category, product_name, qty, amount = row
         else:
             store_no, store_name, sale_date, row_type, category, product_name, qty = row
             amount = None
-
-        ws.cell(row=ri, column=1, value=store_no).border = thin
-        ws.cell(row=ri, column=2, value=store_name).border = thin
-        ws.cell(row=ri, column=3, value=str(sale_date)).border = thin
-        ws.cell(row=ri, column=4, value=type_map.get(row_type, row_type)).border = thin
-        ws.cell(row=ri, column=5, value=category).border = thin
-        ws.cell(row=ri, column=6, value=product_name).border = thin
-        c = ws.cell(row=ri, column=7, value=float(qty))
-        c.border = thin
-        c.number_format = "#,##0.####"
-
+        ws.write(ri, 0, store_no, fmt_text)
+        ws.write(ri, 1, store_name, fmt_text)
+        ws.write(ri, 2, str(sale_date), fmt_text)
+        ws.write(ri, 3, type_map.get(row_type, row_type), fmt_text)
+        ws.write(ri, 4, category, fmt_text)
+        ws.write(ri, 5, product_name, fmt_text)
+        ws.write_number(ri, 6, float(qty), fmt_qty)
         if has_amount and amount is not None:
-            unit_price = round(float(amount) / float(qty), 2) if float(qty) != 0 else 0
-            c = ws.cell(row=ri, column=8, value=float(unit_price))
-            c.border = thin
-            c.number_format = "#,##0.00"
-            c = ws.cell(row=ri, column=9, value=float(amount))
-            c.border = thin
-            c.number_format = "#,##0.00"
-
-    if has_amount:
-        widths = [12, 28, 12, 10, 18, 45, 12, 12, 12]
-    else:
-        widths = [12, 28, 12, 10, 18, 45, 12]
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    ws.freeze_panes = "A2"
+            q = float(qty)
+            unit_price = round(float(amount) / q, 2) if q != 0 else 0
+            ws.write_number(ri, 7, unit_price, fmt_money)
+            ws.write_number(ri, 8, float(amount), fmt_money)
 
 
 def aggregate_per_lang(all_data, prefer):
@@ -476,7 +501,22 @@ def main():
     missing = [no for (no, uuid) in STORE_LIST if f"shop{uuid}" not in all_datasets]
     if missing:
         log(f"⚠ 跳过未发现 dataset 的门店: {missing}")
-    log(f"待查询门店: {len(targets)}\n")
+    log(f"待查询门店: {len(targets)}")
+
+    # 预查哪些 dataset 有 business_status_period 表 (测试营业期排除用)
+    target_datasets = [f"shop{uuid}" for _, _, uuid in targets]
+    bsp_datasets = set()
+    if target_datasets:
+        ds_list = "', '".join(target_datasets)
+        bsp_q = f"""
+        SELECT table_schema FROM `{PROJECT_ID}.region-asia-southeast1.INFORMATION_SCHEMA.TABLES`
+        WHERE table_name = 'ttpos_business_status_period' AND table_schema IN ('{ds_list}')
+        """
+        try:
+            bsp_datasets = {r.table_schema for r in client.query(bsp_q).result()}
+            log(f"测试营业期排除生效门店数: {len(bsp_datasets)}/{len(targets)}\n")
+        except Exception as e:
+            log(f"⚠ 预查 bsp 表失败 (跳过测试期过滤): {e}\n")
 
     all_data = []
     total_rows = 0
@@ -484,7 +524,8 @@ def main():
     query_start = time.time()
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {
-            ex.submit(process_one, (idx, len(targets), no, uuid, start_ts, end_ts)): idx
+            ex.submit(process_one, (idx, len(targets), no, uuid, start_ts, end_ts,
+                                    f"shop{uuid}" in bsp_datasets)): idx
             for idx, no, uuid in targets
         }
         for fut in as_completed(futs):
@@ -515,15 +556,19 @@ def main():
             w.writerow([row[0], row[1], str(row[2]), row[3], row[4], row[5], f"{row[6]:.4f}"])
     log(f"CSV: {csv_path}")
 
-    # Excel：双 Sheet
+    # Excel：双 Sheet (xlsxwriter, write-only, 大数据量快 ~50x)
     xlsx_path = OUTPUT_DIR / f"{file_prefix}_v{version}.xlsx"
-    wb = Workbook()
-    ws_zh = wb.active
-    ws_zh.title = "中文版"
-    write_sheet(ws_zh, "zh", rows_zh)
-    ws_en = wb.create_sheet("English")
-    write_sheet(ws_en, "en", rows_en)
-    wb.save(xlsx_path)
+    wb = xlsxwriter.Workbook(str(xlsx_path), {"constant_memory": True})
+    fmt_header = wb.add_format({"bold": True, "font_color": "white", "bg_color": "#4472C4",
+                                "align": "center", "valign": "vcenter", "border": 1, "border_color": "#D9D9D9"})
+    fmt_text = wb.add_format({"border": 1, "border_color": "#D9D9D9"})
+    fmt_qty = wb.add_format({"border": 1, "border_color": "#D9D9D9", "num_format": "#,##0.####"})
+    fmt_money = wb.add_format({"border": 1, "border_color": "#D9D9D9", "num_format": "#,##0.00"})
+    ws_zh = wb.add_worksheet("中文版")
+    write_sheet(wb, ws_zh, "zh", rows_zh, fmt_header, fmt_text, fmt_qty, fmt_money)
+    ws_en = wb.add_worksheet("English")
+    write_sheet(wb, ws_en, "en", rows_en, fmt_header, fmt_text, fmt_qty, fmt_money)
+    wb.close()
     log(f"Excel: {xlsx_path}")
 
     log(f"\n{'='*60}")

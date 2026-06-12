@@ -133,6 +133,7 @@ def query_all_shops(
     workers: int = 10,
     row_proxy_factory: Optional[Callable] = None,
     label: str = "门店",
+    sql_template_factory: Optional[Callable[[str], str]] = None,
 ) -> Tuple[List[Any], List[Dict]]:
     """
     并发查询所有门店。
@@ -155,7 +156,10 @@ def query_all_shops(
     def _query_one(account_uuid):
         account, uuid_str, store_num, store_name = account_uuid
         dataset = f"shop{uuid_str}"
-        sql = sql_template.format(
+        # 优先 per-store factory (用于按 dataset 切换模板, e.g. 测试营业过滤);
+        # fallback 到固定 sql_template
+        tpl = sql_template_factory(uuid_str) if sql_template_factory else sql_template
+        sql = tpl.format(
             project=client.project,
             dataset=dataset,
             start_ts=start_ts,
@@ -498,11 +502,13 @@ class ReportEngine:
         setup_proxy()
         self.client = get_bq_client(project_id)
 
-    def query(self, sql_template, merchants, start_ts, end_ts, workers=10, row_proxy_factory=None, label="门店"):
-        """并发查询。"""
+    def query(self, sql_template, merchants, start_ts, end_ts, workers=10,
+              row_proxy_factory=None, label="门店", sql_template_factory=None):
+        """并发查询。sql_template_factory(uuid_str) -> str 时, 按店切换模板。"""
         return query_all_shops(
             self.client, sql_template, merchants, start_ts, end_ts,
-            workers=workers, row_proxy_factory=row_proxy_factory, label=label
+            workers=workers, row_proxy_factory=row_proxy_factory, label=label,
+            sql_template_factory=sql_template_factory,
         )
 
     def load_resources(self, configs: List[Dict]) -> Dict[str, Any]:
