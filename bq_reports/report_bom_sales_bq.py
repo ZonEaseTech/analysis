@@ -34,8 +34,7 @@ def main():
         output_path=args.output
     )
 
-    from semantic.validators.gate import GateSpec, validate_and_gate  # noqa: F401  (validate_and_gate 供覆盖测试识别)
-    from semantic.validators.identities import SALES_QTY_IDENTITY, GROSS_AMOUNT_IDENTITY  # noqa: F401
+    from semantic.validators.gate import GateSpec
 
     exporter.set_gate(GateSpec(
         identities=[],  # 技术债: 该报表字段未对齐销售恒等式, 暂只做非空闸门; Task 11 基线工厂落地后升级必填字段校验

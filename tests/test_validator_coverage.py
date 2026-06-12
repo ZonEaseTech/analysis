@@ -1,6 +1,6 @@
 """结构性覆盖: 报表脚本必须接导出闸门 (CLAUDE.md 第 3 节"无例外"的机制化)。
 
-PENDING 是未接脚本的收缩名单 — 只许删不许加. 新脚本不接闸门, 本测试直接挂.
+PENDING 是未接脚本的收缩名单 — 只许删不许加. 新脚本不接闸门, 本测试直接挂. 闸门证据 = 直调 validate_and_gate 或经 GateSpec 走集中式钩子.
 """
 import ast
 import unittest
@@ -30,11 +30,15 @@ def _uses_gate(path: Path) -> bool:
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module and \
                 "semantic.validators" in node.module:
-            if any(a.name in ("validate_and_gate", "gate") for a in node.names):
+            if any(a.name in ("validate_and_gate", "gate", "GateSpec") for a in node.names):
                 return True
         if isinstance(node, ast.Name) and node.id == "validate_and_gate":
             return True
         if isinstance(node, ast.Attribute) and node.attr == "validate_and_gate":
+            return True
+        if isinstance(node, ast.Name) and node.id == "GateSpec":
+            return True
+        if isinstance(node, ast.Attribute) and node.attr == "GateSpec":
             return True
     return False
 
