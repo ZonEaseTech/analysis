@@ -298,6 +298,55 @@ CROSS_LEDGER_IDENTITIES = [CROSS_LEDGER_QTY, CROSS_LEDGER_GROSS, VOUCHER_COVERAG
 
 
 # ═══════════════════════════════════════════════════════════════════
+# A2 — Takeout Tieout Identities (外卖订单勾稽: item 级求和 vs 订单级 platform_total)
+#
+# row 由 semantic/entities/takeout_tieout.takeout_tieout_cte() 构建, 订单粒度.
+# ⚠️ 独立 bundle, 不进 FULL_IDENTITIES / DEFAULT_IDENTITIES —
+#    merchant_charge_fee/merchant_discount 符号关系待观察跑校准 (pitfalls §5.1).
+#    华莱士当前两字段恒 0; 业务开启费用时本 bundle 会 fire 提醒校准.
+#    封顶 🟡: 升 MUST_FIX 须等口径校准
+#    (docs/audit/2026-06-cross-ledger-baseline.md).
+# ═══════════════════════════════════════════════════════════════════
+
+def _capped_review_money(delta: float, lhs: float) -> Severity:
+    """金额分类但封顶 NEEDS_REVIEW — 给口径未校准的勾稽用 (spec §5 A1 支付勾稽同策)."""
+    sev = _money_classify(delta, lhs)
+    return Severity.NEEDS_REVIEW if sev == Severity.MUST_FIX else sev
+
+
+TAKEOUT_TIEOUT_IDENTITY = Identity(
+    name="外卖订单勾稽",
+    description=(
+        "platform_total == SUM(toi.price×quantity) + merchant_charge_fee"
+        " + merchant_discount (符号待观察跑校准, 华莱士当前 merchant 字段恒 0).\n"
+        "封顶 🟡: 升 MUST_FIX 须等口径校准 (docs/audit/2026-06-cross-ledger-baseline.md)."
+    ),
+    lhs=lambda r: r["platform_total"],
+    rhs=lambda r: (r["item_sum"] - r["merchant_charge_fee"]
+                   - r["merchant_discount"]),
+    classify=_capped_review_money,
+    fields=("platform_total", "item_sum", "merchant_charge_fee", "merchant_discount"),
+)
+
+TAKEOUT_TIEOUT_IDENTITIES = [TAKEOUT_TIEOUT_IDENTITY]
+
+
+PAYMENT_TIEOUT_IDENTITY = Identity(
+    name="支付勾稽",
+    description=(
+        "店×月粒度: SUM(sale_bill.payment_amount) vs 统计账实收 (actual_amount).\n"
+        "封顶 🟡 (spec §5 A1): service_fee/tax_fee/整单折扣的口径映射待"
+        " 2026-05 观察跑校准, 校准前不转红线 (CLAUDE.md 技术债 ②).\n"
+        "row 字段: payment_amount_sum / stat_actual_sum (由观察跑/报表层构造)."
+    ),
+    lhs=lambda r: r["payment_amount_sum"],
+    rhs=lambda r: r["stat_actual_sum"],
+    classify=_capped_review_money,
+    fields=("payment_amount_sum", "stat_actual_sum"),
+)
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Combined bundles
 # ═══════════════════════════════════════════════════════════════════
 
