@@ -348,6 +348,51 @@ PAYMENT_TIEOUT_IDENTITY = Identity(
 
 
 # ═══════════════════════════════════════════════════════════════════
+# 非销售导出基线 (BOM / 菜单 / 名录类报表)
+#
+# 这些报表没有销量/金额桶, "可靠"的最低数学含义是: 行非空 (gate min_rows)、
+# 必填列非空、主键不重复. 比裸奔强一个数量级, 但明确不是对账 — 描述里写清.
+# ═══════════════════════════════════════════════════════════════════
+
+def make_required_fields_identity(required: tuple, name: str) -> Identity:
+    """必填字段非空基线. row 缺 key 或值为空串/None → MUST_FIX."""
+    def _missing_count(r: dict) -> float:
+        return float(sum(
+            1 for f in required
+            if f not in r or r[f] is None or (isinstance(r[f], str) and not r[f].strip())
+        ))
+    return Identity(
+        name=name,
+        description=f"必填字段非空: {', '.join(required)} (基线校验, 非对账)",
+        lhs=_missing_count,
+        rhs=lambda r: 0.0,
+        classify=_coverage_classify,
+        fields=tuple(required),
+    )
+
+
+def make_unique_key_identity(key_fields: tuple, name: str):
+    """主键唯一基线. 返回 (identity, prepare) — prepare 给每行标注 _dup_count,
+    identity 检查它为 0. (core.check 是 row-local 的, 跨行去重只能预处理.)"""
+    def prepare(rows: list) -> list:
+        seen: dict = {}
+        for r in rows:
+            k = tuple(r.get(f) for f in key_fields)
+            seen[k] = seen.get(k, 0) + 1
+        return [{**r, "_dup_count": float(seen[tuple(r.get(f) for f in key_fields)] - 1)}
+                for r in rows]
+    ident = Identity(
+        name=name,
+        description=f"主键唯一: ({', '.join(key_fields)}) 重复 = 数据放大, MUST_FIX",
+        lhs=lambda r: r["_dup_count"],
+        rhs=lambda r: 0.0,
+        classify=_coverage_classify,
+        fields=("_dup_count",),
+    )
+    return ident, prepare
+
+
+# ═══════════════════════════════════════════════════════════════════
 # Combined bundles
 # ═══════════════════════════════════════════════════════════════════
 
