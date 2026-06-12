@@ -998,6 +998,7 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
                 "qty": 0.0,
                 "revenue": 0.0,
                 "sales_price": 0.0,
+                "gross_amount": 0.0,
                 "original_amount": 0.0,
                 "refund_qty": 0.0,
                 "refund_amount": 0.0,
@@ -1022,6 +1023,8 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         data[key]["qty"] += qty
         data[key]["revenue"] += revenue
         data[key]["sales_price"] += sales_price
+        # 定义式补齐 (sale_line/takeout_line 未投影 gross_amount), 真校验在 sale_event 报表
+        data[key]["gross_amount"] += sales_price + float(getattr(row, "cancelled_amount", 0) or 0)
         data[key]["original_amount"] += original_amount
         data[key]["refund_qty"] += refund_qty
         data[key]["refund_amount"] += refund_amount
@@ -1429,6 +1432,8 @@ def main():
     parser.add_argument("--summary", action="store_true",
                         help="汇总视角：每 SKU 一行（不展开 BOM 物料），默认输出 sku_profit_summary.yaml 格式")
     parser.add_argument("--no-cache", action="store_true", help="禁用缓存")
+    parser.add_argument("--force", action="store_true",
+                        help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     args = parser.parse_args()
     # --summary 自动切换列配置（除非用户显式覆盖）
     if args.summary and args.column_config == "resources/reports/profit_margin.yaml":
@@ -1545,6 +1550,7 @@ def main():
     if tb_stores:
         print(f"\n[Test Business] 排除测试营业时段, 影响 {len(tb_stores)} 店")
 
+    watermarked = False  # 多 mode 循环只打一次水印
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = COMBO_ORDERS_SQL if mode == "combo" else SINGLE_ORDERS_SQL
@@ -1600,25 +1606,25 @@ def main():
         if not args.summary:
             print(f"[{item_label}] 此为中间表，利润指标请自行在 Excel 中定义")
 
-        # 校验恒等式 + 来源完整性 + 业务合理性 (P2 FULL_IDENTITIES 一次跑完)
+        # 零容差闸门: 校验恒等式 + 来源完整性 + 业务合理性 (FULL_IDENTITIES)
         # agg_data 已带 bom_source / price_source (P2 annotation)
-        from semantic.validators import check, print_result
+        # 闸门在 wb.close() 前执行 — 有 MUST_FIX 且无 --force 则 exit(2), 不落盘
+        from semantic.validators.gate import (
+            add_watermark_sheet_xlsxwriter, validate_and_gate)
         from semantic.validators.identities import FULL_IDENTITIES
 
         check_rows = [
-            {
-                "store_num": store_num,
-                "item_name": item_name,
-                **data,
-            }
+            {"store_num": store_num, "item_name": item_name, **data}
             for (store_num, _store_name, _uuid, item_name), data
             in agg_data.items()
         ]
-        print(f"\n[{item_label}] 校验恒等式 + 来源 + sanity …")
-        result = check(check_rows, FULL_IDENTITIES)
-        print_result(result, row_label=lambda r: f"店 {r['store_num']:>3}  {r['item_name']:<30}")
-        if result.has_must_fix:
-            print(f"⚠️  [{item_label}] 有 🔴 离谱违反，请核实数据/口径。\n")
+        outcome = validate_and_gate(
+            check_rows, FULL_IDENTITIES,
+            force=args.force, report_name=f"profit_margin/{item_label}",
+            row_label=lambda r: f"店 {r['store_num']:>3}  {r['item_name']:<30}")
+        if outcome.needs_watermark and not watermarked:
+            add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
+            watermarked = True
 
     wb.close()
     print(f"\n输出文件: {output_path}")

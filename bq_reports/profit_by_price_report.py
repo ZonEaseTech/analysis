@@ -533,6 +533,8 @@ def main() -> int:
     parser.add_argument("--allow-bq-native-bom", action="store_true",
                         help="允许 fallback BQ 内置 BOM (默认禁用)。默认: BOM 只走 bom_sources, "
                              "缺失即标 BOM来源='无', 成本列空。")
+    parser.add_argument("--force", action="store_true",
+                        help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     args = parser.parse_args()
 
     setup_proxy()
@@ -657,6 +659,7 @@ def main() -> int:
               f"实收 {ext_rev_total:,.0f} 泰铢, "
               f"高置信 {ext_matched:,.0f} ({ext_matched/ext_rev_total*100:.1f}%)")
 
+    watermarked = False  # 多 mode 循环只打一次水印
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = combo_sql_t if mode == "combo" else single_sql_t
@@ -730,7 +733,12 @@ def main() -> int:
         if not external_rows:
             print(f"[{item_label}] {len(flat_rows)} 行")
 
-        # Accounting-identity validation (per fine-grain key — finer = 更严)
+        # 零容差闸门: 校验恒等式 + sanity (FULL_IDENTITIES)
+        # fine-grain (店, SKU, price) 粒度检查 — 更严
+        # 闸门在 wb.close() 前执行 — 有 MUST_FIX 且无 --force 则 exit(2), 不落盘
+        from semantic.validators.gate import (
+            add_watermark_sheet_xlsxwriter, validate_and_gate)
+
         check_rows = [
             {
                 "store_num": k[0], "item_name": k[3], "price": k[4],
@@ -741,14 +749,14 @@ def main() -> int:
             }
             for k, v in grouped.items()
         ]
-        print(f"\n[{item_label}] 校验恒等式 + sanity …")
-        result = _timed("校验恒等式", lambda: check(check_rows, FULL_IDENTITIES))
-        print_result(
-            result,
+        outcome = _timed("校验恒等式", lambda: validate_and_gate(
+            check_rows, FULL_IDENTITIES,
+            force=args.force, report_name=f"profit_by_price/{item_label}",
             row_label=lambda r: f"店 {r['store_num']:>3}  {r['item_name']:<24}  @¥{r['price']}",
-        )
-        if result.has_must_fix:
-            print(f"⚠️  [{item_label}] 有 🔴 离谱违反，发出前请核实数据/口径。\n")
+        ))
+        if outcome.needs_watermark and not watermarked:
+            add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
+            watermarked = True
 
         # 业务合理性 sanity check（独立于会计恒等式）
         zero_cost = _timed("sanity check", lambda: _sanity_check_cost(

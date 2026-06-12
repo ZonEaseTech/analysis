@@ -164,6 +164,8 @@ def parse_args():
     p.add_argument("--stores", help="逗号分隔的门店编号过滤, 如 001,002,003")
     p.add_argument("--workers", type=int, default=8, help="并发查询门店数")
     p.add_argument("--version", type=int, help="指定版本号；不传则自动递增")
+    p.add_argument("--force", action="store_true",
+                   help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     a = p.parse_args()
     if a.start and a.end:
         sd = datetime.strptime(a.start, "%Y-%m-%d").date()
@@ -173,7 +175,7 @@ def parse_args():
         sd = ed - timedelta(days=6)
     if sd > ed:
         sys.exit("start 不能晚于 end")
-    return sd, ed, a.stores, a.workers, a.version
+    return sd, ed, a.stores, a.workers, a.version, a.force
 
 
 def to_ts(d: date, end_of_day: bool = False) -> int:
@@ -672,34 +674,43 @@ def write_meta_sheet(wb, version: int, start, end, prev_start, prev_end, totals:
         ws.set_row(row_i, 32)
 
 
-def run_validators(rows, label: str):
-    """跑销量+金额恒等式. 按 (store_num, item_uuid) 聚合再 check."""
-    log(f"\n=== 校验器: {label} ===")
-    # validator 要 net_qty / revenue 字段 — 用 actual_amount 当 revenue, qty - others 当 net_qty
+def build_validator_check_rows(rows) -> list:
+    """构建校验器 check_rows (按 store_num, item_uuid, channel 聚合)."""
     check_rows = []
     for r in aggregate(rows, ["store_num", "item_uuid", "channel"]):
         cq = r.get("cancelled_qty", 0) or 0
         rq = r.get("refund_qty", 0) or 0
         fq = r.get("free_qty", 0) or 0
         gq = r.get("give_qty", 0) or 0
+        sp = r.get("sales_price", 0) or 0
+        ca = r.get("cancelled_amount", 0) or 0
         check_rows.append({
             "store_num": r["store_num"],
             "item_uuid": r["item_uuid"],
             "qty": r.get("qty", 0),
             "net_qty": r.get("qty", 0) - rq - fq - gq - cq,
             "free_qty": fq, "give_qty": gq, "refund_qty": rq, "cancelled_qty": cq,
-            "sales_price": r.get("sales_price", 0),
+            "sales_price": sp,
             "revenue": r.get("actual_amount", 0),
             "refund_amount": r.get("refund_amount", 0),
             "free_amount": r.get("free_amount", 0),
             "give_amount": r.get("give_amount", 0),
             "discount_amount": r.get("discount_amount", 0),
-            "cancelled_amount": r.get("cancelled_amount", 0),
+            "cancelled_amount": ca,
+            # 定义式补齐 (SQL 未投影 gross_amount), 真校验在 sale_event 报表
+            "gross_amount": sp + ca,
         })
+    return check_rows
+
+
+def run_validators(rows, label: str):
+    """跑销量+金额恒等式 (仅日志/预览用). 按 (store_num, item_uuid) 聚合再 check."""
+    log(f"\n=== 校验器: {label} ===")
+    check_rows = build_validator_check_rows(rows)
     result = check(check_rows, DEFAULT_IDENTITIES)
     print_result(result, row_label=lambda r: f"店 {r['store_num']} item {r['item_uuid']}")
     if result.has_must_fix:
-        log("⚠️  有 🔴 离谱违反, 但继续出表 (运营对账场景, 让用户自己看差异源).")
+        log("⚠️  有 🔴 离谱违反.")
     return result
 
 
@@ -712,7 +723,7 @@ def md5_file(p: Path) -> str:
 
 
 def main():
-    sd, ed, stores_filter, workers, ver_override = parse_args()
+    sd, ed, stores_filter, workers, ver_override, force = parse_args()
     # 当期 & 上期
     span_days = (ed - sd).days + 1
     prev_ed = sd - timedelta(days=1)
@@ -773,6 +784,21 @@ def main():
         log(f"  ✅ 全 {len(anchor_by_store)} 店跟 ttpos 营业总览 byte-equal 一致 (差额 {diff_t:,.2f}, {rate_t*100:.4f}%)")
 
     write_meta_sheet(wb, version, sd, ed, prev_sd, prev_ed, totals)
+
+    # 零容差闸门 — 在 wb.close() 前执行, 有 MUST_FIX 且无 --force 则 exit(2), 不落盘
+    from semantic.validators.gate import (
+        add_watermark_sheet_xlsxwriter, validate_and_gate)
+    from semantic.validators.identities import FULL_IDENTITIES
+
+    gate_rows = build_validator_check_rows(curr_rows)
+    outcome = validate_and_gate(
+        gate_rows, FULL_IDENTITIES,
+        force=force, report_name="sales_period",
+        row_label=lambda r: f"店 {r['store_num']} item {r['item_uuid']}",
+    )
+    if outcome.needs_watermark:
+        add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
+
     wb.close()
 
     md5 = md5_file(out_path)
