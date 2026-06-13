@@ -45,6 +45,30 @@ class TestOrderLineCte(unittest.TestCase):
         self.assertIn("CAST(ROUND(SUM(sop.discount_fee) * 100) AS INT64) AS voucher_discount", self.sql)
         self.assertIn("GROUP BY item_uuid", self.sql)
 
+    def test_takeout_branch_present(self):
+        # 凭证账外卖路径: ttpos_takeout_order_item, 对齐 sale_event takeout 口径
+        # (PR-C: 凭证账从 dine-only 扩到全渠道, qty 45.5%→89.5%)
+        self.assertIn("`p`.`d`.`ttpos_takeout_order_item` toi", self.sql)
+        self.assertIn("`p`.`d`.`ttpos_takeout_order` t", self.sql)
+        self.assertIn("toi.ttpos_product_package_uuid", self.sql)
+        self.assertIn("t.order_state IN (10, 20, 30, 40)", self.sql)
+        self.assertIn("UNION ALL", self.sql)
+
+    def test_takeout_unmapped_item_filter(self):
+        # package_uuid > 0 排未映射平台商品 (is_mapped=0), 对齐 sale_event
+        self.assertIn("toi.ttpos_product_package_uuid > 0", self.sql)
+
+    def test_takeout_dynamic_time(self):
+        # pitfalls §1.3: state=40 用 completed_time, 否则 accepted_time
+        self.assertIn("t.order_state = 40 AND t.completed_time >= 1", self.sql)
+        self.assertIn("t.order_state != 40 AND t.accepted_time >= 1", self.sql)
+
+    def test_takeout_money_integerized(self):
+        # 萨当整数化, 与 dine 分支一致 (PR-B 边界)
+        self.assertIn(
+            "CAST(ROUND(SUM(toi.price * toi.quantity) * 100) AS INT64) AS voucher_gross",
+            self.sql)
+
 
 if __name__ == "__main__":
     unittest.main()
