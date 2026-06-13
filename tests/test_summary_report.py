@@ -25,30 +25,30 @@ class NewSqlFieldsTests(unittest.TestCase):
 
     def test_free_amount_clause(self):
         self.assertIn(
-            "SUM(IF(sp.free_num > 0, sp.product_sale_price * sp.product_num, 0)) AS free_amount",
+            "CAST(ROUND(SUM(IF(sp.free_num > 0, sp.product_sale_price * sp.product_num, 0)) * 100) AS INT64) AS free_amount",
             self.sql,
         )
 
     def test_give_amount_clause(self):
         self.assertIn(
-            "SUM(IF(sp.give_num > 0, sp.product_sale_price * sp.product_num, 0)) AS give_amount",
+            "CAST(ROUND(SUM(IF(sp.give_num > 0, sp.product_sale_price * sp.product_num, 0)) * 100) AS INT64) AS give_amount",
             self.sql,
         )
 
     def test_discount_amount_clause_uses_same_if_as_actual(self):
         """discount must use the same exclusion (free|give → 0, deduct refund)
-        as actual_amount, otherwise the金额恒等式 won't balance."""
+        as actual_amount, otherwise the金额恒等式 won't balance (萨当整数化)."""
         self.assertIn(
-            "SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,\n"
-            "           (sp.product_sale_price - sp.product_final_price) * (sp.product_num - sp.refund_num))) AS discount_amount",
+            "CAST(ROUND(SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,\n"
+            "           (sp.product_sale_price - sp.product_final_price) * (sp.product_num - sp.refund_num))) * 100) AS INT64) AS discount_amount",
             self.sql,
         )
 
     def test_takeout_side_zeros_new_fields(self):
-        """Takeout has no free/give/discount — must zero them to align schema."""
-        self.assertIn("0 AS free_amount", self.sql)
-        self.assertIn("0 AS give_amount", self.sql)
-        self.assertIn("0 AS discount_amount", self.sql)
+        """Takeout has no free/give/discount — must zero them to align schema (萨当 INT64)."""
+        self.assertIn("CAST(0 AS INT64) AS free_amount", self.sql)
+        self.assertIn("CAST(0 AS INT64) AS give_amount", self.sql)
+        self.assertIn("CAST(0 AS INT64) AS discount_amount", self.sql)
 
     def test_merged_cte_aggregates_new_fields(self):
         self.assertIn(

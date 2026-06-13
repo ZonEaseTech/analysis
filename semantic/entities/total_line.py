@@ -12,6 +12,10 @@ choices that are surprisingly easy to get wrong:
 Depends on (as upstream CTEs in the same WITH clause):
   - shop_sales      (semantic/entities/sale_line.shop_sales_cte)
   - takeout_sales   (semantic/entities/takeout_line.takeout_sales_cte)
+
+金额单位: 萨当 (上游 sale_line/takeout_line 已整数化 INT64). 本 CTE 只做
+IFNULL 加法, 不再 ×100、不再舍入 — 萨当整数加法精确零误差 (spec §6 B).
+唯一例外 avg_member_discount 是 qty 加权比率, 仍 float (估算域).
 """
 
 

@@ -22,9 +22,9 @@ class TestSaleLineGrossAmount(unittest.TestCase):
         self.sql = render(f"WITH {shop_sales_cte()} SELECT * FROM shop_sales")
 
     def test_gross_amount_projected(self):
-        # 与 sale_event 堂食支同式: SUM(sp.product_sale_price * sp.product_num)
+        # 与 sale_event 堂食支同式 (萨当整数化): SUM(sp.product_sale_price * sp.product_num)
         self.assertIn(
-            "SUM(sp.product_sale_price * sp.product_num) AS gross_amount",
+            "CAST(ROUND(SUM(sp.product_sale_price * sp.product_num) * 100) AS INT64) AS gross_amount",
             self.sql,
         )
 
@@ -45,9 +45,9 @@ class TestTakeoutLineGrossAmount(unittest.TestCase):
         self.sql = render(f"WITH {takeout_sales_cte()} SELECT * FROM takeout_sales")
 
     def test_gross_amount_projected(self):
-        # 不分 state 全量: SUM(toi.price * toi.quantity)
+        # 不分 state 全量 (萨当整数化): SUM(toi.price * toi.quantity)
         self.assertIn(
-            "SUM(toi.price * toi.quantity) AS gross_amount",
+            "CAST(ROUND(SUM(toi.price * toi.quantity) * 100) AS INT64) AS gross_amount",
             self.sql,
         )
 

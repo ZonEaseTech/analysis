@@ -15,6 +15,8 @@ Pre-check 核实 (2026-06-12):
   - FK: toi.takeout_order_uuid = t.uuid — 与计划假设一致
   - item 列: toi.price * toi.quantity — 与计划假设一致
   - soft delete: toi.delete_time = 0 / t.delete_time = 0 — 与 takeout_line.py 口径一致
+
+金额单位: 萨当 (satang, INT64) — 唯一舍入点在本 CTE 输出层 (spec §6 B).
 """
 
 
@@ -24,10 +26,10 @@ def takeout_tieout_cte() -> str:
   SELECT
     t.uuid AS order_uuid,
     t.order_state AS order_state,
-    IFNULL(t.platform_total, 0) AS platform_total,
-    IFNULL(t.merchant_charge_fee, 0) AS merchant_charge_fee,
-    IFNULL(t.merchant_discount, 0) AS merchant_discount,
-    SUM(toi.price * toi.quantity) AS item_sum
+    CAST(ROUND(IFNULL(t.platform_total, 0) * 100) AS INT64) AS platform_total,
+    CAST(ROUND(IFNULL(t.merchant_charge_fee, 0) * 100) AS INT64) AS merchant_charge_fee,
+    CAST(ROUND(IFNULL(t.merchant_discount, 0) * 100) AS INT64) AS merchant_discount,
+    CAST(ROUND(SUM(toi.price * toi.quantity) * 100) AS INT64) AS item_sum
   FROM `{project}`.`{dataset}`.`ttpos_takeout_order` t
   JOIN `{project}`.`{dataset}`.`ttpos_takeout_order_item` toi
     ON toi.takeout_order_uuid = t.uuid AND toi.delete_time = 0
