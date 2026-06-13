@@ -176,3 +176,136 @@ merchant 字段恒0: 是
 ---
 
 *生成: 2026-06-12, audit_cross_ledger_202605.py, 全 60 店无查询错误*
+
+---
+
+## 复跑 (PR-B Task 2, 2026-06-13)
+
+> 脚本: `scripts/adhoc/audit_cross_ledger_202605.py` (PR-B Task 1 已合入 `product_type != 2` 修复)
+> 归因脚本: `scripts/adhoc/audit_tieout_outliers_202605.py`
+> 决策分支: **(c) qty 匹配率 <99% + 残差未完全归因 → CROSS_LEDGER 维持观察模式**
+
+### 复跑数字 vs 原始基线
+
+| 指标 | 原始 (PR-A, 2026-06-12) | 复跑 (PR-B, 2026-06-13) | 变化 |
+|---|---|---|---|
+| 全局 (store, item) 行数 | 14,540 | 13,905 | -635 (套餐子行移除) |
+| qty 精确匹配 (全渠道) | 4,583 / 14,540 (**31.5%**) | 6,331 / 13,905 (**45.5%**) | +14pp |
+| qty \|delta\| P50 | 3 | 1 | ↓ |
+| qty \|delta\| P95 | 87 | 29 | ↓ |
+| qty \|delta\| max | 2,087 | 289 | ↓ |
+| gross \|delta\| P50 | 218 THB | 59 THB | ↓ |
+| gross \|delta\| P95 | 6,279 THB | 3,135 THB | ↓ |
+| gross \|delta\| max | 102,263 THB | 36,952 THB | ↓ |
+| 外卖勾稽匹配率 | 99.996% (47,450/47,452) | **100.0%** (47,452/47,452) | +0.004pp |
+| 查询错误 | 0 | 0 | — |
+
+### 复跑根因分析
+
+`product_type != 2` 修复使 qty 匹配率从 31.5% 提升至 45.5%，但仍远低于 99%。
+
+**新发现的结构性根因（两层）：**
+
+**层 1 — 渠道覆盖缺口 (55% 差距的主因)**
+- `sale_event` 统计账 UNION ALL 了 `dine`（堂食）+ `takeout`（外卖）两个渠道
+- `order_line_cte` 凭证账仅覆盖 `dine` 路径（`sale_bill → sale_order → sale_order_product`）
+- 外卖订单走 `ttpos_takeout_order_item`，不经过 `sale_bill`，无法纳入当前 `order_line_cte`
+- 实测（shop002 item 3726275394930695）：stat_qty=236 = dine 47 + takeout 189；voucher_qty=47（仅 dine）
+
+**dine-only 匹配率（去除渠道缺口的干净数字）：93.2% (10,433/11,192)**
+
+**层 2 — 月界时间语义残差 (6.8% 差距)**
+- `statistics_product.complete_time` vs `sale_bill.finish_time` 在月界存在系统性差值
+- 方向：全部 `vchr > stat`（finish_time 落 May，complete_time 落 April）
+- 实测（shop018 item 3727577405458434）：stat_in=686，vchr_in=714，delta=-28
+  月界 ±48h 分段明确确认：post-May 两侧一致，差值集中在 May-IN 窗口
+- 高流量店月界残差更大（shop018 最差 72.5%，低流量店 100%）
+
+### 2 笔外卖异常单归因（技术债 ⑦）
+
+**shop006 order 3733164293885953 (delta=+99 THB)**
+- item_sum = 99 THB（1× 汉堡套餐 @99），platform_total = subtotal = 198 = 2× item_sum
+- eater_payment=198 确认客户实付 198 THB
+- 归因：`ttpos_takeout_order_item` 仅记录 1 行，但 platform 计 198。疑似单内有第 2 份商品
+  未映射至 `ttpos_product_package_uuid`（is_mapped=0 行），导致 item 行不完整。
+- 修复方向：检查该订单中 `is_mapped=0` 的 item 行
+
+**shop059 order 3728170758965263 (delta=+89 THB)**
+- item_sum = 158 THB = subtotal = 158（2 品：Sweet Corn @39 + Value set 5 @119）
+- platform_total = 247，eater_payment = 247；delivery_fee 字段 = 0
+- 归因：89 THB 差额 = platform_total − subtotal，存储在 `raw_data`/`additional_properties`
+  中的配送费字段（BQ schema 已明确有 delivery_fee 列但值为 0，可能平台传输延迟或字段映射问题）
+- 当前 `takeout_tieout_cte` 口径：`platform_total == item_sum`（忽略配送费）
+- 若需精确：应改为 `platform_total == subtotal + delivery_fee + ...`
+- 结论：2 单均为**平台数据映射/字段口径问题**，与商品销售数据质量无关，技术债 ⑦ 状态：已归因，需平台字段核实
+
+### 支付勾稽口径分解（技术债 ②）
+
+| 指标 | 店001 | 店005 | 店010 |
+|---|---|---|---|
+| sale_bill 数 | 1,283 | 3,964 | 3,523 |
+| sb.amount (折后应收) | 166,069 | 583,051 | 507,955 |
+| sb.payment_amount | 165,300 | 578,897 | 504,376 |
+| stat_actual (全渠道) | 317,389 | 863,651 | 652,417 |
+| stat_dine only | 164,923 | 580,005 | 492,010 |
+| stat_takeout only | 152,466 | 283,646 | 160,407 |
+| gap (payment − stat_total) | −152,089 (−47.9%) | −284,754 (−33.0%) | −148,041 (−22.7%) |
+| gap (payment − stat_dine) | **+377 (+0.2%)** | **−1,108 (−0.2%)** | **+12,366 (+2.5%)** |
+
+**候选公式（已验证）：`sale_bill.payment_amount ≈ stat_actual_dine`**
+
+口径结论：
+- `payment_amount` 仅覆盖堂食 POS 收款，外卖订单由平台代收，不过 `sale_bill`
+- 30-50% 差额 ≈ `stat_actual_takeout` / `stat_actual_total`（外卖占比）
+- shop001 差额 47.9% ≈ takeout 占比 48.0% ✅；shop005 33.0% ≈ 32.8% ✅
+- shop010 差额 22.7% vs takeout 占比 24.6%（2% 偏差，需进一步确认 payment_order 侧是否含外卖渠道）
+- **正确闸门选择**：`PAYMENT_TIEOUT_IDENTITY` 应改为对比 `payment_amount` vs `stat_dine_actual`
+  而非 `stat_total_actual`；当前封顶 🟡 正确，但参照系需修正（技术债 ②）
+
+### 残差抽样结论
+
+取 shop018（最差 dine-only 72.5%）的 top 5 残差对：
+
+| item_uuid | stat_dine | vchr | delta | 性质 |
+|---|---|---|---|---|
+| 3727577405458434 | 686 | 714 | −28 | finish_time IN，complete_time OUT（月界） |
+| 3699691531534349 | 298 | 314 | −16 | 同上 |
+| 3727572296796204 | 130 | 142 | −12 | 同上 |
+| 3727586387560573 | 222 | 232 | −10 | 同上 |
+| 3699691523145734 | 131 | 139 | −8 | 同上 |
+
+月界 ±48h 分段验证（item 3727577405458434，shop018）：
+
+|  | pre-May | May-IN | post-May |
+|---|---|---|---|
+| stat | 0 | 686 | 29 |
+| voucher | 0 | 714 | 29 |
+| delta | 0 | **-28** | 0 |
+
+残差完全集中在月界 May-IN 窗口，post-May 两侧一致 → **纯时间语义残差确认**。
+
+但残差规模（6.8% 整体）超过"仅月界几单"的量级：shop018 高流量店每月约 28 单受影响，
+说明完整月的"完整性"尚依赖两个时间戳的长期对齐，不是 1-2 单异常。
+
+### 决策结论（分支 c）
+
+**qty 匹配率 45.5%（全渠道）/ 93.2%（dine-only）< 99% 阈值 → 分支 (c)**
+
+- `CROSS_LEDGER_IDENTITIES` 不进 `FULL_IDENTITIES`，维持独立观察模式
+- `CROSS_LEDGER_QTY` 和 `CROSS_LEDGER_GROSS` 的 classify 不变
+- 技术债 ⑥ 更新：两步升级路径：
+  1. `order_line_cte` 纳入 takeout 路径（添加 `ttpos_takeout_order_item` 路由），全渠道匹配
+  2. 月界时间语义对齐（考虑 `business_date` 维度取代点时间戳比较）
+  以上完成后复跑，预期 ≥99%，届时升分支 (b) 或 (a)
+
+### 技术债更新状态
+
+| 债项 | 状态 |
+|---|---|
+| ② payment 口径 | **已归因**：payment_amount ≈ stat_dine_actual；参照系修正留 PR-C |
+| ⑥ CROSS_LEDGER 升级 | **维持观察**；下一步：order_line 纳入 takeout + 月界对齐 |
+| ⑦ 外卖 2 单异常 | **已归因**：shop006=商品行不完整；shop059=delivery_fee 字段映射残缺 |
+
+---
+
+*复跑: 2026-06-13, PR-B Task 2, 决策分支 (c), 全 60 店无查询错误*
