@@ -63,7 +63,7 @@ sheets:
       - {name: "标准金额",   field_index: 6,  type: value, format: "0.00", merge: true, width: 12,
          comment: "= 商品管理后台标价 × 销量；≠ 营业额 = 改价了", hidden: true}
       - {name: "实收金额",   field_index: 7,  type: value, format: "0.00", merge: true, width: 14,
-         comment: "★ 核心：ttpos CountProductSale 真值（赠送归零、扣退款、用成交价）"}
+         comment: "★ 真·实收 = 应收(AT,成交价) − 订单折扣(AU)。原口径把应收当实收, 已修正(#2)"}
 
       - {name: "折损金额",   field_index: 8,  type: block_formula, format: "0.00", merge: true, width: 11,
          formula: "=F{block_start}-H{block_start}",
@@ -133,6 +133,12 @@ sheets:
       - {name: "价来源",     field_index: 39, merge: true, width: 24,
          comment: "物料单价 来源 (priority 栈, 跟 BOM 数量解耦)\n  外挂层名 / uploaded_price_list / ERPNext / bq_native / 无 (strict)\n  多源用 ' + ' 拼接", hidden: true}
 
+      # 实收口径修正 (#2): 应收 − 订单折扣 = 实收(H)
+      - {name: "应收金额",   field_index: 45, type: value, format: "0.00", merge: true, width: 13,
+         comment: "成交价口径 (= 原误标的'实收'), 未减 7 项订单折扣。应收 − 订单折扣 = 实收(H)"}
+      - {name: "订单级折扣", field_index: 46, type: value, format: "0.00", merge: true, width: 12,
+         comment: "整单 7 项营销减项(券/会员/自定义/活动/赠送/积分/抹零)\n按订单内实收占比摊到本商品 (堂食)"}
+
       # 净利润口径 (支付手续费/平台抽佣/服务费/净利润/净利率) — 暂不交付
       # 费率仍是 PLACEHOLDER, 缺平台对账单事实数据. 等接入再开.
 
@@ -154,7 +160,7 @@ sheets:
       - {name: "标准金额",   field_index: 6,  type: value, format: "0.00", merge: true, width: 12,
          comment: "= 商品管理标价 × 销量", hidden: true}
       - {name: "实收金额",   field_index: 7,  type: value, format: "0.00", merge: true, width: 14,
-         comment: "★ 核心：ttpos CountProductSale 真值"}
+         comment: "★ 真·实收 = 应收(AT,成交价) − 订单折扣(AU)。原口径把应收当实收, 已修正(#2)"}
       - {name: "折损金额",   field_index: 8,  type: block_formula, format: "0.00", merge: true, width: 11,
          formula: "=F{block_start}-H{block_start}",
          comment: "= 营业额 − 实收", hidden: true}
@@ -214,4 +220,9 @@ sheets:
          comment: "BOM 数量/单位 来源 (priority 栈)", hidden: true}
       - {name: "价来源",     field_index: 39, merge: true, width: 24,
          comment: "物料单价 来源 (priority 栈, 跟 BOM 数量解耦)", hidden: true}
+      # 实收口径修正 (#2): 应收 − 订单折扣 = 实收(H)
+      - {name: "应收金额",   field_index: 45, type: value, format: "0.00", merge: true, width: 13,
+         comment: "成交价口径 (= 原误标的'实收'), 未减 7 项订单折扣。应收 − 订单折扣 = 实收(H)"}
+      - {name: "订单级折扣", field_index: 46, type: value, format: "0.00", merge: true, width: 12,
+         comment: "整单 7 项营销减项(券/会员/自定义/活动/赠送/积分/抹零)\n按订单内实收占比摊到本商品 (堂食)"}
       # 净利润口径 — 暂不交付 (同套餐 sheet, 见上方注释)

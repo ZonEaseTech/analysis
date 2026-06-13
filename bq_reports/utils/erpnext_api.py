@@ -104,6 +104,59 @@ def _api_get(base_url: str, auth, doctype: str, fields: List[str], filters: Opti
     return data.get("data", [])
 
 
+def load_erpnext_item_last_purchase(
+    item_codes: Optional[List[str]] = None,
+    sid: Optional[str] = None,
+) -> Dict[str, tuple[float, str]]:
+    """
+    从 ERPNext `Item` 主数据取 last_purchase_rate（最近采购单价），返回
+    {item_code: (rate, stock_uom)}。
+
+    用途：当账号无 `Item Price` doctype 读权限（403），但能读 `Item` 时，
+    用 Item 自带的 last_purchase_rate 作成本源。口径 = 最近一次采购入库单价
+    （非加权均价；wallace-th 实例 valuation_rate 全 0，last_purchase_rate 才是
+    唯一有真实值的成本字段）。
+
+    Args:
+        item_codes: 可选，只加载指定物料编码（IN 过滤，分批）
+        sid: 可选，Frappe session ID
+
+    Returns:
+        item_code -> (last_purchase_rate, stock_uom) 的字典
+    """
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
+    base_url, auth = _get_auth(sid=sid)
+
+    fields = ["item_code", "last_purchase_rate", "stock_uom"]
+    rows: List[dict] = []
+    if item_codes:
+        # frappe 的 IN 过滤 URL 不能太长，分批查
+        B = 90
+        for i in range(0, len(item_codes), B):
+            chunk = item_codes[i:i + B]
+            rows += _api_get(
+                base_url, auth, doctype="Item", fields=fields,
+                filters=[["item_code", "in", chunk]], limit=0,
+            )
+    else:
+        rows = _api_get(base_url, auth, doctype="Item", fields=fields, limit=0)
+
+    prices: Dict[str, tuple[float, str]] = {}
+    for row in rows:
+        code = row.get("item_code")
+        if not code:
+            continue
+        prices[code] = (
+            float(row.get("last_purchase_rate") or 0),
+            row.get("stock_uom", "") or "",
+        )
+    nonzero = sum(1 for v in prices.values() if v[0] > 0)
+    print(f"[ERPNext API] 加载 {len(prices)} 个 Item 的 last_purchase_rate "
+          f"(价>0: {nonzero})")
+    return prices
+
+
 def load_erpnext_prices(
     price_list: Optional[str] = None,
     item_codes: Optional[List[str]] = None,
@@ -119,7 +172,13 @@ def load_erpnext_prices(
 
     Returns:
         item_code -> (price_list_rate, uom) 的字典
+
+    口径开关：环境变量 ERPNEXT_PRICE_SOURCE=last_purchase_rate 时，改从 `Item`
+    主数据取 last_purchase_rate（用于账号无 Item Price 读权限的实例，如 wallace-th）。
     """
+    if os.environ.get("ERPNEXT_PRICE_SOURCE", "").strip().lower() == "last_purchase_rate":
+        return load_erpnext_item_last_purchase(item_codes=item_codes, sid=sid)
+
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
