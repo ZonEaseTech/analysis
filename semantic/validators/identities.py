@@ -16,12 +16,16 @@ Identity families:
 from .core import Identity, Severity
 
 
-# ─── Money identity thresholds (tweak after first real run) ──────────
-_NEGLIGIBLE_ABS = 0.01      # <1 分钱：浮点精度，无视
-_NEGLIGIBLE_REL = 0.001     # <0.1%：舍入累积，无视
-_NEGLIGIBLE_ABS_LOOSE = 1   # <1 元 且 <0.1%：累积舍入，无视
-_MUST_FIX_ABS = 100         # >100 元：必查
-_MUST_FIX_REL = 0.05        # >5%：必查
+# ─── Money identity thresholds (萨当单位) ────────────────────────────
+# PR-B 7c: 交易金额整数化萨当后, 单位从「元」改为「萨当」(1 元 = 100 萨当).
+# 这些常数已不服务 sum 型金额恒等式 (AMOUNT/GROSS 现走 _exact_satang_classify,
+# delta==0 零容差) — 仅供 CROSS_LEDGER_GROSS (两本账残差是数据级, 仍带容忍带)
+# 和封顶勾稽 (_capped_review_money) 用.
+_NEGLIGIBLE_ABS = 1          # <1 萨当 (= 1 分钱)：精度, 无视
+_NEGLIGIBLE_REL = 0.001      # <0.1%：舍入累积, 无视
+_NEGLIGIBLE_ABS_LOOSE = 100  # <100 萨当 (= 1 元) 且 <0.1%：累积舍入, 无视
+_MUST_FIX_ABS = 10_000       # >10000 萨当 (= 100 元)：必查
+_MUST_FIX_REL = 0.05         # >5%：必查
 
 
 def _money_classify(delta: float, lhs: float) -> Severity:
@@ -30,6 +34,9 @@ def _money_classify(delta: float, lhs: float) -> Severity:
     NEGLIGIBLE: tiny absolute OR tiny absolute+relative combo (累积舍入)
     MUST_FIX:   large absolute OR large relative
     Else:       NEEDS_REVIEW
+
+    单位 = 萨当 (PR-B 7c). 服务两本账残差类对账 (CROSS_LEDGER) + 封顶勾稽,
+    不服务 sum 型金额恒等式 (那些走 _exact_satang_classify 收零).
     """
     abs_d = abs(delta)
     rel = (abs_d / abs(lhs)) if lhs else 0.0
@@ -40,6 +47,16 @@ def _money_classify(delta: float, lhs: float) -> Severity:
     if abs_d > _MUST_FIX_ABS or rel > _MUST_FIX_REL:
         return Severity.MUST_FIX
     return Severity.NEEDS_REVIEW
+
+
+def _exact_satang_classify(delta: float, lhs: float) -> Severity:
+    """整数萨当算术精确 — 零是唯一可接受答案 (spec §6 B).
+
+    sum 型金额恒等式 (AMOUNT/GROSS) 的两边都是同一份萨当整数的加减组合,
+    整数化后代数上必然精确相等. 任何非零 delta = 真 bug (字段缺失 / SQL 漏桶 /
+    口径漂移), 立即 MUST_FIX, 没有容忍带.
+    """
+    return Severity.NEGLIGIBLE if delta == 0 else Severity.MUST_FIX
 
 
 def _qty_classify(delta: float, lhs: float) -> Severity:
@@ -72,13 +89,14 @@ AMOUNT_IDENTITY = Identity(
     description=(
         "sales_price = revenue + refund + free + give + discount\n"
         "（cancelled_amount 不参与：ttpos sales_price 已按 state=60 排除，"
-        "取消件价格由 GROSS_AMOUNT_IDENTITY 闭环审计）"
+        "取消件价格由 GROSS_AMOUNT_IDENTITY 闭环审计）\n"
+        "(萨当整数, delta==0)"
     ),
     lhs=lambda r: r["sales_price"],
     rhs=lambda r: (r["revenue"] + r["refund_amount"]
                    + r["free_amount"] + r["give_amount"]
                    + r["discount_amount"]),
-    classify=_money_classify,
+    classify=_exact_satang_classify,
     fields=("sales_price", "revenue", "refund_amount", "free_amount", "give_amount", "discount_amount"),
 )
 
@@ -89,11 +107,12 @@ GROSS_AMOUNT_IDENTITY = Identity(
         "gross_amount = sales_price + cancelled_amount\n"
         "守恒闭环: 把被金额恒等式排除的取消金额纳入审计 (spec §5 A3). 外卖侧"
         " gross 不分 state 全量, 本式审计 state 枚举完备性 — ttpos 若新增 state,"
-        " 金额漏桶立刻 fire."
+        " 金额漏桶立刻 fire.\n"
+        "(萨当整数, delta==0)"
     ),
     lhs=lambda r: r["gross_amount"],
     rhs=lambda r: r["sales_price"] + r["cancelled_amount"],
-    classify=_money_classify,
+    classify=_exact_satang_classify,
     fields=("gross_amount", "sales_price", "cancelled_amount"),
 )
 
