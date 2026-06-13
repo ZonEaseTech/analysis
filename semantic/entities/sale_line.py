@@ -48,6 +48,8 @@ def shop_sales_cte(exclude_test_business: bool = False) -> str:
     SUM(sp.product_num) AS qty,
     -- 营业额：标价 × 销量（不扣折扣、不扣退款、含赠品）
     SUM(sp.product_sale_price * sp.product_num) AS sales_price,
+    -- 毛额 (守恒闭环锚): 堂食无 state, 与 sales_price 同式
+    SUM(sp.product_sale_price * sp.product_num) AS gross_amount,
     -- 标准金额：商品管理标价 × 销量
     SUM(IFNULL(pp.price, 0) * sp.product_num) AS original_amount,
     -- 实收金额：ttpos CountProductSale 真实口径 — 赠品/赠送归零，扣退款，用成交价

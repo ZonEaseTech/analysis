@@ -562,6 +562,8 @@ SELECT
   m.qty AS qty,
   m.revenue AS revenue,
   m.sales_price AS sales_price,
+  -- 毛额 (守恒闭环锚): 来自 merged CTE, 堂食=sales_price, 外卖 state-UNCONDITIONED
+  m.gross_amount AS gross_amount,
   m.original_amount AS original_amount,
   m.avg_member_discount AS avg_member_discount,
   m.free_qty AS free_qty,
@@ -1023,8 +1025,8 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         data[key]["qty"] += qty
         data[key]["revenue"] += revenue
         data[key]["sales_price"] += sales_price
-        # 定义式补齐 (sale_line/takeout_line 未投影 gross_amount), 真校验在 sale_event 报表
-        data[key]["gross_amount"] += sales_price + float(getattr(row, "cancelled_amount", 0) or 0)
+        # 真实列 (sale_line/takeout_line 已投影 gross_amount), 毛额守恒为真校验
+        data[key]["gross_amount"] += float(getattr(row, "gross_amount", 0) or 0)
         data[key]["original_amount"] += original_amount
         data[key]["refund_qty"] += refund_qty
         data[key]["refund_amount"] += refund_amount
@@ -1103,7 +1105,7 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
             "net_qty": net_qty,
             "revenue": val["revenue"],
             "sales_price": val["sales_price"],
-            # 定义式补齐 (sale_line/takeout_line 未投影 gross_amount), 真校验在 sale_event 报表
+            # 真实列透传 — sale_line/takeout_line/total_line 已投影 gross_amount
             "gross_amount": val["gross_amount"],
             "original_amount": val["original_amount"],
             "refund_qty": val["refund_qty"],

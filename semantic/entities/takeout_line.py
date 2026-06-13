@@ -33,6 +33,9 @@ def takeout_sales_cte(exclude_test_business: bool = False) -> str:
     -- 营业额 / 实收：state IN (10,20,30,40) 算，state=60 取消订单计 0
     -- 外卖没有 free/give/refund 概念，actual_amount = sales_price
     SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) AS sales_price,
+    -- 毛额: 不分 state 全量. GROSS_AMOUNT 恒等式据此审计 state 枚举完备性 —
+    -- 若 ttpos 新增 state, 金额从 sales_price/cancelled 之间漏掉, 恒等式立刻 fire
+    SUM(toi.price * toi.quantity) AS gross_amount,
     SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) AS actual_amount,
     SUM(IF(t.order_state IN (10,20,30,40), IFNULL(pp.price, 0) * toi.quantity, 0)) AS original_amount,
     0 AS refund_qty,

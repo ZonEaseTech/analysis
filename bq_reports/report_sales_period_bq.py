@@ -73,15 +73,16 @@ STORE_LIST = [
     ("67", "5752387276800000"), ("72", "3469788319744000"),
 ]
 
-# 13 个指标 + 中文 label (用户 Q3: 全展示用来对账)
+# 14 个指标 + 中文 label (用户 Q3: 全展示用来对账; gross_amount 供毛额守恒真校验)
 METRICS = [
-    "qty", "sales_price", "original_amount", "actual_amount",
+    "qty", "sales_price", "gross_amount", "original_amount", "actual_amount",
     "refund_qty", "refund_amount", "free_qty", "give_qty",
     "free_amount", "give_amount", "discount_amount",
     "cancelled_qty", "cancelled_amount",
 ]
 METRIC_LABELS = {
-    "qty": "销量", "sales_price": "营业额", "original_amount": "标准金额",
+    "qty": "销量", "sales_price": "营业额", "gross_amount": "毛额",
+    "original_amount": "标准金额",
     "actual_amount": "实收金额", "refund_qty": "退单数", "refund_amount": "退单金额",
     "free_qty": "免单数", "give_qty": "赠送数", "free_amount": "免单金额",
     "give_amount": "赠送金额", "discount_amount": "折扣金额",
@@ -698,8 +699,8 @@ def build_validator_check_rows(rows) -> list:
             "give_amount": r.get("give_amount", 0),
             "discount_amount": r.get("discount_amount", 0),
             "cancelled_amount": ca,
-            # 定义式补齐 (SQL 未投影 gross_amount), 真校验在 sale_event 报表
-            "gross_amount": sp + ca,
+            # 真实列 (sale_event 已投影 gross_amount, 已加入 METRICS), 毛额守恒为真校验
+            "gross_amount": r.get("gross_amount", 0) or 0,
         })
     return check_rows
 

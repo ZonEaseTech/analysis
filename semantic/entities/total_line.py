@@ -25,6 +25,8 @@ def merged_cte() -> str:
     IFNULL(s.actual_amount, 0) + IFNULL(t.actual_amount, 0) AS revenue,
     -- 营业额：标价×销量
     IFNULL(s.sales_price, 0) + IFNULL(t.sales_price, 0) AS sales_price,
+    -- 毛额 (守恒闭环锚): shop 端无 state + takeout 端 state-UNCONDITIONED 全量
+    IFNULL(s.gross_amount, 0) + IFNULL(t.gross_amount, 0) AS gross_amount,
     IFNULL(s.original_amount, 0) + IFNULL(t.original_amount, 0) AS original_amount,
     IFNULL(s.refund_qty, 0) + IFNULL(t.refund_qty, 0) AS refund_qty,
     IFNULL(s.refund_amount, 0) + IFNULL(t.refund_amount, 0) AS refund_amount,
