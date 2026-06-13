@@ -1043,6 +1043,14 @@ class ReportExporter(MultiShopExporter):
             key=lambda r: (_store_key(r), r.get("日期", ""), -float(r.get("净收金额", 0) or 0))
         )
 
+        # 零容差闸门 (set_gate 设置后执行; 主表 sales_results 为闸门输入).
+        # ⚠️ 必须在 xlsxwriter.Workbook() 构造之前: xlsxwriter 的落盘动作是
+        # close(), 若把 gate 放 try、close 放 finally, 则 gate 的 sys.exit(2)
+        # 触发后 finally 仍会 flush 一个无水印文件到盘 — 违反「🔴 且无 force →
+        # 不产文件」契约 (PR-A #24 review; 回归测试见 tests/test_bq_exporter_gate
+        # ::TestXlsxwriterGateNoFileLeak). 闸门只需 sales_results, 不依赖 workbook.
+        outcome = self.gate_spec.run(sales_results) if self.gate_spec is not None else None
+
         import xlsxwriter
         wb = xlsxwriter.Workbook(str(output_path))
         try:
@@ -1059,11 +1067,8 @@ class ReportExporter(MultiShopExporter):
             self._write_data_sheet_xw(wb, "支付方式明细(按天)", payment_daily_results,
                 ["门店编号", "门店名称", "日期", "支付方式", "渠道", "笔数", "收款总额", "退款金额", "净收金额"])
 
-            # 零容差闸门 (set_gate 设置后执行; 主表 sales_results 为闸门输入)
-            if self.gate_spec is not None:
-                outcome = self.gate_spec.run(sales_results)
-                if outcome.needs_watermark:
-                    add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
+            if outcome is not None and outcome.needs_watermark:
+                add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
         finally:
             wb.close()
         
