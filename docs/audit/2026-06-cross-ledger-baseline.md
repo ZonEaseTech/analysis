@@ -365,6 +365,11 @@ PR-B「复跑」段把 dine 残差归到**月界 `complete_time` vs `finish_time
    (ttpos 后端写入可靠性问题，方向 voucher > stat)。
 2. **未映射外卖商品** —— `is_mapped=0` / `package_uuid=0` 的 takeout 行，只在一本账里出现。
 3. **促销码路径** —— 例如 `PEPSIMCK` 等促销码只落在单边账本。
+4. **builder 口径项(可消,非后端不可控)** —— `cross_ledger.build_cross_ledger_rows`
+   比较时 stat 侧用 sale_event raw qty(含外卖 state=60 取消件,被拆进 cancelled_qty),
+   voucher 侧 order_line 已排除 state=60,故取消件使 stat 略高于 voucher。这一项**不是**
+   后端问题,builder 改用 net_qty(扣 cancelled)对齐两侧即可消除,留作 CROSS_LEDGER
+   后续收口的可控项(前三项才是结构天花板)。
 
 明确结论：**≥99% 不可达**。后端写入可靠性问题属 ttpos 业务系统层，不在本 BQ 分析口径
 可修复范围内；继续往 order_line SQL 上加路由/对齐时间，都无法跨过这个天花板。
