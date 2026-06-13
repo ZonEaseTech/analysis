@@ -17,12 +17,14 @@ from .utils.bq_exporter import ReportExporter
 def main():
     parser = argparse.ArgumentParser(description="销售业绩 + 物品消耗报表导出")
     parser.add_argument("--month", required=True, help="月份，格式 YYYY-MM，如 2026-01")
-    parser.add_argument("--merchants", default="resources/merchants.xlsx", 
+    parser.add_argument("--merchants", default="resources/merchants.xlsx",
                         help="商家列表 Excel 路径")
     parser.add_argument("--output", required=True, help="输出 Excel 文件路径")
     parser.add_argument("--project", default="diyl-407103", help="GCP 项目 ID")
     parser.add_argument("--external", default=None,
                         help="外部销售源, 格式 'provider:key=val', e.g. 'huku:path=/path/to/file.xlsx'")
+    parser.add_argument("--force", action="store_true",
+                        help="校验失败仍强制导出 (文件带水印, 不得对外交付)")
 
     args = parser.parse_args()
 
@@ -32,6 +34,15 @@ def main():
         project_id=args.project,
         output_path=args.output
     )
+
+    from semantic.validators.gate import GateSpec
+
+    exporter.set_gate(GateSpec(
+        identities=[],  # 技术债: 该报表字段未对齐销售恒等式, 暂只做非空闸门; Task 11 基线工厂落地后升级必填字段校验
+        force=args.force,
+        report_name="sales_consumption",
+        build_check_rows=lambda rows: [{"_row": i} for i, _ in enumerate(rows)],
+    ))
 
     result = exporter.export_sales_and_consumption(
         month=args.month,

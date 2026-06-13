@@ -53,6 +53,10 @@ def _qty_classify(delta: float, lhs: float) -> Severity:
 
 # ─── The two identities ──────────────────────────────────────────────
 
+# ⚠️ 定义式守卫, 非对账. 报表层的 net_qty 是 `qty − 其他桶` 减法推导的,
+# 本恒等式在这种 row 上代数永真 (见 tests/test_identity_perturbation.py
+# TestSalesQtyIsDefinitional). 它的价值仅剩: 防字段缺失 / schema 漂移.
+# 真实检测力 = CROSS_LEDGER_IDENTITIES (统计账 vs 凭证账互证).
 SALES_QTY_IDENTITY = Identity(
     name="销量恒等式",
     description="qty = net_qty + free_qty + give_qty + refund_qty + cancelled_qty",
@@ -60,6 +64,7 @@ SALES_QTY_IDENTITY = Identity(
     rhs=lambda r: (r["net_qty"] + r["free_qty"] + r["give_qty"]
                    + r["refund_qty"] + r["cancelled_qty"]),
     classify=_qty_classify,
+    fields=("qty", "net_qty", "free_qty", "give_qty", "refund_qty", "cancelled_qty"),
 )
 
 AMOUNT_IDENTITY = Identity(
@@ -67,18 +72,34 @@ AMOUNT_IDENTITY = Identity(
     description=(
         "sales_price = revenue + refund + free + give + discount\n"
         "（cancelled_amount 不参与：ttpos sales_price 已按 state=60 排除，"
-        "取消件价格独立审计）"
+        "取消件价格由 GROSS_AMOUNT_IDENTITY 闭环审计）"
     ),
     lhs=lambda r: r["sales_price"],
     rhs=lambda r: (r["revenue"] + r["refund_amount"]
                    + r["free_amount"] + r["give_amount"]
                    + r["discount_amount"]),
     classify=_money_classify,
+    fields=("sales_price", "revenue", "refund_amount", "free_amount", "give_amount", "discount_amount"),
+)
+
+
+GROSS_AMOUNT_IDENTITY = Identity(
+    name="毛额守恒恒等式",
+    description=(
+        "gross_amount = sales_price + cancelled_amount\n"
+        "守恒闭环: 把被金额恒等式排除的取消金额纳入审计 (spec §5 A3). 外卖侧"
+        " gross 不分 state 全量, 本式审计 state 枚举完备性 — ttpos 若新增 state,"
+        " 金额漏桶立刻 fire."
+    ),
+    lhs=lambda r: r["gross_amount"],
+    rhs=lambda r: r["sales_price"] + r["cancelled_amount"],
+    classify=_money_classify,
+    fields=("gross_amount", "sales_price", "cancelled_amount"),
 )
 
 
 # Default bundle for the profit_margin / sku_profit_summary reports.
-DEFAULT_IDENTITIES = [SALES_QTY_IDENTITY, AMOUNT_IDENTITY]
+DEFAULT_IDENTITIES = [SALES_QTY_IDENTITY, AMOUNT_IDENTITY, GROSS_AMOUNT_IDENTITY]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -232,6 +253,143 @@ SANITY_BAND_IDENTITIES = [
     FREE_GIVE_RATIO_BAND,
     CANCEL_RATIO_BAND,
 ]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# A1 — Cross-Ledger Identities (跨账本互证: 统计账 vs 凭证账)
+#
+# row 由 semantic/validators/cross_ledger.build_cross_ledger_rows 构建.
+# ⚠️ 独立 bundle, 不进 FULL_IDENTITIES / 不进导出闸门 — 时间语义对齐度
+# (sp.complete_time vs sb.finish_time) 由 2026-05 观察跑实测后才决定升级
+# (spec §11 PR-A 验收线; 决策记录见 docs/audit/2026-06-cross-ledger-baseline.md).
+# ═══════════════════════════════════════════════════════════════════
+
+CROSS_LEDGER_QTY = Identity(
+    name="跨账本销量互证",
+    description="统计账 qty == 凭证账 SUM(num) — 两本账独立写入, 互相可证伪",
+    lhs=lambda r: r["stat_qty"],
+    rhs=lambda r: r["voucher_qty"],
+    classify=lambda d, lhs: (Severity.NEGLIGIBLE if d == 0 else Severity.MUST_FIX),  # qty 是 int 转 float, 精确相等安全; 若引入小数计量需改判别
+    fields=("stat_qty", "voucher_qty"),
+)
+
+CROSS_LEDGER_GROSS = Identity(
+    name="跨账本毛额互证",
+    description="统计账 gross_amount == 凭证账 SUM(sale_price×num) — PR-B 整数化后收零容差",
+    lhs=lambda r: r["stat_gross"],
+    rhs=lambda r: r["voucher_gross"],
+    classify=_money_classify,
+    fields=("stat_gross", "voucher_gross"),
+)
+
+VOUCHER_COVERAGE = Identity(
+    name="凭证账覆盖完整性",
+    description=(
+        "统计账有销量 (stat_qty > 0) 的 (store, item) 必须在凭证账有行.\n"
+        "违反语义是「该数字未经互证」, 不是「数字错了」— console 文案要区分."
+    ),
+    lhs=lambda r: 1.0 if (r["stat_qty"] > 0 and r["voucher_present"] == 0.0) else 0.0,
+    rhs=lambda r: 0.0,
+    classify=_coverage_classify,
+    fields=("stat_qty", "voucher_present"),
+)
+
+CROSS_LEDGER_IDENTITIES = [CROSS_LEDGER_QTY, CROSS_LEDGER_GROSS, VOUCHER_COVERAGE]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# A2 — Takeout Tieout Identities (外卖订单勾稽: item 级求和 vs 订单级 platform_total)
+#
+# row 由 semantic/entities/takeout_tieout.takeout_tieout_cte() 构建, 订单粒度.
+# ⚠️ 独立 bundle, 不进 FULL_IDENTITIES / DEFAULT_IDENTITIES —
+#    merchant_charge_fee/merchant_discount 符号关系待观察跑校准 (pitfalls §5.1).
+#    华莱士当前两字段恒 0; 业务开启费用时本 bundle 会 fire 提醒校准.
+#    封顶 🟡: 升 MUST_FIX 须等口径校准
+#    (docs/audit/2026-06-cross-ledger-baseline.md).
+# ═══════════════════════════════════════════════════════════════════
+
+def _capped_review_money(delta: float, lhs: float) -> Severity:
+    """金额分类但封顶 NEEDS_REVIEW — 给口径未校准的勾稽用 (spec §5 A1 支付勾稽同策)."""
+    sev = _money_classify(delta, lhs)
+    return Severity.NEEDS_REVIEW if sev == Severity.MUST_FIX else sev
+
+
+TAKEOUT_TIEOUT_IDENTITY = Identity(
+    name="外卖订单勾稽",
+    description=(
+        "外卖订单级勾稽. 符号待观察跑校准 — 当前假设:\n"
+        "platform_total == item_sum − merchant_charge_fee − merchant_discount\n"
+        "(华莱士当前 merchant 字段恒 0, 两种符号数值等价; 字段启用时以实测为准).\n"
+        "封顶 🟡: 升 MUST_FIX 须等口径校准 (docs/audit/2026-06-cross-ledger-baseline.md)."
+    ),
+    lhs=lambda r: r["platform_total"],
+    rhs=lambda r: (r["item_sum"] - r["merchant_charge_fee"]
+                   - r["merchant_discount"]),
+    classify=_capped_review_money,
+    fields=("platform_total", "item_sum", "merchant_charge_fee", "merchant_discount"),
+)
+
+TAKEOUT_TIEOUT_IDENTITIES = [TAKEOUT_TIEOUT_IDENTITY]
+
+
+PAYMENT_TIEOUT_IDENTITY = Identity(
+    name="支付勾稽",
+    description=(
+        "店×月粒度: SUM(sale_bill.payment_amount) vs 统计账实收 (actual_amount).\n"
+        "封顶 🟡 (spec §5 A1): service_fee/tax_fee/整单折扣的口径映射待"
+        " 2026-05 观察跑校准, 校准前不转红线 (CLAUDE.md 技术债 ②).\n"
+        "row 字段: payment_amount_sum / stat_actual_sum (由观察跑/报表层构造)."
+    ),
+    lhs=lambda r: r["payment_amount_sum"],
+    rhs=lambda r: r["stat_actual_sum"],
+    classify=_capped_review_money,
+    fields=("payment_amount_sum", "stat_actual_sum"),
+)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# 非销售导出基线 (BOM / 菜单 / 名录类报表)
+#
+# 这些报表没有销量/金额桶, "可靠"的最低数学含义是: 行非空 (gate min_rows)、
+# 必填列非空、主键不重复. 比裸奔强一个数量级, 但明确不是对账 — 描述里写清.
+# ═══════════════════════════════════════════════════════════════════
+
+def make_required_fields_identity(required: tuple, name: str) -> Identity:
+    """必填字段非空基线. row 缺 key 或值为空串/None → MUST_FIX."""
+    def _missing_count(r: dict) -> float:
+        return float(sum(
+            1 for f in required
+            if f not in r or r[f] is None or (isinstance(r[f], str) and not r[f].strip())
+        ))
+    return Identity(
+        name=name,
+        description=f"必填字段非空: {', '.join(required)} (基线校验, 非对账)",
+        lhs=_missing_count,
+        rhs=lambda r: 0.0,
+        classify=_coverage_classify,
+        fields=tuple(required),
+    )
+
+
+def make_unique_key_identity(key_fields: tuple, name: str):
+    """主键唯一基线. 返回 (identity, prepare) — prepare 给每行标注 _dup_count,
+    identity 检查它为 0. (core.check 是 row-local 的, 跨行去重只能预处理.)"""
+    def prepare(rows: list) -> list:
+        seen: dict = {}
+        for r in rows:
+            k = tuple(r.get(f) for f in key_fields)
+            seen[k] = seen.get(k, 0) + 1
+        return [{**r, "_dup_count": float(seen[tuple(r.get(f) for f in key_fields)] - 1)}
+                for r in rows]
+    ident = Identity(
+        name=name,
+        description=f"主键唯一: ({', '.join(key_fields)}) 重复 = 数据放大, MUST_FIX",
+        lhs=lambda r: r["_dup_count"],
+        rhs=lambda r: 0.0,
+        classify=_coverage_classify,
+        fields=("_dup_count",),
+    )
+    return ident, prepare
 
 
 # ═══════════════════════════════════════════════════════════════════

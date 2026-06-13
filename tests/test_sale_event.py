@@ -91,6 +91,15 @@ class SaleEventCteTests(unittest.TestCase):
         self.assertIn("0 AS give_amount", self.sql)
         self.assertIn("0 AS discount_amount", self.sql)
 
+    def test_gross_amount_dine(self):
+        # 堂食: gross == 标价×销量 (无 state 概念, 与 sales_price 同式)
+        self.assertIn(
+            "SUM(sp.product_sale_price * sp.product_num) AS gross_amount", self.sql)
+
+    def test_gross_amount_takeout_unconditioned(self):
+        # 外卖: 不分 state 全量 — 这是守恒闭环的关键, 不许加 IF(order_state ...)
+        self.assertIn("SUM(toi.price * toi.quantity) AS gross_amount", self.sql)
+
 
 class MetricAndDimensionDeclarationTests(unittest.TestCase):
     """The module-level lists drive aggregate_by_grain; if they drift from the

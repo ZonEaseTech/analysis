@@ -287,7 +287,45 @@ def _write_no_bom_sheet(ws, no_bom, store_name: str):
     ws.freeze_panes = "A2"
 
 
-def write_excel(with_bom, no_bom, store_name: str, output_path: str):
+def write_excel(with_bom, no_bom, store_name: str, output_path: str,
+                force: bool = False):
+    from semantic.validators.gate import (
+        add_watermark_sheet_openpyxl, validate_and_gate)
+    from semantic.validators.identities import (
+        make_required_fields_identity, make_unique_key_identity)
+
+    outcomes = []
+
+    # Sheet 1「已删除BOM清单」: 有 BOM 的已删除商品明细 — 空=当月无已删除且有BOM的商品(合法), min_rows=0
+    uniq_ident, prepare = make_unique_key_identity(
+        ("product_name", "material_name"), name="商品+物料主键唯一")
+    check_rows = prepare([
+        {"product_name": r.product_name or "", "material_name": r.material_name or ""}
+        for r in with_bom
+    ])
+    outcomes.append(validate_and_gate(
+        check_rows,
+        [make_required_fields_identity(
+            ("product_name", "material_name"), name="已删除单品BOM必填字段"),
+         uniq_ident],
+        force=force, report_name="deleted_single_bom/with_bom",
+        row_label=lambda r: f"{r.get('product_name', '')} / {r.get('material_name', '')}",
+        min_rows=0,  # 空=可能合法(当月无已删除且配有BOM的商品)
+    ))
+
+    # Sheet 2「已删除未配置BOM」: 诊断列表(已删除但从未配过BOM的商品) — 空=好状态, min_rows=0
+    no_bom_check_rows = [
+        {"product_name": r.product_name or ""}
+        for r in no_bom
+    ]
+    outcomes.append(validate_and_gate(
+        no_bom_check_rows,
+        [make_required_fields_identity(("product_name",), name="已删除未配BOM商品名必填")],
+        force=force, report_name="deleted_single_bom/no_bom",
+        row_label=lambda r: r.get("product_name", ""),
+        min_rows=0,  # 空=好状态(所有已删除商品都曾配置过BOM)
+    ))
+
     wb = Workbook()
     ws_bom = wb.active
     ws_bom.title = "已删除BOM清单"
@@ -295,6 +333,10 @@ def write_excel(with_bom, no_bom, store_name: str, output_path: str):
 
     ws_no = wb.create_sheet("已删除未配置BOM")
     _write_no_bom_sheet(ws_no, no_bom, store_name)
+
+    if any(o.needs_watermark for o in outcomes):
+        first_wm = next(o for o in outcomes if o.needs_watermark)
+        add_watermark_sheet_openpyxl(wb, first_wm.watermark_lines())
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -319,6 +361,8 @@ def parse_args():
                    help=f"删除时间截止 Unix 时间戳(默认 {DEFAULT_END_TS}=2026-04-01)")
     p.add_argument("--output", required=True,
                    help=f"输出 Excel 文件路径(自动追加版本号 _{REPORT_VERSION})")
+    p.add_argument("--force", action="store_true",
+                   help="强制导出 (有 🔴 违反时打水印而非阻断)")
     return p.parse_args()
 
 
@@ -346,7 +390,7 @@ def main():
     print(f"[BQ] 共 {len(rows)} 行")
 
     with_bom, no_bom = split_rows(rows)
-    write_excel(with_bom, no_bom, store_name, output_path)
+    write_excel(with_bom, no_bom, store_name, output_path, force=args.force)
 
     no_bom_singles = sum(1 for r in no_bom if r.sort_type == 0)
     no_bom_sauces = sum(1 for r in no_bom if r.sort_type == 1)

@@ -127,8 +127,8 @@ class BuildRowsShapeTests(unittest.TestCase):
         )
         # 1 SKU × 2 BOM = 2 行 (不是 2 价 × 2 BOM = 4)
         self.assertEqual(len(rows), 2)
-        # 40 列 (37 visible + 1 hidden + 2 audit: BOM 来源, 价来源)
-        self.assertEqual(len(rows[0]), 40)
+        # 45 列 (37 visible + 1 hidden + 2 audit + 5 净利润口径: 支付手续费/平台抽佣/服务费收入/净利润/净利率)
+        self.assertEqual(len(rows[0]), 45)
 
     def test_row_columns_match_yaml_layout(self):
         fine = aggregate_by_grain(self.events, FINE_GRAIN_KEYS, METRIC_KEYS)
@@ -244,7 +244,7 @@ class ExcelRoundTrip(unittest.TestCase):
                          '=IF(OR(E2=0,AH2=0),"",H2/E2-AH2)')
         self.assertEqual(ws.cell(row=2, column=headers["总毛利"]).value,
                          '=IF(AH2=0,"",H2-E2*AH2)')
-        self.assertEqual(ws.cell(row=2, column=headers["净利润率"]).value,
+        self.assertEqual(ws.cell(row=2, column=headers["毛利率"]).value,
                          '=IF(OR(H2=0,AH2=0),"",AJ2/H2)')
 
 

@@ -82,25 +82,26 @@ analysis/
 
 ### 3. 导出必须接校验器（无例外）
 
-**任何把数据写到 Excel/CSV 的报表脚本，导出阶段必须跑 `semantic/validators/`，
-console 至少打印 ✅/🟡/🔴 三级摘要。** 这是为了：
+**任何把数据写到 Excel/CSV 的报表脚本，导出阶段必须跑 `semantic/validators/`。**
+这是为了：
 
 - **可审计**：数据出问题时一眼看出"是源 / 聚合 / 落盘哪一层错了"
 - **对账闭环**：中间表 (`profit_margin`) 跟交付物 (`profit_by_price` 等) 共享同一份
   identities，任一边违反恒等式立即在 console 里冒出来
 - **拒绝胡编乱造**：客户/老板拿到的每个数字背后都有数学保证，不是"看起来差不多"
 
-#### 最小集成（4 行 + 一个字典构造）
+#### 最小集成（闸门语义，非建议性）
 
 ```python
-from semantic.validators import check, print_result
-from semantic.validators.identities import DEFAULT_IDENTITIES
+from semantic.validators.gate import validate_and_gate, add_watermark_sheet_xlsxwriter
+from semantic.validators.identities import FULL_IDENTITIES
 
-check_rows = [{"store_num": ..., "item_name": ..., **agg_metrics} for ...]
-result = check(check_rows, DEFAULT_IDENTITIES)
-print_result(result, row_label=lambda r: f"店 {r['store_num']}  {r['item_name']}")
-if result.has_must_fix:
-    print("⚠️  有 🔴 离谱违反，请核实数据/口径。")
+outcome = validate_and_gate(check_rows, FULL_IDENTITIES,
+                            force=args.force, report_name="my_report",
+                            row_label=lambda r: f"店 {r['store_num']}")
+# 有 🔴 且无 --force → 已在函数内 exit 2, 不产出文件
+if outcome.needs_watermark:   # --force 强制导出
+    add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
 ```
 
 `check_rows` 里 row 必须包含 identities 用到的字段：
@@ -110,6 +111,15 @@ if result.has_must_fix:
 
 新报表如果有新维度/新指标，**新加 identity** 到 `semantic/validators/identities.py`，
 不要写"特殊容忍"在报表脚本里——所有口径只在 identities 文件里收口。
+
+**"无例外"是机制不是口号**:`tests/test_validator_coverage.py` AST 扫描
+`bq_reports/*.py`,不接闸门(直调 `validate_and_gate` 或经 `GateSpec` 走
+bq_exporter 集中式钩子)的脚本直接挂测试。
+校验失败默认 exit 2 不产出文件;`--force` 强制导出的文件首页带红色水印
+"⚠️校验未通过",不得对外交付。
+非销售类导出(BOM/菜单)用 `make_required_fields_identity` /
+`make_unique_key_identity` 基线,不许裸奔;空表语义按 sheet 判定
+(`min_rows=0` 仅用于"空=好状态/空=合法"的诊断类数据集,代码内注释说明)。
 
 #### 现成可复用的报表模式
 
@@ -148,3 +158,19 @@ BQ_PROXY=http://127.0.0.1:7897 venv/bin/python -m bq_reports.profit_margin_repor
 ```
 
 `bq_client.setup_proxy()` 和各报表脚本里的同名函数都会读 `BQ_PROXY`，未设置时为 no-op。
+
+### 6. 技术债清单(零容差改造)
+
+spec: `docs/superpowers/specs/2026-06-12-zero-tolerance-design.md`
+基线: `docs/audit/2026-06-cross-ledger-baseline.md`
+
+| # | 债 | 还债条件 |
+|---|---|---|
+| ② | 支付勾稽 (bill.payment_amount vs 统计账实收) 封顶 🟡, 实测全店差 30-50% | service_fee/tax_fee/整单折扣/会员储值口径校准后转红线 |
+| ③ | 外卖平台侧退款不在恒等式内 | 对账桥范围, 子项目 D 接平台对账单后 |
+| ④ | sale_event / sale_line 双轨并存; profit_margin/sales_period 的 gross_amount 是定义式补齐 | sale_line/takeout_line 投影 gross_amount (PR-B), CROSS_LEDGER 证明等价后合并双轨 |
+| ⑤ | pnl_statement 只接非空闸门, 销售恒等式待 P&L 行字段对齐 | PR-B 整数化时一并对齐 |
+| ⑥ | CROSS_LEDGER 未进闸门: 凭证账含套餐子项行, 粒度不齐 (qty match 31.5%) | PR-B 修 order_line 套餐口径 → 复跑观察 → 100% 后进闸门 |
+| ⑦ | 外卖勾稽 2 单偏差未归因 (shop006/373316429388, shop059/372817075896) | PR-B 观察复跑时一并排查 |
+
+(技术债 ① "2026-05 前旧口径封存" 在 PR-B 落 month guard 时写入。)

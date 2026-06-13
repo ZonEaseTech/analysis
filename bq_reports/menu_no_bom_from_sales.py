@@ -79,7 +79,25 @@ def query_bq(client, dataset: str):
     return {r.name_zh: r for r in rows if r.name_zh}
 
 
-def write_excel(matched_items, output_path: str):
+def write_excel(matched_items, output_path: str, force: bool = False):
+    from semantic.validators.gate import (
+        add_watermark_sheet_openpyxl, validate_and_gate)
+    from semantic.validators.identities import (
+        make_required_fields_identity, make_unique_key_identity)
+
+    uniq_ident, prepare = make_unique_key_identity(("name_zh",), name="中文名唯一")
+    check_rows = prepare([
+        {"name_zh": bq_row.name_zh or "", "ptype": bq_row.ptype or ""}
+        for _, (bq_row, _) in matched_items
+    ])
+    outcome = validate_and_gate(
+        check_rows,
+        [make_required_fields_identity(("name_zh",), name="销售匹配菜单中文名必填"),
+         uniq_ident],
+        force=force, report_name="menu_no_bom_from_sales",
+        row_label=lambda r: r.get("name_zh", ""),
+    )
+
     wb = Workbook()
     ws = wb.active
     ws.title = "未设置BOM商品(已匹配)"
@@ -111,6 +129,9 @@ def write_excel(matched_items, output_path: str):
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = w
     ws.freeze_panes = "A2"
 
+    if outcome.needs_watermark:
+        add_watermark_sheet_openpyxl(wb, outcome.watermark_lines())
+
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
 
@@ -121,6 +142,8 @@ def parse_args():
     p.add_argument("--dataset", default=DEFAULT_DATASET, help="BQ dataset")
     p.add_argument("--input", required=True, help="销售报表 Excel 路径")
     p.add_argument("--output", default="exports/menu_no_bom_clean.xlsx", help="输出路径")
+    p.add_argument("--force", action="store_true",
+                   help="强制导出 (有 🔴 违反时打水印而非阻断)")
     return p.parse_args()
 
 
@@ -148,7 +171,7 @@ def main():
     # 按商品类型排序
     sorted_items = sorted(matched.items(), key=lambda x: (x[1][0].ptype, x[0]))
 
-    write_excel(sorted_items, args.output)
+    write_excel(sorted_items, args.output, force=args.force)
 
     print(f"[完成] 输出 {args.output}")
     print(f"  已匹配: {len(matched)} 种")

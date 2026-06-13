@@ -64,7 +64,7 @@ SELECT
     '未知'
   ), r'^\\s+|\\s+$', '') AS item_name,
   IFNULL(pp.product_type, 0) AS product_type,
-  se.price, se.channel, se.qty, se.sales_price, se.original_amount, se.actual_amount,
+  se.price, se.channel, se.qty, se.sales_price, se.gross_amount, se.original_amount, se.actual_amount,
   se.refund_qty, se.refund_amount, se.free_qty, se.give_qty,
   se.free_amount, se.give_amount, se.discount_amount,
   se.cancelled_qty, se.cancelled_amount
@@ -490,6 +490,7 @@ def write_pnl_excel(
     channel_data: Optional[dict] = None,
     menu_rows: Optional[list] = None,
     previous_artifact: Optional[dict] = None,
+    force: bool = False,
 ):
     """写 P&L Excel — 多 sheet, 支持 drill-down.
 
@@ -527,6 +528,22 @@ def write_pnl_excel(
         _write_source_audit_sheet(wb, artifact)
         if previous_artifact:
             _write_variance_sheet(wb, artifact, previous_artifact)
+
+        # 零容差闸门 (在 wb.close() 前执行, 有 MUST_FIX 且无 --force 则 exit(2))
+        # 技术债 ⑤ (CLAUDE.md): P&L 行字段与销售恒等式未对齐, 暂只做非空闸门;
+        # 销售恒等式接入待 PR-B 字段对齐. 必填字段基线 (Task 11 工厂) 落地后升级.
+        from semantic.validators.gate import (
+            add_watermark_sheet_xlsxwriter, validate_and_gate)
+
+        # 用 sales_rows 代理: 从 artifact 取 pnl 行 — 确保至少有数据
+        # gate 检查 check_rows 行数 >= 1; identities=[] 跳过恒等式(字段未对齐)
+        pnl_rows = [{"_pnl": True}] if artifact.get("pnl") else []
+        outcome = validate_and_gate(
+            pnl_rows, identities=[],
+            force=force, report_name="pnl_statement",
+        )
+        if outcome.needs_watermark:
+            add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
     finally:
         wb.close()
 
@@ -1290,6 +1307,8 @@ def main():
                         help="跟某月对比, 格式 YYYY-MM (Sheet 7 差异分解用)")
     parser.add_argument("--skip-menu", action="store_true",
                         help="跳过 Sheet 5 菜单工程 (大集团时省时间)")
+    parser.add_argument("--force", action="store_true",
+                        help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     args = parser.parse_args()
 
     setup_proxy()
@@ -1469,6 +1488,7 @@ def main():
         channel_data=channel_data,
         menu_rows=menu_rows,
         previous_artifact=previous_artifact,
+        force=args.force,
     )
 
     # ── P4 跨系统对账: ttpos anchor ──

@@ -58,7 +58,25 @@ def query_rows(client, dataset: str):
     return list(client.query(sql).result())
 
 
-def write_excel(rows, output_path: str):
+def write_excel(rows, output_path: str, force: bool = False):
+    from semantic.validators.gate import (
+        add_watermark_sheet_openpyxl, validate_and_gate)
+    from semantic.validators.identities import (
+        make_required_fields_identity, make_unique_key_identity)
+
+    uniq_ident, prepare = make_unique_key_identity(("uuid",), name="UUID唯一")
+    check_rows = prepare([
+        {"name_zh": r.name_zh or "", "uuid": str(r.uuid) if r.uuid else ""}
+        for r in rows
+    ])
+    outcome = validate_and_gate(
+        check_rows,
+        [make_required_fields_identity(("name_zh",), name="菜单中文名必填"),
+         uniq_ident],
+        force=force, report_name="export_all_menu_bilingual",
+        row_label=lambda r: r.get("name_zh", "") or r.get("uuid", ""),
+    )
+
     wb = Workbook()
     ws = wb.active
     ws.title = "菜单中英泰对照"
@@ -89,6 +107,9 @@ def write_excel(rows, output_path: str):
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = w
     ws.freeze_panes = "A2"
 
+    if outcome.needs_watermark:
+        add_watermark_sheet_openpyxl(wb, outcome.watermark_lines())
+
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
 
@@ -98,6 +119,8 @@ def parse_args():
     p.add_argument("--project", default=PROJECT_ID, help="GCP 项目 ID")
     p.add_argument("--dataset", default=DEFAULT_DATASET, help="BQ dataset")
     p.add_argument("--output", default="exports/all_menu_bilingual.xlsx", help="输出路径")
+    p.add_argument("--force", action="store_true",
+                   help="强制导出 (有 🔴 违反时打水印而非阻断)")
     return p.parse_args()
 
 
@@ -107,7 +130,7 @@ def main():
 
     client = get_bq_client(project_id=args.project)
     rows = query_rows(client, args.dataset)
-    write_excel(rows, args.output)
+    write_excel(rows, args.output, force=args.force)
     print(f"[完成] 共 {len(rows)} 条商品，输出 {args.output}")
     return 0
 
