@@ -185,5 +185,5 @@ Excel 写盘 `money_satang` 列 `/100` 还原。估算域(物料单价 4dp / 套
 | ③ | 外卖平台侧退款不在恒等式内 | 对账桥范围, 子项目 D 接平台对账单后 |
 | ④ | sale_event / sale_line 双轨并存(gross_amount 投影已还前半) | ✅ 前半已还: sale_line/takeout_line/total_line 投影 gross_amount, profit_margin/sales_period 毛额守恒转真校验 (PR-B Task 4); 后半双轨合并待 CROSS_LEDGER 达零容差 |
 | ⑤ | ~~pnl_statement 只接非空闸门~~ | ✅ 已还: pnl_statement 店粒度接 DEFAULT_IDENTITIES, 60 店真数据全绿 (PR-B Task 5) |
-| ⑥ | CROSS_LEDGER 未进闸门, 维持观察模式(决策分支 c) | 套餐子行修复后 qty 匹配 31.5%→45.5%(dine-only 93.2%);残余两层根因: order_line 仅覆盖堂食路径(外卖走 ttpos_takeout_order_item 不经 sale_bill)+ 月界时间语义。还债: order_line 加外卖路径 → 时间语义对齐 → ≥99% 后进闸门 |
+| ⑥ | CROSS_LEDGER 维持观察模式(分支 c): 凭证账已补外卖路径(PR-C), qty 31.5%→45.5%→**89.5%**; 残余 ~10.5% 为结构天花板 = ttpos 后端 sp/sop 写入路径不对称(凭证记录了统计漏记的销售, 方向 voucher>stat; PR-B "月界时间语义"假设已被 PR-C 实测推翻——shop018 月界 0 跨窗行)+ 未映射外卖商品(is_mapped=0)+ 促销码单账本路径(PEPSIMCK 类) | ≥99% 不可达且后端问题 BQ 层不可解; 完全闭合需 ttpos 后端 sp 写入可靠性调查(本仓库范围外)。CROSS_LEDGER 不进闸门: 避免 ~10% 不可控残差天天误报 / 稀释闸门可信度(零容差核心=响警报即真错) |
 | ⑦ | ~~外卖勾稽 2 单偏差未归因~~ | ✅ 已归因: shop006/3733164293885953 = 未映射商品 item_sum 不全(+99); shop059/3728170758965263 = 配送费在 platform_total 不在 subtotal(+89)。takeout_tieout 口径待补配送费项 |

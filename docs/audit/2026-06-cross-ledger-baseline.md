@@ -309,3 +309,88 @@ merchant 字段恒0: 是
 ---
 
 *复跑: 2026-06-13, PR-B Task 2, 决策分支 (c), 全 60 店无查询错误*
+
+---
+
+## PR-C 复跑 (外卖路径, 2026-06-13)
+
+> 脚本: `scripts/adhoc/audit_cross_ledger_202605.py` (无改动; 自动吃 `semantic/entities/order_line.py` 新增的 takeout UNION ALL 分支)
+> 凭证账 CTE 改动: PR-C 给 `order_line_cte` 加 `ttpos_takeout_order_item` 路径 → 凭证账由 dine-only 升为 dine+takeout 全渠道
+> 决策分支: **(c) 维持观察模式 — 结构天花板 ~89.5%, ≥99% 不可达**
+
+### 复跑数字 vs PR-B 基线
+
+| 指标 | PR-B (dine-only 凭证, 2026-06-13) | PR-C (dine+takeout 凭证, 2026-06-13) | 变化 |
+|---|---|---|---|
+| 全局 (store, item) 行数 | 13,905 | 13,905 | 0 |
+| qty 精确匹配 (全局) | 6,331 / 13,905 (**45.5%**) | 12,440 / 13,905 (**89.5%**) | **+44pp** |
+| qty `|delta|` 分布 | — | P50=0 / P95=1 / max=28 | — |
+| gross `|delta|` 分布 (THB) | — | P50=0 / P95=10,900 / max=249,200 | — |
+| gross 恒等式 | — | ✅ 12,446 / 🟡 459 / 🔴 1,000 | — |
+| 外卖订单勾稽 | 99.996% | 100.0% (60 店 / 47,452 单) | — |
+| 查询错误 | 0 | 0 | — |
+
+预测 ~89.5%，实测 **89.5%**，逐点命中。脚本未单独拆 dine / takeout 子率
+(全局口径汇总输出)；dine-only 残差归因见下文 (PR-B 曾报 dine-only 93.2%)。
+
+### 最差门店 Top 5 (按 max gross delta, 2026-05)
+
+| 店 | 名称 | items | qty_exact | gross_P95 (THB) | worst_delta (THB) |
+|---|---|---|---|---|---|
+| 018 | Sahapat Sriracha 卫星店 | 249 | 164/249 | 42,000 | 249,200 |
+| 053 | Ratchada ซอย 3 | 241 | 172/241 | 31,800 | 207,900 |
+| 028 | Hollywood Pattaya | 235 | 180/235 | 21,800 | 113,400 |
+| 035 | UTCC ม.หอการค้า | 260 | 226/260 | 19,800 | 113,400 |
+| 029 | Khao Noi Pattaya | 233 | 193/233 | 15,800 | 106,800 |
+
+### 纠正 PR-B 时间语义假设（重要）
+
+PR-B「复跑」段把 dine 残差归到**月界 `complete_time` vs `finish_time` 漂移**
+(声称 shop018 高流量店每月约 28 单落在 May-IN 窗口，"纯时间语义残差确认")。
+**PR-C 调查证伪了这个假设**：
+
+- shop018 实测**跨窗口行数 = 0** —— 不存在「finish_time IN / complete_time OUT」的月界单。
+  PR-B 残差抽样表把 −28 归因于月界，是错的。
+- 真实 dine 残差根因 = **ttpos 后端写入路径不对称**：`sale_order_product`（凭证账）
+  有时记录了 `ttpos_statistics_product`（统计账）漏记的销售；方向恒为 **voucher > stat**
+  (与 PR-B 抽样表里 LHS<RHS 的 stat<voucher 符号一致，但成因是后端写入而非时间)。
+- **改时间字段不是修复**：把比较基准从 `complete_time` 换到 `finish_time`（或 business_date）
+  并不能消掉这批差异，反而会更差 —— 差的不是落在哪个月，而是统计账压根没写这条。
+
+### 结构天花板 ~89.5%（残差 ~10.5% 不可控）
+
+残差 ~10.5% = 三类结构性成分，**全部在 BQ 口径之外**：
+
+1. **后端 sp/sop 写入不对称** —— `sale_order_product` 写了而 `statistics_product` 漏写
+   (ttpos 后端写入可靠性问题，方向 voucher > stat)。
+2. **未映射外卖商品** —— `is_mapped=0` / `package_uuid=0` 的 takeout 行，只在一本账里出现。
+3. **促销码路径** —— 例如 `PEPSIMCK` 等促销码只落在单边账本。
+4. **builder 口径项(可消,非后端不可控)** —— `cross_ledger.build_cross_ledger_rows`
+   比较时 stat 侧用 sale_event raw qty(含外卖 state=60 取消件,被拆进 cancelled_qty),
+   voucher 侧 order_line 已排除 state=60,故取消件使 stat 略高于 voucher。这一项**不是**
+   后端问题,builder 改用 net_qty(扣 cancelled)对齐两侧即可消除,留作 CROSS_LEDGER
+   后续收口的可控项(前三项才是结构天花板)。
+
+明确结论：**≥99% 不可达**。后端写入可靠性问题属 ttpos 业务系统层，不在本 BQ 分析口径
+可修复范围内；继续往 order_line SQL 上加路由/对齐时间，都无法跨过这个天花板。
+
+### CROSS_LEDGER 决策（分支 c，维持观察）
+
+**CROSS_LEDGER 保持独立观察包，不升入导出闸门。** `identities.py` 不改动。
+
+理由（零容差核心 = 报警必须是真错）：
+
+- 10.5% 残差是后端不可控的结构性差异，不是数据管线 bug。
+- 升 🔴 → 每次导出都误报，闸门失信。
+- 升 🟡 进 `FULL_IDENTITIES` → 给每次导出注入 ~10% 噪音，稀释闸门可信度。
+- 因此 `CROSS_LEDGER_IDENTITIES` 继续与 `FULL_IDENTITIES` 解耦，仅作旁路观察跑。
+
+### 技术债更新状态
+
+| 债项 | 状态 |
+|---|---|
+| ⑥ CROSS_LEDGER 升级 | **维持观察 (分支 c)**；外卖路径已并入凭证账 (45.5%→89.5%)，时间语义假设已证伪；残差为后端写入不对称 + 未映射外卖商品 + 促销码单边，结构天花板 ~89.5%，≥99% 不可达，故不升闸门 |
+
+---
+
+*PR-C 复跑: 2026-06-13, 外卖路径并入凭证账, qty 89.5% (预测命中), 决策分支 (c), 全 60 店 0 查询错误*

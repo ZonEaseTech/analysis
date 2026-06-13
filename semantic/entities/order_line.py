@@ -18,29 +18,71 @@
   - sop.product_type != 2 排除套餐子行 (2=子行, package_uuid 指向父行 uuid):
     统计账记 SKU 粒度, 凭证账不排子行会按套餐组件翻倍
     (2026-05 基线 31.5% 匹配率的根因, shop005 实测排除后残差 0.00%).
+  - 外卖路径 (PR-C): ttpos_takeout_order_item toi, 对齐 sale_event takeout 口径
+    (state IN(10,20,30,40)、§1.3 动态时间、package_uuid>0 排未映射商品).
+    toi 的 ttpos_product_type 0=单品 1=套餐父均为顶层, toi 无子行无双计数
+    (实测含 type=1 时 shop003 96.9% vs 仅 type=0 的 71.7%). 凭证账由此从
+    dine-only 扩到全渠道, 跨账本 qty 45.5%→89.5%. 残余 ~10.5% 为结构天花板
+    (后端 sp/sop 写入路径不对称等, 见 docs/audit/2026-06-cross-ledger-baseline.md).
 
 金额单位: 萨当 (satang, INT64) — 唯一舍入点在本 CTE 输出层 (spec §6 B).
 """
 
 
 def order_line_cte() -> str:
-    """Returns `order_line AS (...)`. 占位符同 sale_event — drop-in 兼容 engine.query()。"""
+    """Returns `order_line AS (...)`. 占位符同 sale_event — drop-in 兼容 engine.query()。
+
+    dine + takeout 两个凭证账分支 UNION ALL 后外层 GROUP BY item_uuid 合并:
+    同一商品的堂食与外卖凭证量合成一行, 对齐统计账 sale_event 的 (dine UNION takeout).
+    """
     return """order_line AS (
   SELECT
-    sop.product_package_uuid AS item_uuid,
-    SUM(sop.num) AS voucher_qty,
-    CAST(ROUND(SUM(sop.sale_price * sop.num) * 100) AS INT64) AS voucher_gross,
-    CAST(ROUND(SUM(sop.total_price) * 100) AS INT64) AS voucher_net,
-    CAST(ROUND(SUM(sop.discount_fee) * 100) AS INT64) AS voucher_discount
-  FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
-  JOIN `{project}`.`{dataset}`.`ttpos_sale_order` so
-    ON so.uuid = sop.sale_order_uuid AND so.delete_time = 0
-  JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
-    ON sb.uuid = so.sale_bill_uuid AND sb.delete_time = 0
-  WHERE sb.status = 1
-    AND sb.finish_time >= {start_ts}
-    AND sb.finish_time < {end_ts}
-    AND sop.delete_time = 0
-    AND sop.product_type != 2
+    item_uuid,
+    SUM(voucher_qty) AS voucher_qty,
+    SUM(voucher_gross) AS voucher_gross,
+    SUM(voucher_net) AS voucher_net,
+    SUM(voucher_discount) AS voucher_discount
+  FROM (
+    -- 堂食凭证账: sale_bill → sale_order → sale_order_product (排套餐子行 product_type=2)
+    SELECT
+      sop.product_package_uuid AS item_uuid,
+      SUM(sop.num) AS voucher_qty,
+      CAST(ROUND(SUM(sop.sale_price * sop.num) * 100) AS INT64) AS voucher_gross,
+      CAST(ROUND(SUM(sop.total_price) * 100) AS INT64) AS voucher_net,
+      CAST(ROUND(SUM(sop.discount_fee) * 100) AS INT64) AS voucher_discount
+    FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
+    JOIN `{project}`.`{dataset}`.`ttpos_sale_order` so
+      ON so.uuid = sop.sale_order_uuid AND so.delete_time = 0
+    JOIN `{project}`.`{dataset}`.`ttpos_sale_bill` sb
+      ON sb.uuid = so.sale_bill_uuid AND sb.delete_time = 0
+    WHERE sb.status = 1
+      AND sb.finish_time >= {start_ts}
+      AND sb.finish_time < {end_ts}
+      AND sop.delete_time = 0
+      AND sop.product_type != 2
+    GROUP BY item_uuid
+
+    UNION ALL
+
+    -- 外卖凭证账: ttpos_takeout_order_item (toi 无子行, type 0/1 均顶层无双计数)
+    SELECT
+      toi.ttpos_product_package_uuid AS item_uuid,
+      SUM(toi.quantity) AS voucher_qty,
+      CAST(ROUND(SUM(toi.price * toi.quantity) * 100) AS INT64) AS voucher_gross,
+      CAST(ROUND(SUM(toi.price * toi.quantity) * 100) AS INT64) AS voucher_net,
+      CAST(0 AS INT64) AS voucher_discount
+    FROM `{project}`.`{dataset}`.`ttpos_takeout_order_item` toi
+    JOIN `{project}`.`{dataset}`.`ttpos_takeout_order` t
+      ON t.uuid = toi.takeout_order_uuid AND t.delete_time = 0
+    WHERE toi.delete_time = 0
+      AND toi.ttpos_product_package_uuid > 0
+      AND t.order_state IN (10, 20, 30, 40)
+      AND t.accepted_time > 0
+      AND (
+        (t.order_state = 40 AND t.completed_time >= {start_ts} AND t.completed_time < {end_ts})
+        OR (t.order_state != 40 AND t.accepted_time >= {start_ts} AND t.accepted_time < {end_ts})
+      )
+    GROUP BY item_uuid
+  )
   GROUP BY item_uuid
 )"""
