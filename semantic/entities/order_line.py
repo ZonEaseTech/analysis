@@ -15,6 +15,9 @@
     sales_price = product_sale_price × product_num 的折前口径.
   - sop.status (送厨状态) 不过滤: sb.status=1 已完成账单的商品行定义上已送厨,
     显式说明此处是有意省略, 非遗漏.
+  - sop.product_type != 2 排除套餐子行 (2=子行, package_uuid 指向父行 uuid):
+    统计账记 SKU 粒度, 凭证账不排子行会按套餐组件翻倍
+    (2026-05 基线 31.5% 匹配率的根因, shop005 实测排除后残差 0.00%).
 """
 
 
@@ -36,5 +39,6 @@ def order_line_cte() -> str:
     AND sb.finish_time >= {start_ts}
     AND sb.finish_time < {end_ts}
     AND sop.delete_time = 0
+    AND sop.product_type != 2
   GROUP BY item_uuid
 )"""

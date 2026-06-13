@@ -33,6 +33,11 @@ class TestOrderLineCte(unittest.TestCase):
         self.assertIn("sb.finish_time >= 1", self.sql)
         self.assertIn("sb.finish_time < 2", self.sql)
 
+    def test_excludes_combo_child_rows(self):
+        # product_type: 0=单品, 1=套餐父行, 2=套餐子行 (package_uuid=父行uuid).
+        # 子行不排除 → 凭证账 qty 翻倍 (2026-05 实测 31.5% 匹配率的根因)
+        self.assertIn("sop.product_type != 2", self.sql)
+
     def test_measures(self):
         self.assertIn("SUM(sop.num) AS voucher_qty", self.sql)
         self.assertIn("SUM(sop.sale_price * sop.num) AS voucher_gross", self.sql)
