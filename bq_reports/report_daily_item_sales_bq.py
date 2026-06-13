@@ -18,6 +18,8 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from semantic.dimensions.time import assert_month_not_frozen
+
 from google.cloud import bigquery
 from google.oauth2.credentials import Credentials
 from openpyxl import Workbook
@@ -250,11 +252,12 @@ def main():
     setup_proxy()
 
     ym, start_ts, end_ts = get_time_range()
+    assert_month_not_frozen(ym)
     log(f"统计月份: {ym}")
     log(f"时间戳: {start_ts} ~ {end_ts}\n")
-    
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     # 获取所有门店数据集
     client = bigquery.Client(project=PROJECT_ID, credentials=get_creds())
     all_datasets = [d.dataset_id for d in client.list_datasets() if d.dataset_id.startswith("shop")]

@@ -15,6 +15,11 @@
     sales_price = product_sale_price × product_num 的折前口径.
   - sop.status (送厨状态) 不过滤: sb.status=1 已完成账单的商品行定义上已送厨,
     显式说明此处是有意省略, 非遗漏.
+  - sop.product_type != 2 排除套餐子行 (2=子行, package_uuid 指向父行 uuid):
+    统计账记 SKU 粒度, 凭证账不排子行会按套餐组件翻倍
+    (2026-05 基线 31.5% 匹配率的根因, shop005 实测排除后残差 0.00%).
+
+金额单位: 萨当 (satang, INT64) — 唯一舍入点在本 CTE 输出层 (spec §6 B).
 """
 
 
@@ -24,9 +29,9 @@ def order_line_cte() -> str:
   SELECT
     sop.product_package_uuid AS item_uuid,
     SUM(sop.num) AS voucher_qty,
-    SUM(sop.sale_price * sop.num) AS voucher_gross,
-    SUM(sop.total_price) AS voucher_net,
-    SUM(sop.discount_fee) AS voucher_discount
+    CAST(ROUND(SUM(sop.sale_price * sop.num) * 100) AS INT64) AS voucher_gross,
+    CAST(ROUND(SUM(sop.total_price) * 100) AS INT64) AS voucher_net,
+    CAST(ROUND(SUM(sop.discount_fee) * 100) AS INT64) AS voucher_discount
   FROM `{project}`.`{dataset}`.`ttpos_sale_order_product` sop
   JOIN `{project}`.`{dataset}`.`ttpos_sale_order` so
     ON so.uuid = sop.sale_order_uuid AND so.delete_time = 0
@@ -36,5 +41,6 @@ def order_line_cte() -> str:
     AND sb.finish_time >= {start_ts}
     AND sb.finish_time < {end_ts}
     AND sop.delete_time = 0
+    AND sop.product_type != 2
   GROUP BY item_uuid
 )"""

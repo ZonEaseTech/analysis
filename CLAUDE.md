@@ -159,18 +159,31 @@ BQ_PROXY=http://127.0.0.1:7897 venv/bin/python -m bq_reports.profit_margin_repor
 
 `bq_client.setup_proxy()` 和各报表脚本里的同名函数都会读 `BQ_PROXY`，未设置时为 no-op。
 
+### 5.5 历史封存(零容差口径切换线)
+
+**封存线 = 2026-06**。2026-05 及之前的月份为旧浮点口径交付物,**永不重算**
+(`semantic/dimensions/time.py: assert_month_not_frozen`,报表入口拒跑 exit 3)。
+新旧口径数字不可逐分比较;只读对账/审计查询不受限。
+依据:spec 决策 2/3(`docs/superpowers/specs/2026-06-12-zero-tolerance-design.md`)。
+
 ### 6. 技术债清单(零容差改造)
 
 spec: `docs/superpowers/specs/2026-06-12-zero-tolerance-design.md`
 基线: `docs/audit/2026-06-cross-ledger-baseline.md`
 
+**整数化边界声明**:零容差的数学保证(sum 型金额恒等式 `delta==0`)覆盖**语义层管线**
+(semantic/entities CTE + profit_margin/profit_by_price/report_sales_period/pnl_statement);
+交易金额在 CTE 输出层 `CAST(ROUND(x*100) AS INT64)` 转萨当 INT64,唯一舍入点,加法精确,
+Excel 写盘 `money_satang` 列 `/100` 还原。估算域(物料单价 4dp / 套餐权重 / 费率 / COGS /
+利润 / 比率)保持 float,不参与零容差恒等式。手写 SQL 报表(bq_exporter 系 / standalone 系)
+不在整数化边界内,走基线恒等式(必填/主键唯一),金额仍 float。
+
 | # | 债 | 还债条件 |
 |---|---|---|
-| ② | 支付勾稽 (bill.payment_amount vs 统计账实收) 封顶 🟡, 实测全店差 30-50% | service_fee/tax_fee/整单折扣/会员储值口径校准后转红线 |
+| ① | ~~2026-05 前旧口径封存待机制化~~ | ✅ 已还: month guard (semantic/dimensions/time.py), 2026-06-13 |
+| ② | 支付勾稽封顶 🟡;根因已查明: `bill.payment_amount` 仅含堂食 POS 收款, 外卖在平台侧支付不经 sale_bill, 故 `payment_amount ≈ stat_actual_dine`(实测 shop001/005/010 缺口 ±0.2~2.5%) | 接外卖平台对账单(子项目 D)后补外卖支付侧, 方可对账全渠道实收 |
 | ③ | 外卖平台侧退款不在恒等式内 | 对账桥范围, 子项目 D 接平台对账单后 |
-| ④ | sale_event / sale_line 双轨并存; profit_margin/sales_period 的 gross_amount 是定义式补齐 | sale_line/takeout_line 投影 gross_amount (PR-B), CROSS_LEDGER 证明等价后合并双轨 |
-| ⑤ | pnl_statement 只接非空闸门, 销售恒等式待 P&L 行字段对齐 | PR-B 整数化时一并对齐 |
-| ⑥ | CROSS_LEDGER 未进闸门: 凭证账含套餐子项行, 粒度不齐 (qty match 31.5%) | PR-B 修 order_line 套餐口径 → 复跑观察 → 100% 后进闸门 |
-| ⑦ | 外卖勾稽 2 单偏差未归因 (shop006/373316429388, shop059/372817075896) | PR-B 观察复跑时一并排查 |
-
-(技术债 ① "2026-05 前旧口径封存" 在 PR-B 落 month guard 时写入。)
+| ④ | sale_event / sale_line 双轨并存(gross_amount 投影已还前半) | ✅ 前半已还: sale_line/takeout_line/total_line 投影 gross_amount, profit_margin/sales_period 毛额守恒转真校验 (PR-B Task 4); 后半双轨合并待 CROSS_LEDGER 达零容差 |
+| ⑤ | ~~pnl_statement 只接非空闸门~~ | ✅ 已还: pnl_statement 店粒度接 DEFAULT_IDENTITIES, 60 店真数据全绿 (PR-B Task 5) |
+| ⑥ | CROSS_LEDGER 未进闸门, 维持观察模式(决策分支 c) | 套餐子行修复后 qty 匹配 31.5%→45.5%(dine-only 93.2%);残余两层根因: order_line 仅覆盖堂食路径(外卖走 ttpos_takeout_order_item 不经 sale_bill)+ 月界时间语义。还债: order_line 加外卖路径 → 时间语义对齐 → ≥99% 后进闸门 |
+| ⑦ | ~~外卖勾稽 2 单偏差未归因~~ | ✅ 已归因: shop006/3733164293885953 = 未映射商品 item_sum 不全(+99); shop059/3728170758965263 = 配送费在 platform_total 不在 subtotal(+89)。takeout_tieout 口径待补配送费项 |

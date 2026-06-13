@@ -39,7 +39,7 @@ from bq_reports.utils.bq_client import setup_proxy
 from semantic.aggregations.kpi_ratios import Kpi, compute_kpis
 from semantic.aggregations.pnl_layers import PnlStatement, build_pnl
 from semantic.comparison import compute_mom_changes, compute_yoy_changes
-from semantic.dimensions.time import month_to_ts_range
+from semantic.dimensions.time import month_to_ts_range, assert_month_not_frozen
 from semantic.entities import sale_event
 from semantic.resolvers import Resolver, load_resolvers_from_yaml
 from utils.report_engine import ReportEngine
@@ -315,6 +315,13 @@ _TOTAL_FIELDS = (
 # 按 channel 拆出来的字段 (build_pnl 用 dine_/takeout_sales_price + qty)
 _PER_CHANNEL_FIELDS = ("qty", "sales_price")
 
+# 交易金额字段 (萨当整数) — aggregate_sales_by_channel 在边界 /100 转元进入
+# P&L 估算域 (COGS/费率/利润全是元 float). 非金额 (qty/order_count) 不转. (PR-B 7b)
+_SATANG_FIELDS = frozenset({
+    "sales_price", "actual_amount", "refund_amount", "cancelled_amount",
+    "free_amount", "give_amount", "discount_amount",
+})
+
 
 def aggregate_sales_by_channel(rows: Iterable[Any]) -> dict:
     """从 sale_event-like 行 (含 channel ∈ {'dine','takeout'}) 聚合成单 dict.
@@ -330,16 +337,22 @@ def aggregate_sales_by_channel(rows: Iterable[Any]) -> dict:
     """
     out: dict = defaultdict(float)
     for row in rows:
-        # 总数
+        # 总数 — 边界: 萨当金额字段 /100 转元进入 P&L 估算域 (PR-B 7b)
         for field in _TOTAL_FIELDS:
-            out[field] += float(_get(row, field, 0) or 0)
+            v = float(_get(row, field, 0) or 0)
+            if field in _SATANG_FIELDS:
+                v /= 100.0  # 萨当→元
+            out[field] += v
         # 按渠道拆 (只拆 qty/sales_price; actual/refund 等总数本身已经按 channel
         # 在 sale_event 里区分了, 不需要重复拆)
         channel = _get(row, "channel", "")
         if channel in ("dine", "takeout"):
             prefix = f"{channel}_"
             for field in _PER_CHANNEL_FIELDS:
-                out[f"{prefix}{field}"] += float(_get(row, field, 0) or 0)
+                v = float(_get(row, field, 0) or 0)
+                if field in _SATANG_FIELDS:
+                    v /= 100.0  # 萨当→元
+                out[f"{prefix}{field}"] += v
     return dict(out)
 
 
@@ -491,6 +504,7 @@ def write_pnl_excel(
     menu_rows: Optional[list] = None,
     previous_artifact: Optional[dict] = None,
     force: bool = False,
+    sales_check_rows: Optional[list] = None,
 ):
     """写 P&L Excel — 多 sheet, 支持 drill-down.
 
@@ -530,17 +544,23 @@ def write_pnl_excel(
             _write_variance_sheet(wb, artifact, previous_artifact)
 
         # 零容差闸门 (在 wb.close() 前执行, 有 MUST_FIX 且无 --force 则 exit(2))
-        # 技术债 ⑤ (CLAUDE.md): P&L 行字段与销售恒等式未对齐, 暂只做非空闸门;
-        # 销售恒等式接入待 PR-B 字段对齐. 必填字段基线 (Task 11 工厂) 落地后升级.
+        # 店粒度销售恒等式 (DEFAULT_IDENTITIES); P&L 层金额 (COGS/费用) 是估算量不参与 — 技术债⑤已还 (PR-B Task 5)
         from semantic.validators.gate import (
             add_watermark_sheet_xlsxwriter, validate_and_gate)
+        from semantic.validators.identities import DEFAULT_IDENTITIES
 
-        # 用 sales_rows 代理: 从 artifact 取 pnl 行 — 确保至少有数据
-        # gate 检查 check_rows 行数 >= 1; identities=[] 跳过恒等式(字段未对齐)
-        pnl_rows = [{"_pnl": True}] if artifact.get("pnl") else []
+        # sales_check_rows: 店粒度销售桶聚合行 (由调用方从 sales_rows 构建并传入)
+        # 若未传入 (单元测试/mock 场景), 回退到非空闸门 (identities=[])
+        if sales_check_rows:
+            gate_rows = sales_check_rows
+            gate_identities = DEFAULT_IDENTITIES
+        else:
+            gate_rows = [{"_pnl": True}] if artifact.get("pnl") else []
+            gate_identities = []
         outcome = validate_and_gate(
-            pnl_rows, identities=[],
+            gate_rows, identities=gate_identities,
             force=force, report_name="pnl_statement",
+            row_label=lambda r: f"店 {r['store_num']}",
         )
         if outcome.needs_watermark:
             add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
@@ -961,7 +981,8 @@ def _compute_menu_engineering(
         key = (row.store_num, str(row.item_uuid))
         e = by_item[key]
         e["qty"] += float(row.qty or 0)
-        e["actual"] += float(row.actual_amount or 0)
+        # 边界: actual_amount 萨当 → 元 (跟 COGS 估算域算毛利, PR-B 7b)
+        e["actual"] += float(row.actual_amount or 0) / 100.0
         if not e["name"]:
             e["name"] = row.item_name or ""
             e["store_name"] = row.store_name or ""
@@ -1311,6 +1332,7 @@ def main():
                         help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     args = parser.parse_args()
 
+    assert_month_not_frozen(args.month)
     setup_proxy()
 
     # 延迟 import 避免循环
@@ -1427,13 +1449,14 @@ def main():
     # 按渠道 cogs + net_sales (Sheet 4 用)
     # net_sales 按 channel 拆: 直接 SUM sales_rows.actual_amount by channel
     from collections import defaultdict
+    # 边界: actual_amount/sales_price 是萨当 → 元 (Sheet 4 跟 COGS 估算域对比, PR-B 7b)
     net_sales_by_channel: dict = defaultdict(float)
     gmv_by_channel: dict = defaultdict(float)
     for row in sales_rows:
         ch = getattr(row, "channel", None)
         if ch in ("dine", "takeout"):
-            net_sales_by_channel[ch] += float(getattr(row, "actual_amount", 0) or 0)
-            gmv_by_channel[ch] += float(getattr(row, "sales_price", 0) or 0)
+            net_sales_by_channel[ch] += float(getattr(row, "actual_amount", 0) or 0) / 100.0
+            gmv_by_channel[ch] += float(getattr(row, "sales_price", 0) or 0) / 100.0
     channel_data = {
         "dine":    {"cogs": cogs_data["dine"],
                     "net_sales": net_sales_by_channel["dine"],
@@ -1482,6 +1505,45 @@ def main():
         )
         print(f"  -> 上期 Net Sales {previous_artifact['pnl'].by_code('net_sales').amount:,.0f}")
 
+    # ── 店粒度销售恒等式 check_rows (技术债⑤已还 PR-B Task 5) ──
+    # 从 sales_rows (item × price × channel 粒度) 聚合到 store 粒度,
+    # 累加 DEFAULT_IDENTITIES 所需的全部销量/金额桶.
+    # net_qty 按定义式推导: qty − free − give − refund − cancelled
+    # (SALES_QTY_IDENTITY 是定义式守卫, 防字段缺失/schema 漂移; 参见 identities.py 注释)
+    _store_buckets: dict = {}
+    for _row in sales_rows:
+        _snum = _row.store_num
+        if _snum not in _store_buckets:
+            _store_buckets[_snum] = {
+                "store_num": _snum,
+                "qty": 0.0, "sales_price": 0.0, "gross_amount": 0.0,
+                "actual_amount": 0.0,
+                "refund_qty": 0.0, "refund_amount": 0.0,
+                "free_qty": 0.0, "free_amount": 0.0,
+                "give_qty": 0.0, "give_amount": 0.0,
+                "discount_amount": 0.0,
+                "cancelled_qty": 0.0, "cancelled_amount": 0.0,
+            }
+        _b = _store_buckets[_snum]
+        _b["qty"]              += float(getattr(_row, "qty", 0) or 0)
+        _b["sales_price"]      += float(getattr(_row, "sales_price", 0) or 0)
+        _b["gross_amount"]     += float(getattr(_row, "gross_amount", 0) or 0)
+        _b["actual_amount"]    += float(getattr(_row, "actual_amount", 0) or 0)
+        _b["refund_qty"]       += float(getattr(_row, "refund_qty", 0) or 0)
+        _b["refund_amount"]    += float(getattr(_row, "refund_amount", 0) or 0)
+        _b["free_qty"]         += float(getattr(_row, "free_qty", 0) or 0)
+        _b["free_amount"]      += float(getattr(_row, "free_amount", 0) or 0)
+        _b["give_qty"]         += float(getattr(_row, "give_qty", 0) or 0)
+        _b["give_amount"]      += float(getattr(_row, "give_amount", 0) or 0)
+        _b["discount_amount"]  += float(getattr(_row, "discount_amount", 0) or 0)
+        _b["cancelled_qty"]    += float(getattr(_row, "cancelled_qty", 0) or 0)
+        _b["cancelled_amount"] += float(getattr(_row, "cancelled_amount", 0) or 0)
+    sales_check_rows = []
+    for _b in _store_buckets.values():
+        _net_qty = (_b["qty"] - _b["free_qty"] - _b["give_qty"]
+                    - _b["refund_qty"] - _b["cancelled_qty"])
+        sales_check_rows.append({**_b, "revenue": _b["actual_amount"], "net_qty": _net_qty})
+
     write_pnl_excel(
         artifact, output_path,
         per_store_artifacts=per_store,
@@ -1489,6 +1551,7 @@ def main():
         menu_rows=menu_rows,
         previous_artifact=previous_artifact,
         force=args.force,
+        sales_check_rows=sales_check_rows,
     )
 
     # ── P4 跨系统对账: ttpos anchor ──

@@ -24,10 +24,10 @@ class TestTakeoutTieoutCte(unittest.TestCase):
         self.assertIn("t.order_state != 40 AND t.accepted_time >= 1", self.sql)
 
     def test_order_grain_measures(self):
-        self.assertIn("IFNULL(t.platform_total, 0) AS platform_total", self.sql)
-        self.assertIn("IFNULL(t.merchant_charge_fee, 0) AS merchant_charge_fee", self.sql)
-        self.assertIn("IFNULL(t.merchant_discount, 0) AS merchant_discount", self.sql)
-        self.assertIn("SUM(toi.price * toi.quantity) AS item_sum", self.sql)
+        self.assertIn("CAST(ROUND(IFNULL(t.platform_total, 0) * 100) AS INT64) AS platform_total", self.sql)
+        self.assertIn("CAST(ROUND(IFNULL(t.merchant_charge_fee, 0) * 100) AS INT64) AS merchant_charge_fee", self.sql)
+        self.assertIn("CAST(ROUND(IFNULL(t.merchant_discount, 0) * 100) AS INT64) AS merchant_discount", self.sql)
+        self.assertIn("CAST(ROUND(SUM(toi.price * toi.quantity) * 100) AS INT64) AS item_sum", self.sql)
 
     def test_soft_delete(self):
         self.assertIn("t.delete_time = 0", self.sql)

@@ -10,18 +10,19 @@ from semantic.validators.identities import DEFAULT_IDENTITIES
 
 
 def _good_row():
+    # 金额是萨当整数 (PR-B 7c: = 元 × 100)
     return {
         "qty": 100.0, "net_qty": 80.0, "free_qty": 5.0, "give_qty": 5.0,
         "refund_qty": 6.0, "cancelled_qty": 4.0,
-        "sales_price": 1000.0, "revenue": 800.0, "refund_amount": 60.0,
-        "free_amount": 50.0, "give_amount": 50.0, "discount_amount": 40.0,
-        "cancelled_amount": 30.0, "gross_amount": 1030.0,
+        "sales_price": 100000, "revenue": 80000, "refund_amount": 6000,
+        "free_amount": 5000, "give_amount": 5000, "discount_amount": 4000,
+        "cancelled_amount": 3000, "gross_amount": 103000,
     }
 
 
 def _bad_row():
     row = _good_row()
-    row["revenue"] += 500.0  # 穿透容忍带 → MUST_FIX
+    row["revenue"] += 50000  # +500 元 = 50000 萨当 → 破坏金额恒等式 → MUST_FIX
     return row
 
 

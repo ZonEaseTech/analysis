@@ -38,14 +38,14 @@ class SaleEventCteTests(unittest.TestCase):
         """The 'free|give → 0, deduct refund' rule MUST survive the grain change.
         Otherwise sale_event diverges from sale_line's contract."""
         self.assertIn(
-            "SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,\n"
-            "           sp.product_final_price * (sp.product_num - sp.refund_num))) AS actual_amount",
+            "CAST(ROUND(SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,\n"
+            "           sp.product_final_price * (sp.product_num - sp.refund_num))) * 100) AS INT64) AS actual_amount",
             self.sql,
         )
 
     def test_takeout_excludes_state_60_from_revenue(self):
         self.assertIn(
-            "SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) AS sales_price",
+            "CAST(ROUND(SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) * 100) AS INT64) AS sales_price",
             self.sql,
         )
         self.assertIn(
@@ -72,33 +72,33 @@ class SaleEventCteTests(unittest.TestCase):
     def test_identity_fields_present_on_dine_side(self):
         """Accounting-identity additions: free_amount / give_amount / discount_amount."""
         self.assertIn(
-            "SUM(IF(sp.free_num > 0, sp.product_sale_price * sp.product_num, 0)) AS free_amount",
+            "CAST(ROUND(SUM(IF(sp.free_num > 0, sp.product_sale_price * sp.product_num, 0)) * 100) AS INT64) AS free_amount",
             self.sql,
         )
         self.assertIn(
-            "SUM(IF(sp.give_num > 0, sp.product_sale_price * sp.product_num, 0)) AS give_amount",
+            "CAST(ROUND(SUM(IF(sp.give_num > 0, sp.product_sale_price * sp.product_num, 0)) * 100) AS INT64) AS give_amount",
             self.sql,
         )
         self.assertIn(
-            "(sp.product_sale_price - sp.product_final_price) * (sp.product_num - sp.refund_num))) AS discount_amount",
+            "(sp.product_sale_price - sp.product_final_price) * (sp.product_num - sp.refund_num))) * 100) AS INT64) AS discount_amount",
             self.sql,
         )
 
     def test_takeout_zeros_identity_fields(self):
         """Takeout has no free/give/discount concept — must zero them so schema
-        aligns for UNION ALL."""
-        self.assertIn("0 AS free_amount", self.sql)
-        self.assertIn("0 AS give_amount", self.sql)
-        self.assertIn("0 AS discount_amount", self.sql)
+        aligns for UNION ALL (萨当 INT64 对齐)."""
+        self.assertIn("CAST(0 AS INT64) AS free_amount", self.sql)
+        self.assertIn("CAST(0 AS INT64) AS give_amount", self.sql)
+        self.assertIn("CAST(0 AS INT64) AS discount_amount", self.sql)
 
     def test_gross_amount_dine(self):
-        # 堂食: gross == 标价×销量 (无 state 概念, 与 sales_price 同式)
+        # 堂食: gross == 标价×销量 (无 state 概念, 与 sales_price 同式; 萨当整数化)
         self.assertIn(
-            "SUM(sp.product_sale_price * sp.product_num) AS gross_amount", self.sql)
+            "CAST(ROUND(SUM(sp.product_sale_price * sp.product_num) * 100) AS INT64) AS gross_amount", self.sql)
 
     def test_gross_amount_takeout_unconditioned(self):
         # 外卖: 不分 state 全量 — 这是守恒闭环的关键, 不许加 IF(order_state ...)
-        self.assertIn("SUM(toi.price * toi.quantity) AS gross_amount", self.sql)
+        self.assertIn("CAST(ROUND(SUM(toi.price * toi.quantity) * 100) AS INT64) AS gross_amount", self.sql)
 
 
 class MetricAndDimensionDeclarationTests(unittest.TestCase):

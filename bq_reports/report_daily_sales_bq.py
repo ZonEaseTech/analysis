@@ -13,6 +13,7 @@ import argparse
 import sys
 
 from .utils.bq_exporter import ReportExporter
+from semantic.dimensions.time import assert_month_not_frozen
 
 
 def main():
@@ -27,6 +28,7 @@ def main():
 
     args = parser.parse_args()
 
+    assert_month_not_frozen(args.month)
     print(f"开始导出 {args.month} 月的单品日销量报表...")
 
     exporter = ReportExporter(

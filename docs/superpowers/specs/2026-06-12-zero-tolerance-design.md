@@ -122,6 +122,19 @@ property 扰动测试(见 §7)防循环恒等式回归。
 - **双跑验收**:2026-06 真实数据新旧引擎各跑一次,逐 (store, item, 指标) diff
   报告归档为验收证据,然后**删除旧浮点路径**,不养两套代码
 
+> **实施记录(PR-B,2026-06-13)。** 实际落地与设计一致,补充三点:
+> - **整数化边界明确为语义层管线**(见 CLAUDE.md「整数化边界声明」);手写 SQL 报表
+>   (bq_exporter/standalone 系)不在边界内,走基线恒等式。COGS/费率/利润/比率为估算域,
+>   保持 float,交易金额进入估算域前在边界处 `/100` 一次(集中且注释)。
+> - **双跑用快照前置策略**:整数化为就地修改,无并行引擎;Task 6 在整数化前 dump 浮点基准
+>   (`exports/.dual_run/float_baseline_202606.json`,gitignore),Task 8 整数引擎复跑 diff
+>   (`docs/audit/2026-06-dual-run-integerization.md`)。验收结论:**qty 冻结子集 21,205 行
+>   零金额漂移 >0.01 THB**,超容差行全部归因为活跃月新销售(非缩放误差,经第三时点对抗复跑证伪)。
+>   "删除旧浮点路径"由快照前置满足——无第二引擎存在。
+> - **跨账本互证未达零容差**(技术债 ⑥,决策分支 c):套餐子行修复后 qty 匹配 31.5%→45.5%
+>   (dine-only 93.2%),CROSS_LEDGER 维持观察 bundle,不进闸门;sum 型金额恒等式
+>   (AMOUNT/GROSS)已收 `delta == 0`,2026-06 真数据全绿。
+
 ### C:尾差记账,然后真零容差
 
 - `semantic/allocations.py`:最大余额法 `allocate(total_satang, weights) -> list[int]`,

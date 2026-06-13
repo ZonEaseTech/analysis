@@ -55,8 +55,8 @@ class ProfitSalesTemplateTests(unittest.TestCase):
         # Exact substring of the IF condition; if anyone tries to change to OR/AND
         # of different fields this test breaks.
         self.assertIn(
-            "SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,\n"
-            "           sp.product_final_price * (sp.product_num - sp.refund_num))) AS actual_amount",
+            "CAST(ROUND(SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,\n"
+            "           sp.product_final_price * (sp.product_num - sp.refund_num))) * 100) AS INT64) AS actual_amount",
             sql,
         )
 
@@ -77,7 +77,7 @@ class ProfitSalesTemplateTests(unittest.TestCase):
         """state=60 cancellations contribute 0 to sales_price/actual_amount."""
         sql = render(COMBO_ORDERS_SQL, product_type=1)
         self.assertIn(
-            "SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) AS sales_price",
+            "CAST(ROUND(SUM(IF(t.order_state IN (10,20,30,40), toi.price * toi.quantity, 0)) * 100) AS INT64) AS sales_price",
             sql,
         )
         self.assertIn(
