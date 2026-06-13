@@ -146,6 +146,12 @@ property 扰动测试(见 §7)防循环恒等式回归。
 - **终态**:`_money_classify` 删除容忍带,全部金额恒等式 `delta == 0`;
   `NEEDS_REVIEW` 仅保留给 sanity band 和未转红线的支付勾稽(它们本来就不是恒等式)
 
+> **实施勘误(PR-C,2026-06-13)。** PR-B 实测推翻了本节字面 C 的三项前提,**C 的"尾差记账"未做,实际交付为凭证账全渠道覆盖**:
+> - **`allocate()` 最大余额法 — 未做(无消费者)**:整数化后参与零容差的恒等式(AMOUNT/GROSS)都是逐行乘积求和,不涉及订单级金额摊到行级。member_discount_fee 等订单级折扣当前不进任何 sum 型恒等式,建分摊函数是 YAGNI。
+> - **`rounding_residual` 桶 — 未做(尾差被结构差异淹没)**:CROSS_LEDGER 现 qty 89.5%,残余 10.5% 是后端写入路径不对称等**结构性差异**,不是 ±1 萨当舍入尾差,立桶无落点。
+> - **删 `_money_classify` — 未做(原理上做不到 delta==0)**:它服务的 CROSS_LEDGER_GROSS(观察模式)、TAKEOUT/PAYMENT_TIEOUT(封顶🟡 口径未校准)是跨账本/跨口径对账,非 sum 型恒等式,delta==0 在原理上不可达(见 §8.5 共因错误/口径选择残余风险)。
+> - **实际做了(PR-C)**:`order_line` 加外卖凭证账路径,凭证账从 dine-only 扩到全渠道,跨账本 qty 45.5%→89.5%(`docs/audit/2026-06-cross-ledger-baseline.md` PR-C 章节)。真零容差终态的剩余障碍 = ttpos 后端 sp/sop 写入可靠性(后端问题,上交,非 BQ 范围),非本设计可关闭。
+
 ## 7. 测试策略
 
 - **存量不破**:现有 150+ 测试全程绿,每个 PR 合入前提
