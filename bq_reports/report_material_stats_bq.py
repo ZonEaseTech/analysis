@@ -13,6 +13,7 @@ import argparse
 import sys
 
 from .utils.bq_exporter import ReportExporter
+from semantic.dimensions.time import assert_month_not_frozen
 
 
 def main():
@@ -29,6 +30,7 @@ def main():
 
     args = parser.parse_args()
 
+    assert_month_not_frozen(args.month)
     # 解析原料 code
     material_codes = [c.strip() for c in args.materials.split(",")]
     print(f"原料 codes: {material_codes}")

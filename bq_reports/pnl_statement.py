@@ -39,7 +39,7 @@ from bq_reports.utils.bq_client import setup_proxy
 from semantic.aggregations.kpi_ratios import Kpi, compute_kpis
 from semantic.aggregations.pnl_layers import PnlStatement, build_pnl
 from semantic.comparison import compute_mom_changes, compute_yoy_changes
-from semantic.dimensions.time import month_to_ts_range
+from semantic.dimensions.time import month_to_ts_range, assert_month_not_frozen
 from semantic.entities import sale_event
 from semantic.resolvers import Resolver, load_resolvers_from_yaml
 from utils.report_engine import ReportEngine
@@ -1311,6 +1311,7 @@ def main():
                         help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     args = parser.parse_args()
 
+    assert_month_not_frozen(args.month)
     setup_proxy()
 
     # 延迟 import 避免循环

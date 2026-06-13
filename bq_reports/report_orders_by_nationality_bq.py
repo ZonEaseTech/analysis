@@ -13,6 +13,7 @@ import sys
 
 from .utils.bq_exporter import ReportExporter
 from .utils.bq_client import setup_proxy
+from semantic.dimensions.time import assert_month_not_frozen
 
 
 def main():
@@ -26,6 +27,7 @@ def main():
 
     args = parser.parse_args()
 
+    assert_month_not_frozen(args.start_date[:7])
     print("开始导出订单国籍报表...")
 
     setup_proxy()

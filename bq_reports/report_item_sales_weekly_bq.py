@@ -32,6 +32,8 @@ from google.cloud import bigquery
 from google.oauth2.credentials import Credentials
 import xlsxwriter
 
+from semantic.dimensions.time import assert_month_not_frozen
+
 PROJECT_ID = "diyl-407103"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "exports"
 
@@ -481,6 +483,7 @@ def main():
     # 当前用基线恒等式 (必填+唯一) 替代. 升级路径: 改 query_shop 输出完整桶字段.
     setup_proxy()
     sd, ed, start_ts, end_ts, workers, version, force = parse_args()
+    assert_month_not_frozen(sd.strftime("%Y-%m"))
     log(f"统计区间: {sd} ~ {ed}")
     log(f"时间戳:   {start_ts} ~ {end_ts}")
     log(f"门店数:   {len(STORE_LIST)}, 并发: {workers}\n")

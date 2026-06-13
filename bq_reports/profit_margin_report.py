@@ -36,7 +36,7 @@ from semantic.cogs import (
     match_fallback_bom as _match_fallback_bom,
     resolve_unit_price as _resolve_unit_price_with_source,
 )
-from semantic.dimensions.time import month_to_ts_range as _month_to_ts_range
+from semantic.dimensions.time import month_to_ts_range as _month_to_ts_range, assert_month_not_frozen
 from semantic.entities import bom, combo, price_breakdown, sale_line, takeout_line, total_line
 from semantic.resolvers import (
     CallableProvider,
@@ -1447,6 +1447,7 @@ def main():
         return 1
 
     if args.month:
+        assert_month_not_frozen(args.month)
         start_ts, end_ts = _month_to_ts_range(args.month)
         range_label = args.month.replace("-", "")
     elif args.start_date and args.end_date:

@@ -159,6 +159,13 @@ BQ_PROXY=http://127.0.0.1:7897 venv/bin/python -m bq_reports.profit_margin_repor
 
 `bq_client.setup_proxy()` 和各报表脚本里的同名函数都会读 `BQ_PROXY`，未设置时为 no-op。
 
+### 5.5 历史封存(零容差口径切换线)
+
+**封存线 = 2026-06**。2026-05 及之前的月份为旧浮点口径交付物,**永不重算**
+(`semantic/dimensions/time.py: assert_month_not_frozen`,报表入口拒跑 exit 3)。
+新旧口径数字不可逐分比较;只读对账/审计查询不受限。
+依据:spec 决策 2/3(`docs/superpowers/specs/2026-06-12-zero-tolerance-design.md`)。
+
 ### 6. 技术债清单(零容差改造)
 
 spec: `docs/superpowers/specs/2026-06-12-zero-tolerance-design.md`
@@ -166,11 +173,10 @@ spec: `docs/superpowers/specs/2026-06-12-zero-tolerance-design.md`
 
 | # | 债 | 还债条件 |
 |---|---|---|
+| ① | ~~2026-05 前旧口径封存待机制化~~ | 已落地: month guard (semantic/dimensions/time.py), 2026-06-13 |
 | ② | 支付勾稽 (bill.payment_amount vs 统计账实收) 封顶 🟡, 实测全店差 30-50% | service_fee/tax_fee/整单折扣/会员储值口径校准后转红线 |
 | ③ | 外卖平台侧退款不在恒等式内 | 对账桥范围, 子项目 D 接平台对账单后 |
 | ④ | sale_event / sale_line 双轨并存; profit_margin/sales_period 的 gross_amount 是定义式补齐 | sale_line/takeout_line 投影 gross_amount (PR-B), CROSS_LEDGER 证明等价后合并双轨 |
 | ⑤ | pnl_statement 只接非空闸门, 销售恒等式待 P&L 行字段对齐 | PR-B 整数化时一并对齐 |
 | ⑥ | CROSS_LEDGER 未进闸门: 凭证账含套餐子项行, 粒度不齐 (qty match 31.5%) | PR-B 修 order_line 套餐口径 → 复跑观察 → 100% 后进闸门 |
 | ⑦ | 外卖勾稽 2 单偏差未归因 (shop006/373316429388, shop059/372817075896) | PR-B 观察复跑时一并排查 |
-
-(技术债 ① "2026-05 前旧口径封存" 在 PR-B 落 month guard 时写入。)

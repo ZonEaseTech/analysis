@@ -39,6 +39,7 @@ from google.cloud import bigquery
 from google.oauth2.credentials import Credentials
 import xlsxwriter
 
+from semantic.dimensions.time import assert_month_not_frozen
 from semantic.entities.sale_event import sale_event_cte
 from semantic.validators import check, print_result
 from semantic.validators.identities import DEFAULT_IDENTITIES
@@ -724,6 +725,7 @@ def md5_file(p: Path) -> str:
 
 def main():
     sd, ed, stores_filter, workers, ver_override, force = parse_args()
+    assert_month_not_frozen(sd.strftime("%Y-%m"))
     # 当期 & 上期
     span_days = (ed - sd).days + 1
     prev_ed = sd - timedelta(days=1)

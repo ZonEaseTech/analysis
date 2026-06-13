@@ -47,7 +47,7 @@ from bq_reports.profit_margin_report import (
 )
 from bq_reports.utils.bq_client import setup_proxy
 from semantic.aggregations.by_grain import aggregate_by_grain
-from semantic.dimensions.time import month_to_ts_range
+from semantic.dimensions.time import month_to_ts_range, assert_month_not_frozen
 from semantic.entities import sale_event
 from semantic.validators import check, print_result
 from semantic.validators.identities import FULL_IDENTITIES
@@ -537,6 +537,7 @@ def main() -> int:
                         help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     args = parser.parse_args()
 
+    assert_month_not_frozen(args.month)
     setup_proxy()
     start_ts, end_ts = month_to_ts_range(args.month)
     # 自动版本号: 默认输出 exports/profit_by_price_{月}_v{N}.xlsx，每次升版。
