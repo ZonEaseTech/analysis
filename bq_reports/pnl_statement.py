@@ -491,6 +491,7 @@ def write_pnl_excel(
     menu_rows: Optional[list] = None,
     previous_artifact: Optional[dict] = None,
     force: bool = False,
+    sales_check_rows: Optional[list] = None,
 ):
     """写 P&L Excel — 多 sheet, 支持 drill-down.
 
@@ -530,17 +531,23 @@ def write_pnl_excel(
             _write_variance_sheet(wb, artifact, previous_artifact)
 
         # 零容差闸门 (在 wb.close() 前执行, 有 MUST_FIX 且无 --force 则 exit(2))
-        # 技术债 ⑤ (CLAUDE.md): P&L 行字段与销售恒等式未对齐, 暂只做非空闸门;
-        # 销售恒等式接入待 PR-B 字段对齐. 必填字段基线 (Task 11 工厂) 落地后升级.
+        # 店粒度销售恒等式 (DEFAULT_IDENTITIES); P&L 层金额 (COGS/费用) 是估算量不参与 — 技术债⑤已还 (PR-B Task 5)
         from semantic.validators.gate import (
             add_watermark_sheet_xlsxwriter, validate_and_gate)
+        from semantic.validators.identities import DEFAULT_IDENTITIES
 
-        # 用 sales_rows 代理: 从 artifact 取 pnl 行 — 确保至少有数据
-        # gate 检查 check_rows 行数 >= 1; identities=[] 跳过恒等式(字段未对齐)
-        pnl_rows = [{"_pnl": True}] if artifact.get("pnl") else []
+        # sales_check_rows: 店粒度销售桶聚合行 (由调用方从 sales_rows 构建并传入)
+        # 若未传入 (单元测试/mock 场景), 回退到非空闸门 (identities=[])
+        if sales_check_rows:
+            gate_rows = sales_check_rows
+            gate_identities = DEFAULT_IDENTITIES
+        else:
+            gate_rows = [{"_pnl": True}] if artifact.get("pnl") else []
+            gate_identities = []
         outcome = validate_and_gate(
-            pnl_rows, identities=[],
+            gate_rows, identities=gate_identities,
             force=force, report_name="pnl_statement",
+            row_label=lambda r: f"店 {r['store_num']}",
         )
         if outcome.needs_watermark:
             add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
@@ -1483,6 +1490,45 @@ def main():
         )
         print(f"  -> 上期 Net Sales {previous_artifact['pnl'].by_code('net_sales').amount:,.0f}")
 
+    # ── 店粒度销售恒等式 check_rows (技术债⑤已还 PR-B Task 5) ──
+    # 从 sales_rows (item × price × channel 粒度) 聚合到 store 粒度,
+    # 累加 DEFAULT_IDENTITIES 所需的全部销量/金额桶.
+    # net_qty 按定义式推导: qty − free − give − refund − cancelled
+    # (SALES_QTY_IDENTITY 是定义式守卫, 防字段缺失/schema 漂移; 参见 identities.py 注释)
+    _store_buckets: dict = {}
+    for _row in sales_rows:
+        _snum = _row.store_num
+        if _snum not in _store_buckets:
+            _store_buckets[_snum] = {
+                "store_num": _snum,
+                "qty": 0.0, "sales_price": 0.0, "gross_amount": 0.0,
+                "actual_amount": 0.0,
+                "refund_qty": 0.0, "refund_amount": 0.0,
+                "free_qty": 0.0, "free_amount": 0.0,
+                "give_qty": 0.0, "give_amount": 0.0,
+                "discount_amount": 0.0,
+                "cancelled_qty": 0.0, "cancelled_amount": 0.0,
+            }
+        _b = _store_buckets[_snum]
+        _b["qty"]              += float(getattr(_row, "qty", 0) or 0)
+        _b["sales_price"]      += float(getattr(_row, "sales_price", 0) or 0)
+        _b["gross_amount"]     += float(getattr(_row, "gross_amount", 0) or 0)
+        _b["actual_amount"]    += float(getattr(_row, "actual_amount", 0) or 0)
+        _b["refund_qty"]       += float(getattr(_row, "refund_qty", 0) or 0)
+        _b["refund_amount"]    += float(getattr(_row, "refund_amount", 0) or 0)
+        _b["free_qty"]         += float(getattr(_row, "free_qty", 0) or 0)
+        _b["free_amount"]      += float(getattr(_row, "free_amount", 0) or 0)
+        _b["give_qty"]         += float(getattr(_row, "give_qty", 0) or 0)
+        _b["give_amount"]      += float(getattr(_row, "give_amount", 0) or 0)
+        _b["discount_amount"]  += float(getattr(_row, "discount_amount", 0) or 0)
+        _b["cancelled_qty"]    += float(getattr(_row, "cancelled_qty", 0) or 0)
+        _b["cancelled_amount"] += float(getattr(_row, "cancelled_amount", 0) or 0)
+    sales_check_rows = []
+    for _b in _store_buckets.values():
+        _net_qty = (_b["qty"] - _b["free_qty"] - _b["give_qty"]
+                    - _b["refund_qty"] - _b["cancelled_qty"])
+        sales_check_rows.append({**_b, "revenue": _b["actual_amount"], "net_qty": _net_qty})
+
     write_pnl_excel(
         artifact, output_path,
         per_store_artifacts=per_store,
@@ -1490,6 +1536,7 @@ def main():
         menu_rows=menu_rows,
         previous_artifact=previous_artifact,
         force=args.force,
+        sales_check_rows=sales_check_rows,
     )
 
     # ── P4 跨系统对账: ttpos anchor ──
