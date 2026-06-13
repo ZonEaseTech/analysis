@@ -89,6 +89,22 @@ METRIC_LABELS = {
     "cancelled_qty": "取消数", "cancelled_amount": "取消金额",
 }
 
+# 交易金额指标 (萨当整数, 写盘时 /100 还原成元; PR-B 7b).
+# qty 类 (qty/refund_qty/free_qty/give_qty/cancelled_qty) 不是金额, 不转.
+MONEY_METRICS = {
+    "sales_price", "gross_amount", "original_amount", "actual_amount",
+    "refund_amount", "free_amount", "give_amount", "discount_amount",
+    "cancelled_amount",
+}
+
+
+def _disp(metric: str, value):
+    """显示侧: 交易金额萨当 → 元 (唯一除法点). 非金额原样返回 (PR-B 7b)."""
+    if metric in MONEY_METRICS and isinstance(value, (int, float)):
+        return value / 100.0
+    return value
+
+
 # 渠道展示顺序 (堂食优先, 外卖按平台字母序, pos_takeout 兜底最后)
 SUBCH_PRIORITY = {"pos": 0, "pos_takeout": 99}
 
@@ -298,9 +314,12 @@ def write_sheet_anchor(wb, anchor_by_store: dict, rows: list):
     for i, c in enumerate(cols):
         ws.write(3, i, c, hdr)
 
+    # 我方 actual_amount 是萨当 → 元 (对账锚 anchor_by_store 是 ttpos 口径元值)
     ours_by_store = {}
     for r in rows:
-        ours_by_store[r["store_num"]] = ours_by_store.get(r["store_num"], 0) + (r.get("actual_amount") or 0)
+        ours_by_store[r["store_num"]] = (
+            ours_by_store.get(r["store_num"], 0)
+            + (r.get("actual_amount") or 0) / 100.0)
 
     ri = 4
     tot_a = 0.0; tot_o = 0.0
@@ -423,7 +442,7 @@ def write_sheet1_period_long(wb, rows, store_names: dict):
         ws.write(target_row, 2, "", sub); ws.write(target_row, 3, "", sub)
         ws.write(target_row, 4, "", sub); ws.write(target_row, 5, "", sub)
         for ci, m in enumerate(METRICS, start=6):
-            ws.write(target_row, ci, store_agg[m], sub_i if m.endswith("_qty") else sub)
+            ws.write(target_row, ci, _disp(m, store_agg[m]), sub_i if m.endswith("_qty") else sub)
     for r in agg:
         if cur_store is not None and r["store_num"] != cur_store:
             _flush_store_subtotal(ri, cur_store)
@@ -439,7 +458,7 @@ def write_sheet1_period_long(wb, rows, store_names: dict):
         for ci, m in enumerate(METRICS, start=6):
             fmt = int_f if m.endswith("_qty") else money
             v = r.get(m, 0) or 0
-            ws.write(ri, ci, v, fmt)
+            ws.write(ri, ci, _disp(m, v), fmt)
             grand[m] += v; store_agg[m] += v
         ri += 1
     if cur_store is not None:
@@ -449,7 +468,7 @@ def write_sheet1_period_long(wb, rows, store_names: dict):
     ws.write(ri, 0, "总计", gtotal)
     for ci in range(1, 6): ws.write(ri, ci, "", gtotal)
     for ci, m in enumerate(METRICS, start=6):
-        ws.write(ri, ci, grand[m], gtotal_i if m.endswith("_qty") else gtotal)
+        ws.write(ri, ci, _disp(m, grand[m]), gtotal_i if m.endswith("_qty") else gtotal)
     ws.freeze_panes(1, 6)
     ws.set_column(0, 0, 8); ws.set_column(1, 1, 18); ws.set_column(2, 2, 30)
     ws.set_column(3, 3, 18); ws.set_column(4, 5, 11); ws.set_column(6, 5 + len(METRICS), 14)
@@ -490,10 +509,10 @@ def write_sheet2_store_pivot(wb, rows, store_names: dict):
                 v = r.get(m, 0) or 0
                 totals[m] += v; grand_pivot[sc][m] += v
                 fmt = int_f if m.endswith("_qty") else money
-                ws.write(ri, ci, v, fmt); ci += 1
+                ws.write(ri, ci, _disp(m, v), fmt); ci += 1
         for m in core_metrics:
             fmt = int_f if m.endswith("_qty") else money
-            ws.write(ri, ci, totals[m], fmt); ci += 1
+            ws.write(ri, ci, _disp(m, totals[m]), fmt); ci += 1
             grand_total[m] += totals[m]
     # 总计行
     ri = len(sorted_stores) + 1
@@ -501,9 +520,9 @@ def write_sheet2_store_pivot(wb, rows, store_names: dict):
     ci = 2
     for sc in subchs:
         for m in core_metrics:
-            ws.write(ri, ci, grand_pivot[sc][m], gtotal_i if m.endswith("_qty") else gtotal); ci += 1
+            ws.write(ri, ci, _disp(m, grand_pivot[sc][m]), gtotal_i if m.endswith("_qty") else gtotal); ci += 1
     for m in core_metrics:
-        ws.write(ri, ci, grand_total[m], gtotal_i if m.endswith("_qty") else gtotal); ci += 1
+        ws.write(ri, ci, _disp(m, grand_total[m]), gtotal_i if m.endswith("_qty") else gtotal); ci += 1
     ws.freeze_panes(1, 2)
     ws.set_column(0, 0, 10); ws.set_column(1, 1, 18); ws.set_column(2, len(cols)-1, 14)
     return len(by_store)
@@ -530,7 +549,7 @@ def write_sheet3_daily(wb, rows, store_names: dict):
         ws.write(ri, 6, fmt_subch(r["sub_channel"]))
         for ci, m in enumerate(METRICS, start=7):
             fmt = int_f if m.endswith("_qty") else money
-            ws.write(ri, ci, r.get(m, 0), fmt)
+            ws.write(ri, ci, _disp(m, r.get(m, 0)), fmt)
     ws.freeze_panes(1, 7)
     ws.set_column(0, 0, 12); ws.set_column(1, 1, 8); ws.set_column(2, 2, 18)
     ws.set_column(3, 3, 30); ws.set_column(4, 4, 18); ws.set_column(5, 6, 11)
@@ -572,7 +591,9 @@ def write_sheet4_variance(wb, curr_rows, prev_rows, curr_period, prev_period, st
         cur = curr_map.get(k, {}); prv = prev_map.get(k, {})
         item_name = cur.get("item_name") or prv.get("item_name") or ""
         cq = cur.get("qty", 0) or 0; pq = prv.get("qty", 0) or 0
-        cr = cur.get("sales_price", 0) or 0; pr = prv.get("sales_price", 0) or 0
+        # 营业额是萨当 → 元, 进入量差/价差估算 (PR-B 7b)
+        cr = (cur.get("sales_price", 0) or 0) / 100.0
+        pr = (prv.get("sales_price", 0) or 0) / 100.0
         # 行类型 + 整行底色
         if pq == 0 and cq > 0:
             row_type = "🆕 新品"; row_fmt = new_f

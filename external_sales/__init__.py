@@ -53,14 +53,16 @@ def to_profit_by_price_rows(ext_rows, mode: str):
         if r.category != cat_filter:
             continue
         # prefix (列 0-27)
-        avg_price = round(r.revenue / r.qty_net, 2) if r.qty_net else None
+        # 列 5/6/7/25/27 是 money_satang (引擎 /100 写盘), 外部 revenue 是元 → ×100 转萨当
+        avg_price = round(r.revenue / r.qty_net, 2) if r.qty_net else None  # 售价是元, 非萨当
+        revenue_satang = round(r.revenue * 100)   # 元→萨当
         prefix = [
             r.store_num, r.store_name, r.item_name,
             round(r.qty_net, 2),                 # 3 销量 (外部没赠/退/取, 等于净销量)
             round(r.qty_net, 2),                 # 4 净销量
-            round(r.revenue, 2),                 # 5 营业额 (用实收近似)
+            revenue_satang,                      # 5 营业额(萨当, 用实收近似)
             0,                                   # 6 标准金额 (外部没数据)
-            round(r.revenue, 2),                 # 7 实收
+            revenue_satang,                      # 7 实收(萨当)
             None, None, None,                    # 8-10 公式
             avg_price,                           # 11 售价1 (avg)
             round(r.qty_net, 2),                 # 12 净销量1

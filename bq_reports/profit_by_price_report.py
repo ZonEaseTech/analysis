@@ -277,15 +277,17 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             top_n.append((None, None))
 
         # SKU 级 prefix（merge: true，跨 BOM 行复制）
+        # 交易金额 (营业额/标准/实收/退款/取消) 是萨当整数, 列标 money_satang →
+        # 引擎写盘时 /100 还原成元 (PR-B 7b). 不在此 round (萨当整数已精确).
         prefix = [
             store_num,                              # 0  门店编号        A
             store_name,                             # 1  门店名称        B
             item_name,                              # 2  商品名称        C
             round(qty, 2),                          # 3  销量            D
             round(net_qty, 2),                      # 4  净销量          E
-            round(data["sales_price"], 2),          # 5  营业额          F
-            round(data["original_amount"], 2),      # 6  标准金额        G
-            round(data["actual_amount"], 2),        # 7  实收金额        H  ★
+            data["sales_price"],                    # 5  营业额(萨当)    F
+            data["original_amount"],                # 6  标准金额(萨当)  G
+            data["actual_amount"],                  # 7  实收金额(萨当)  H  ★
             None, None, None,                       # 8-10 折损/客单实收/实收占比 (formula)
             # 价格档 5 对 + 其它销量
             (round(top_n[0][0], 2) if top_n[0][0] is not None else None),  # 11 售价1
@@ -302,9 +304,9 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             round(data["free_qty"], 2),             # 22 赠品数量        W
             round(data["give_qty"], 2),             # 23 赠送数量        X
             round(data["refund_qty"], 2),           # 24 退款数量        Y
-            round(data["refund_amount"], 2),        # 25 退款金额        Z
+            data["refund_amount"],                  # 25 退款金额(萨当)  Z
             round(data["cancelled_qty"], 2),        # 26 取消数量       AA
-            round(data["cancelled_amount"], 2),     # 27 取消金额       AB
+            data["cancelled_amount"],               # 27 取消金额(萨当) AB
         ]
         bom_list, bom_source, price_source = _bom_for_item(
             store_num, item_uuid_str, item_name,
@@ -315,9 +317,10 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
         )
 
         # 渠道分实收 — 用于算 3 项费用
+        # 边界: revenue_by_channel 是萨当 → 元, 进入估算域跟费率算 (PR-B 7b)
         rev_ch = revenue_by_channel.get((store_num, item_uuid_str), {})
-        revenue_dine = float(rev_ch.get("dine", 0))
-        revenue_takeout = float(rev_ch.get("takeout", 0))
+        revenue_dine = float(rev_ch.get("dine", 0)) / 100.0      # 萨当→元
+        revenue_takeout = float(rev_ch.get("takeout", 0)) / 100.0  # 萨当→元
         payment_fee = revenue_dine * dine_pay_rate
         service_fee_income = revenue_dine * dine_svc_rate
         # 平台抽佣: 优先用对账单事实费率 (该店真实综合费率)
@@ -773,7 +776,8 @@ def main() -> int:
             print(f"   后果: 利润率显示为 100% (实际无意义)")
             for (k, q, actual) in sorted(zero_cost, key=lambda x: -x[2])[:10]:
                 # sku_key 现在是 (店编, 店名, item_uuid, SKU名)，已不含 price
-                print(f"   店 {k[0]:>3}  {k[3]:<28}  qty={q:>5.0f}  实收 ¥{actual:>10.0f}")
+                # actual 是萨当 → 元显示 (PR-B 7b)
+                print(f"   店 {k[0]:>3}  {k[3]:<28}  qty={q:>5.0f}  实收 ¥{actual/100.0:>10.0f}")
             if len(zero_cost) > 10:
                 print(f"   ⏬ 还有 {len(zero_cost)-10} 条略")
 

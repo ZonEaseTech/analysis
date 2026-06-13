@@ -77,6 +77,8 @@ class ColumnConfig:
     zero_yellow: bool = False           # 0 值标黄（用于"应有值却缺失"列，如 strict 模式下物料单价=0）
     hidden: bool = False                # 列隐藏（客户报表收敛视图，audit 脚本仍可读）
     comment: str = ""                   # 表头悬停备注（字段语义 / 取数说明）
+    money_satang: bool = False          # 值是萨当整数 (INT64), 写盘时 /100 还原成元
+                                        # (PR-B 7b: 交易金额整数化, 唯一显示侧除法点)
 
 
 @dataclass
@@ -336,6 +338,9 @@ def write_configured_sheet(workbook, sheet_name: str, sheet_config: SheetConfig,
 
                 if col_cfg.col_type == "value":
                     value = rows[data_idx][field_idx] if field_idx < len(rows[data_idx]) else None
+                    # 萨当整数 → 元: 唯一显示侧除法点 (PR-B 7b)
+                    if col_cfg.money_satang and isinstance(value, (int, float)):
+                        value = value / 100.0
                     fmt_args = {"border": 1, "border_color": _BORDER_COLOR, "valign": "vcenter"}
                     if isinstance(value, (int, float)):
                         fmt_args["align"] = "right"
@@ -404,6 +409,9 @@ def write_configured_sheet(workbook, sheet_name: str, sheet_config: SheetConfig,
 
             if col_cfg.col_type == "value":
                 val = rows[block_start][col_cfg.field_index] if col_cfg.field_index < len(rows[block_start]) else None
+                # 萨当整数 → 元: 唯一显示侧除法点 (PR-B 7b)
+                if col_cfg.money_satang and isinstance(val, (int, float)):
+                    val = val / 100.0
                 if isinstance(val, (int, float)):
                     fmt_args["align"] = "right"
                 fmt = cache.get(**fmt_args)
@@ -479,6 +487,7 @@ def load_sheet_config(yaml_path: str, sheet_name: str) -> SheetConfig:
             zero_yellow=c.get("zero_yellow", False),
             hidden=c.get("hidden", False),
             comment=c.get("comment", ""),
+            money_satang=c.get("money_satang", False),
         ))
 
     return SheetConfig(

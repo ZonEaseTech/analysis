@@ -971,21 +971,22 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         item_uuid = str(row.item_uuid)
         item_name = row.item_name
         qty = float(row.qty or 0)
-        revenue = float(row.revenue or 0)
-        sales_price = float(getattr(row, "sales_price", None) or 0)
-        original_amount = float(getattr(row, "original_amount", None) or 0)
+        # 交易金额: 萨当整数 (BQ INT64), 全程 int 加法精确 (PR-B 7b)
+        revenue = int(row.revenue or 0)
+        sales_price = int(getattr(row, "sales_price", None) or 0)
+        original_amount = int(getattr(row, "original_amount", None) or 0)
         avg_member_discount = float(getattr(row, "avg_member_discount", None) or 1.0)
         free_qty = float(getattr(row, "free_qty", None) or 0)
         give_qty = float(getattr(row, "give_qty", None) or 0)
         refund_qty = float(getattr(row, "refund_qty", None) or 0)
-        refund_amount = float(getattr(row, "refund_amount", None) or 0)
+        refund_amount = int(getattr(row, "refund_amount", None) or 0)
         cancelled_qty = float(getattr(row, "cancelled_qty", None) or 0)
-        cancelled_amount = float(getattr(row, "cancelled_amount", None) or 0)
-        # 金额恒等式分项（堂食才有非零值）
-        free_amount = float(getattr(row, "free_amount", None) or 0)
-        give_amount = float(getattr(row, "give_amount", None) or 0)
-        discount_amount = float(getattr(row, "discount_amount", None) or 0)
-        list_price = float(getattr(row, "list_price", None) or 0)
+        cancelled_amount = int(getattr(row, "cancelled_amount", None) or 0)
+        # 金额恒等式分项（堂食才有非零值; 萨当整数）
+        free_amount = int(getattr(row, "free_amount", None) or 0)
+        give_amount = int(getattr(row, "give_amount", None) or 0)
+        discount_amount = int(getattr(row, "discount_amount", None) or 0)
+        list_price = float(getattr(row, "list_price", None) or 0)  # 估算域: 标价是元 float
         price_1 = getattr(row, "price_1", None)
         qty_1 = getattr(row, "qty_1", None)
         price_2 = getattr(row, "price_2", None)
@@ -998,17 +999,18 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         if key not in data:
             data[key] = {
                 "qty": 0.0,
-                "revenue": 0.0,
-                "sales_price": 0.0,
-                "gross_amount": 0.0,
-                "original_amount": 0.0,
+                # 交易金额桶: 萨当整数 (int 加法精确, PR-B 7b)
+                "revenue": 0,
+                "sales_price": 0,
+                "gross_amount": 0,
+                "original_amount": 0,
                 "refund_qty": 0.0,
-                "refund_amount": 0.0,
+                "refund_amount": 0,
                 "cancelled_qty": 0.0,
-                "cancelled_amount": 0.0,
-                "free_amount": 0.0,
-                "give_amount": 0.0,
-                "discount_amount": 0.0,
+                "cancelled_amount": 0,
+                "free_amount": 0,
+                "give_amount": 0,
+                "discount_amount": 0,
                 "avg_member_discount": 0.0,
                 "free_qty": 0.0,
                 "give_qty": 0.0,
@@ -1025,8 +1027,8 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         data[key]["qty"] += qty
         data[key]["revenue"] += revenue
         data[key]["sales_price"] += sales_price
-        # 真实列 (sale_line/takeout_line 已投影 gross_amount), 毛额守恒为真校验
-        data[key]["gross_amount"] += float(getattr(row, "gross_amount", 0) or 0)
+        # 真实列 (sale_line/takeout_line 已投影 gross_amount), 毛额守恒为真校验 (萨当整数)
+        data[key]["gross_amount"] += int(getattr(row, "gross_amount", 0) or 0)
         data[key]["original_amount"] += original_amount
         data[key]["refund_qty"] += refund_qty
         data[key]["refund_amount"] += refund_amount
@@ -1234,18 +1236,20 @@ def _build_rows(agg_data, mode, bom_layers=None, uploaded_prices=None, erp_price
 
         # row 末尾扩展槽位（field_index 26-29 = utility 公式列；30-31 = 标价应收/异常损失公式列；
         # 32 = 取消数量、33 = 取消金额、34 = BOM 来源；35 = 物料价来源）。
+        # cancelled_amount 是萨当整数, 列标 money_satang → 引擎 /100 写盘 (PR-B 7b)
         tail = [None, None, None, None, None, None,
-                round(cancelled_qty, 2), round(cancelled_amount, 2),
+                round(cancelled_qty, 2), cancelled_amount,
                 bom_source, price_source_str]
 
         if not bom_list:
             rows.append([
                 store_num, store_name, item_name,
                 round(list_price, 2), round(qty, 2),
-                round(sales_price, 2), round(original_amount, 2),
-                round(revenue, 2), round(avg_member_discount, 4),
+                # 萨当整数 (money_satang 列, 引擎 /100 写盘); original_amount 被 block_formula 覆盖
+                sales_price, original_amount,
+                revenue, round(avg_member_discount, 4),
                 round(free_qty, 2), round(give_qty, 2),
-                round(refund_qty, 2), round(refund_amount, 2),
+                round(refund_qty, 2), refund_amount,
                 price_1, qty_1, price_2, qty_2, price_3, qty_3, other_price_qty,
                 "-", "-", None, None, "-",
                 str(item_uuid),
@@ -1256,10 +1260,11 @@ def _build_rows(agg_data, mode, bom_layers=None, uploaded_prices=None, erp_price
             rows.append([
                 store_num, store_name, item_name,
                 round(list_price, 2), round(qty, 2),
-                round(sales_price, 2), round(original_amount, 2),
-                round(revenue, 2), round(avg_member_discount, 4),
+                # 萨当整数 (money_satang 列, 引擎 /100 写盘); original_amount 被 block_formula 覆盖
+                sales_price, original_amount,
+                revenue, round(avg_member_discount, 4),
                 round(free_qty, 2), round(give_qty, 2),
-                round(refund_qty, 2), round(refund_amount, 2),
+                round(refund_qty, 2), refund_amount,
                 price_1, qty_1, price_2, qty_2, price_3, qty_3, other_price_qty,
                 name, code, round(bom_num, 4), round(mat_price, 4), uom or "-",
                 str(item_uuid),
@@ -1332,21 +1337,23 @@ def _build_summary_rows(agg_data, mode, bom_layers=None, uploaded_prices=None, e
             bom_source = "无"
         price_source_str = " + ".join(sorted(price_sources_seen)) if price_sources_seen else "无"
 
-        # 单份总成本 = Σ (BOM 消耗 × 物料单价)
+        # 单份总成本 = Σ (BOM 消耗 × 物料单价) — 估算域 (物料单价是 4 位小数元)
         per_unit_cost = sum(bom_num * unit_price
                             for _, _, bom_num, unit_price, _ in bom_list)
         # 总成本 = 单份成本 × 销量（含赠/退/取，因为 BOM 实际消耗了）
         total_cost = per_unit_cost * qty
+        # 边界: revenue 是萨当整数 → 元, 进入估算域跟成本/利润算 (PR-B 7b)
+        revenue_thb = revenue / 100.0  # 萨当→元
         # 总利润 = 实收 - 总成本
-        total_profit = revenue - total_cost
-        margin = total_profit / revenue if revenue > 0 else 0
+        total_profit = revenue_thb - total_cost
+        margin = total_profit / revenue_thb if revenue_thb > 0 else 0
 
         rows.append([
             store_num, store_name, item_name,
             round(qty, 2),
             round(net_qty, 2),
-            round(sales_price, 2),
-            round(revenue, 2),
+            round(sales_price / 100.0, 2),    # 萨当→元
+            round(revenue_thb, 2),
             round(per_unit_cost, 4),
             round(total_cost, 2),
             round(total_profit, 2),

@@ -315,6 +315,13 @@ _TOTAL_FIELDS = (
 # 按 channel 拆出来的字段 (build_pnl 用 dine_/takeout_sales_price + qty)
 _PER_CHANNEL_FIELDS = ("qty", "sales_price")
 
+# 交易金额字段 (萨当整数) — aggregate_sales_by_channel 在边界 /100 转元进入
+# P&L 估算域 (COGS/费率/利润全是元 float). 非金额 (qty/order_count) 不转. (PR-B 7b)
+_SATANG_FIELDS = frozenset({
+    "sales_price", "actual_amount", "refund_amount", "cancelled_amount",
+    "free_amount", "give_amount", "discount_amount",
+})
+
 
 def aggregate_sales_by_channel(rows: Iterable[Any]) -> dict:
     """从 sale_event-like 行 (含 channel ∈ {'dine','takeout'}) 聚合成单 dict.
@@ -330,16 +337,22 @@ def aggregate_sales_by_channel(rows: Iterable[Any]) -> dict:
     """
     out: dict = defaultdict(float)
     for row in rows:
-        # 总数
+        # 总数 — 边界: 萨当金额字段 /100 转元进入 P&L 估算域 (PR-B 7b)
         for field in _TOTAL_FIELDS:
-            out[field] += float(_get(row, field, 0) or 0)
+            v = float(_get(row, field, 0) or 0)
+            if field in _SATANG_FIELDS:
+                v /= 100.0  # 萨当→元
+            out[field] += v
         # 按渠道拆 (只拆 qty/sales_price; actual/refund 等总数本身已经按 channel
         # 在 sale_event 里区分了, 不需要重复拆)
         channel = _get(row, "channel", "")
         if channel in ("dine", "takeout"):
             prefix = f"{channel}_"
             for field in _PER_CHANNEL_FIELDS:
-                out[f"{prefix}{field}"] += float(_get(row, field, 0) or 0)
+                v = float(_get(row, field, 0) or 0)
+                if field in _SATANG_FIELDS:
+                    v /= 100.0  # 萨当→元
+                out[f"{prefix}{field}"] += v
     return dict(out)
 
 
@@ -968,7 +981,8 @@ def _compute_menu_engineering(
         key = (row.store_num, str(row.item_uuid))
         e = by_item[key]
         e["qty"] += float(row.qty or 0)
-        e["actual"] += float(row.actual_amount or 0)
+        # 边界: actual_amount 萨当 → 元 (跟 COGS 估算域算毛利, PR-B 7b)
+        e["actual"] += float(row.actual_amount or 0) / 100.0
         if not e["name"]:
             e["name"] = row.item_name or ""
             e["store_name"] = row.store_name or ""
@@ -1435,13 +1449,14 @@ def main():
     # 按渠道 cogs + net_sales (Sheet 4 用)
     # net_sales 按 channel 拆: 直接 SUM sales_rows.actual_amount by channel
     from collections import defaultdict
+    # 边界: actual_amount/sales_price 是萨当 → 元 (Sheet 4 跟 COGS 估算域对比, PR-B 7b)
     net_sales_by_channel: dict = defaultdict(float)
     gmv_by_channel: dict = defaultdict(float)
     for row in sales_rows:
         ch = getattr(row, "channel", None)
         if ch in ("dine", "takeout"):
-            net_sales_by_channel[ch] += float(getattr(row, "actual_amount", 0) or 0)
-            gmv_by_channel[ch] += float(getattr(row, "sales_price", 0) or 0)
+            net_sales_by_channel[ch] += float(getattr(row, "actual_amount", 0) or 0) / 100.0
+            gmv_by_channel[ch] += float(getattr(row, "sales_price", 0) or 0) / 100.0
     channel_data = {
         "dine":    {"cogs": cogs_data["dine"],
                     "net_sales": net_sales_by_channel["dine"],

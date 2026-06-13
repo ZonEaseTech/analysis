@@ -18,11 +18,12 @@ from bq_reports.profit_margin_report import _build_rows
 
 def make_agg(bom=None, **fields):
     """Minimal agg_data dict matching what aggregate_with_bom returns."""
+    # 交易金额字段值是萨当整数 (PR-B 7b): _build_rows 透传, 引擎写盘时 /100
     defaults = dict(
-        qty=10.0, revenue=300.0,
-        sales_price=500.0, original_amount=480.0,
-        refund_qty=2.0, refund_amount=20.0,
-        cancelled_qty=3.0, cancelled_amount=30.0,
+        qty=10.0, revenue=30000,
+        sales_price=50000, original_amount=48000,
+        refund_qty=2.0, refund_amount=2000,
+        cancelled_qty=3.0, cancelled_amount=3000,
         avg_member_discount=0.95,
         free_qty=1.0, give_qty=2.0,
         list_price=60.0,
@@ -62,15 +63,16 @@ class ColumnContractTests(unittest.TestCase):
         # 3 当前标价, 4 销量
         self.assertEqual(row[3], 60.0)
         self.assertEqual(row[4], 10.0)
-        # 5 营业额, 6 标准金额, 7 实收, 8 折扣率, 9/10 free/give, 11/12 refund qty/amount
-        self.assertEqual(row[5], 500.0)
-        self.assertEqual(row[6], 480.0)
-        self.assertEqual(row[7], 300.0)
+        # 5 营业额, 6 标准金额, 7 实收 — 萨当整数透传 (引擎 /100 写盘)
+        # 8 折扣率, 9/10 free/give, 11/12 refund qty/amount
+        self.assertEqual(row[5], 50000)
+        self.assertEqual(row[6], 48000)
+        self.assertEqual(row[7], 30000)
         self.assertEqual(row[8], 0.95)
         self.assertEqual(row[9], 1.0)
         self.assertEqual(row[10], 2.0)
         self.assertEqual(row[11], 2.0)
-        self.assertEqual(row[12], 20.0)
+        self.assertEqual(row[12], 2000)
         # 13-19 price breakdown
         self.assertEqual(row[13], 60.0)
         self.assertEqual(row[14], 5.0)
@@ -96,7 +98,7 @@ class ColumnContractTests(unittest.TestCase):
         self.assertIsNone(row[30])
         self.assertIsNone(row[31])
         self.assertEqual(row[32], 3.0)
-        self.assertEqual(row[33], 30.0)
+        self.assertEqual(row[33], 3000)   # cancelled_amount 萨当整数
 
     def test_no_bom_row_uses_dash_placeholders(self):
         row = _build_rows(make_agg(bom=[]), mode="single")[0]

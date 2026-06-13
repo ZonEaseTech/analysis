@@ -100,9 +100,10 @@ class BuildSummaryRowsTests(unittest.TestCase):
     """Flatten produces one row per (store, SKU) with pre-computed numbers."""
 
     def _agg(self, bom=None, **fields):
+        # 交易金额字段值是萨当整数 (PR-B 7b): revenue 30000 萨当 = 300 元
         defaults = dict(
-            qty=10.0, net_qty=8.0, revenue=300.0, sales_price=500.0,
-            original_amount=480.0, refund_qty=0, refund_amount=0,
+            qty=10.0, net_qty=8.0, revenue=30000, sales_price=50000,
+            original_amount=48000, refund_qty=0, refund_amount=0,
             cancelled_qty=0, cancelled_amount=0,
             free_amount=0, give_amount=0, discount_amount=0,
             free_qty=1.0, give_qty=1.0, avg_member_discount=1.0,
@@ -146,10 +147,10 @@ class BuildSummaryRowsTests(unittest.TestCase):
         self.assertEqual(rows[0][8], 20)
 
     def test_profit_and_margin(self):
-        rows = _build_summary_rows(self._agg(qty=10, revenue=300.0,
+        rows = _build_summary_rows(self._agg(qty=10, revenue=30000,
                                               bom=[("M1", "x", 1.0, 2.0, "g")]),
                                     mode="single")
-        # cost=20, profit=300-20=280, margin=280/300
+        # revenue 30000 萨当 = 300 元; cost=20, profit=300-20=280, margin=280/300
         self.assertEqual(rows[0][9], 280)
         self.assertAlmostEqual(rows[0][10], 280 / 300, places=4)
 
