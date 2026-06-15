@@ -1,6 +1,15 @@
 # Plan: Metrics Registry — single source of truth for 口径 / formulas, rendered by hub
 
-- Status: **approved (full A+B+C) — implementing** (2026-06-15)
+- Status: **completed (A+B+C)** (2026-06-15)
+  - Phase A `9e31447`: registry (26 metrics / 5 domains) + schema + loader +
+    render_catalog generator (`--check` CI gate) + 15 tests. metrics-catalog.md
+    is now generated.
+  - Phase B `957d224`: `/api/metrics` + 口径中心 page (domain cards, search,
+    detail drawer with formula/SQL/lineage/anchor/confidence). Also recovered
+    hub/web/src/shared/lib/ which the root `lib/` gitignore had been dropping.
+  - Phase C `0113c91`: report yaml `metric:` bindings (profit_margin.yaml ×9) +
+    contract gate (validate_bindings) + ColumnConfig.metric field (additive) +
+    `/api/metrics/bindings` + 报表血缘 page. 18 tests green.
 - Owner: weifashi (with Claude)
 - Created: 2026-06-15
 - Task: docs/task/index.md → metrics-registry
