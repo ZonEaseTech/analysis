@@ -5,6 +5,7 @@ import {
   CircleCheck,
   CircleX,
   FileSpreadsheet,
+  Ruler,
   ShieldCheck,
   Terminal,
 } from "lucide-react";
@@ -16,6 +17,7 @@ import { apiGet } from "@/shared/lib/http";
 const NAV = [
   { to: "/", label: "脚本中心", icon: Terminal },
   { to: "/reports", label: "报表中心", icon: FileSpreadsheet },
+  { to: "/metrics", label: "口径中心", icon: Ruler },
   { to: "/datadict", label: "数据字典", icon: BookOpen },
   { to: "/audit", label: "审计中心", icon: ShieldCheck },
 ] as const;

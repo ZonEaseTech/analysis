@@ -9,6 +9,7 @@ import { existsSync } from 'node:fs'
 import { audit } from './modules/audit'
 import { datadict } from './modules/datadict'
 import { health } from './modules/health'
+import { metrics } from './modules/metrics'
 import { reports } from './modules/reports'
 import { runsApi, scripts } from './modules/scripts'
 import { HUB_ROOT } from './root'
@@ -29,6 +30,7 @@ export function createApp(_config: Config) {
   api.route('/runs', runsApi)
   api.route('/reports', reports)
   api.route('/datadict', datadict)
+  api.route('/metrics', metrics)
   api.route('/audit', audit)
   app.route('/api', api)
 
