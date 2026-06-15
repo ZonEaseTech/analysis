@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import { readdirSync, readFileSync } from 'node:fs'
 import { fromAnalysis } from '@/root'
 

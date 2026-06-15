@@ -5,6 +5,7 @@ import {
   CircleCheck,
   CircleX,
   FileSpreadsheet,
+  History,
   Ruler,
   ShieldCheck,
   Terminal,
@@ -17,6 +18,7 @@ import { apiGet } from "@/shared/lib/http";
 
 const NAV = [
   { to: "/", label: "脚本中心", icon: Terminal },
+  { to: "/runs", label: "运行历史", icon: History },
   { to: "/reports", label: "报表中心", icon: FileSpreadsheet },
   { to: "/metrics", label: "口径中心", icon: Ruler },
   { to: "/lineage", label: "报表血缘", icon: Workflow },

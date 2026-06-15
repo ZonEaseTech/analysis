@@ -4,6 +4,9 @@ node_modules
 # build output (bun build src/index.ts --outdir dist)
 dist
 
+# local SQLite db (run history) — schema lives in drizzle/ migrations
+.data
+
 # local env / secrets
 .env
 .env.local

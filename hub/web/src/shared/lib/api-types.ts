@@ -36,6 +36,28 @@ export interface RunResponse {
   runId: string;
 }
 
+export type RunStatus = "running" | "done" | "error";
+
+export interface RunSummary {
+  id: string;
+  scriptId: string;
+  scriptName: string;
+  scriptPath: string;
+  args: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  exitCode: number | null;
+  status: RunStatus;
+}
+
+export interface RunDetail extends RunSummary {
+  log: string | null;
+}
+
+export interface RunsResponse {
+  runs: RunSummary[];
+}
+
 export interface ReportFile {
   file: string;
   sizeKb: number;

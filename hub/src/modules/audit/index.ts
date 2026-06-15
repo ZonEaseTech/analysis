@@ -1,6 +1,6 @@
-import { Hono } from 'hono'
-import { basename } from 'node:path'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { basename } from 'node:path'
+import { Hono } from 'hono'
 import { fromAnalysis } from '@/root'
 
 const EXPORTS = fromAnalysis('exports')
@@ -42,19 +42,22 @@ function listRuns(): AuditRun[] {
 }
 
 function parseCsv(text: string, maxRows = 500): { header: string[], rows: string[][] } {
-  const lines = text.replace(/^﻿/, '').split(/\r?\n/).filter(l => l.length)
+  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).filter(l => l.length)
   const split = (l: string): string[] => {
     const out: string[] = []
     let cur = ''
     let q = false
     for (const ch of l) {
-      if (ch === '"')
+      if (ch === '"') {
         q = !q
+      }
       else if (ch === ',' && !q) {
         out.push(cur)
         cur = ''
       }
-      else cur += ch
+      else {
+        cur += ch
+      }
     }
     out.push(cur)
     return out

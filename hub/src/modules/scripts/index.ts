@@ -1,20 +1,23 @@
+import { readFileSync } from 'node:fs'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
-import { readFileSync } from 'node:fs'
 import { fromAnalysis } from '@/root'
 import { spawnPython } from '@/shared/python'
 import { decodeId, scanScripts } from '@/shared/scripts-scan'
+import { RunsRepo } from './runs-repo'
 
-interface RunState {
-  scriptId: string
+/**
+ * Live, in-memory state for an active run — drives the SSE stream while the
+ * process runs. The durable record (incl. final log) lives in SQLite.
+ */
+interface LiveRun {
   logs: string[]
   done: boolean
   exitCode: number | null
-  startedAt: string
 }
 
-const runs = new Map<string, RunState>()
-const lastRun = new Map<string, string>() // scriptId -> ISO
+const live = new Map<string, LiveRun>()
+const repo = new RunsRepo()
 let runSeq = 0
 
 const pad = (n: number): string => String(n).padStart(2, '0')
@@ -29,8 +32,10 @@ function lastMonth(): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`
 }
 
-/** Auto-fill the common required CLI args so a web "run" works without a form.
- * --output → timestamped path under exports/; --month → previous month. */
+/**
+ * Auto-fill the common required CLI args so a web "run" works without a form.
+ * --output → timestamped path under exports/; --month → previous month.
+ */
 function defaultArgs(name: string, source: string): string[] {
   const args: string[] = []
   if (source.includes('--output'))
@@ -42,6 +47,7 @@ function defaultArgs(name: string, source: string): string[] {
 
 export const scripts = new Hono()
   .get('/', (c) => {
+    const lastRun = repo.lastRunByScript()
     const list = scanScripts().map(s => ({ ...s, lastRunAt: lastRun.get(s.id) ?? null }))
     return c.json({ scripts: list })
   })
@@ -70,19 +76,34 @@ export const scripts = new Hono()
     catch { /* ignore */ }
     const extra = defaultArgs(meta.name, source)
     const runId = `run-${++runSeq}-${Date.now()}`
-    const state: RunState = { scriptId: id, logs: [], done: false, exitCode: null, startedAt: new Date().toISOString() }
-    runs.set(runId, state)
-    lastRun.set(id, state.startedAt)
+    const startedAt = new Date().toISOString()
+    const argsStr = extra.join(' ')
 
-    state.logs.push(`[hub] venv/bin/python ${rel}${extra.length ? ` ${extra.join(' ')}` : ''}`)
+    const state: LiveRun = { logs: [], done: false, exitCode: null }
+    live.set(runId, state)
+    state.logs.push(`[hub] venv/bin/python ${rel}${argsStr ? ` ${argsStr}` : ''}`)
+    repo.create({
+      id: runId,
+      scriptId: id,
+      scriptName: meta.name,
+      scriptPath: rel,
+      args: argsStr || null,
+      startedAt,
+      finishedAt: null,
+      exitCode: null,
+      status: 'running',
+      log: null,
+    })
+
     const proc = spawnPython([rel, ...extra])
     void (async () => {
       const dec = new TextDecoder()
       const pump = async (stream: ReadableStream<Uint8Array>) => {
         for await (const chunk of stream) {
-          for (const line of dec.decode(chunk).split('\n'))
+          for (const line of dec.decode(chunk).split('\n')) {
             if (line.length)
               state.logs.push(line)
+          }
         }
       }
       try {
@@ -95,6 +116,12 @@ export const scripts = new Hono()
       }
       finally {
         state.done = true
+        repo.finish(runId, {
+          finishedAt: new Date().toISOString(),
+          exitCode: state.exitCode,
+          status: state.exitCode === 0 ? 'done' : 'error',
+          log: state.logs.join('\n'),
+        })
       }
     })()
 
@@ -102,11 +129,30 @@ export const scripts = new Hono()
   })
 
 export const runsApi = new Hono()
+  .get('/', (c) => {
+    const rows = repo.list().map(({ log: _log, ...r }) => r)
+    return c.json({ runs: rows })
+  })
+  .get('/:runId', (c) => {
+    const row = repo.get(c.req.param('runId'))
+    if (!row)
+      return c.json({ error: 'no such run' }, 404)
+    return c.json(row)
+  })
   .get('/:runId/stream', (c) => {
     const runId = c.req.param('runId')
-    const state = runs.get(runId)
-    if (!state)
-      return c.json({ error: 'no such run' }, 404)
+    const state = live.get(runId)
+    // Finished run (or post-restart): replay the persisted log, then close.
+    if (!state) {
+      const row = repo.get(runId)
+      if (!row)
+        return c.json({ error: 'no such run' }, 404)
+      return streamSSE(c, async (stream) => {
+        for (const line of (row.log ?? '').split('\n'))
+          await stream.writeSSE({ data: line })
+        await stream.writeSSE({ event: 'done', data: JSON.stringify({ exitCode: row.exitCode }) })
+      })
+    }
     return streamSSE(c, async (stream) => {
       let i = 0
       while (true) {

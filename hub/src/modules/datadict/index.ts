@@ -1,5 +1,5 @@
-import { Hono } from 'hono'
 import { readFileSync } from 'node:fs'
+import { Hono } from 'hono'
 import { fromAnalysis } from '@/root'
 
 interface Field { name: string, type: string, comment: string }

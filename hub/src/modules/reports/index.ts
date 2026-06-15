@@ -1,6 +1,6 @@
-import { Hono } from 'hono'
-import { basename } from 'node:path'
 import { existsSync, readdirSync, statSync } from 'node:fs'
+import { basename } from 'node:path'
+import { Hono } from 'hono'
 import { fromAnalysis } from '@/root'
 import { runPythonJSON } from '@/shared/python'
 
@@ -14,8 +14,8 @@ function meta(file: string): { name: string, month: string, version: number | nu
   const version = file.match(/_?v(\d+)/)?.[1]
   const name = file
     .replace(/\.xlsx$/i, '')
-    .replace(/_?v\d+.*$/i, '')
-    .replace(/\d{4}-?\d{2}\d*/g, '')
+    .replace(/_?v\d.*$/i, '')
+    .replace(/\d{4}-?\d{2,}/g, '')
     .replace(/[_-]+$/g, '')
     .replace(/[_-]+/g, '_')
     .trim() || file.replace(/\.xlsx$/i, '')

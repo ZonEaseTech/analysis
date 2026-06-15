@@ -1,8 +1,11 @@
+import process from 'node:process'
 import { consola } from 'consola'
 import { createApp } from './app'
 import { loadConfig } from './config'
+import { getDb, migrateDb } from './db'
 
 const config = loadConfig()
+migrateDb(getDb())
 const app = createApp(config)
 
 const server = Bun.serve({

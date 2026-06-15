@@ -1,11 +1,14 @@
+import process from 'node:process'
 import { ANALYSIS_ROOT, fromAnalysis } from '@/root'
 
 /** venv python — all report scripts must run through it (project rule). */
 export const PYTHON: string = fromAnalysis('venv', 'bin', 'python')
 
-/** Spawn a python process rooted at the analysis repo.
+/**
+ * Spawn a python process rooted at the analysis repo.
  * PYTHONPATH=<repo root> so absolute imports like `from bq_reports.utils...`
- * resolve when running a script by file path (mirrors `python -m bq_reports.x`). */
+ * resolve when running a script by file path (mirrors `python -m bq_reports.x`).
+ */
 export function spawnPython(args: string[]): Bun.Subprocess<'ignore', 'pipe', 'pipe'> {
   return Bun.spawn([PYTHON, ...args], {
     cwd: ANALYSIS_ROOT,

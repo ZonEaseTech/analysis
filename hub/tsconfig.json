@@ -1,19 +1,19 @@
 {
   "compilerOptions": {
-    "lib": ["ESNext"],
     "target": "ESNext",
+    "lib": ["ESNext"],
+    "moduleDetection": "force",
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "moduleDetection": "force",
+    "paths": { "@/*": ["./src/*"] },
     "types": ["bun-types"],
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "verbatimModuleSyntax": true,
-    "exactOptionalPropertyTypes": true,
-    "noEmit": true,
-    "skipLibCheck": true,
     "allowImportingTsExtensions": true,
-    "paths": { "@/*": ["./src/*"] }
+    "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true
   },
   "include": ["src"]
 }
