@@ -9,6 +9,11 @@ from semantic.metrics import (
     validate_registry,
 )
 from semantic.metrics.render_catalog import render_catalog
+from semantic.metrics.report_bindings import (
+    Binding,
+    scan_report_bindings,
+    validate_bindings,
+)
 
 
 class RegistryLoadTests(unittest.TestCase):
@@ -113,6 +118,23 @@ class RenderCatalogTests(unittest.TestCase):
         self.assertIn("# 口径地图", self.md)
         self.assertIn("## 排障速查", self.md)
         self.assertIn("自动生成", self.md)
+
+
+class ReportBindingTests(unittest.TestCase):
+    def test_all_report_bindings_resolve(self):
+        # The contract gate: every metric: <id> in resources/reports/*.yaml
+        # must point at a real registry metric. Fails loud if a report drifts.
+        validate_bindings()
+
+    def test_profit_margin_has_bindings(self):
+        bindings = scan_report_bindings()
+        pm = [b for b in bindings if b.report == "profit_margin.yaml"]
+        self.assertGreater(len(pm), 0, "expected profit_margin.yaml to bind metrics")
+
+    def test_dangling_binding_rejected(self):
+        bad = [Binding("r.yaml", "s", "col", 0, "ghost_metric")]
+        with self.assertRaises(ValueError):
+            validate_bindings(bad, known_ids={"gmv"})
 
 
 if __name__ == "__main__":

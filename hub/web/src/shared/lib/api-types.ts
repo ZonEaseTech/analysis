@@ -136,6 +136,26 @@ export interface MetricsResponse {
   domains: MetricDomain[];
 }
 
+export interface ReportBindingColumn {
+  column: string;
+  metricId: string;
+  metricName: string | null;
+  domain: string | null;
+  confidence: Metric["confidence"] | null;
+  formula: string | null;
+  sourceTables: string[];
+  found: boolean;
+}
+
+export interface ReportBinding {
+  report: string;
+  columns: ReportBindingColumn[];
+}
+
+export interface ReportBindingsResponse {
+  reports: ReportBinding[];
+}
+
 export interface AuditFile {
   file: string;
   kind: "csv" | "txt";

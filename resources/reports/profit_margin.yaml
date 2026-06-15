@@ -41,12 +41,12 @@ sheets:
          comment: "商品管理后台标价\nttpos_product_package.price，跟订单实际成交价无关"}
       - {name: "销量", field_index: 4, type: value, format: "0.00", merge: true, width: 10,
          comment: "总销量（堂食 + 外卖）\n堂食 = SUM(product_num)（含退款件、赠品、赠送）\n外卖 = SUM(quantity)（含 state=60 取消订单 — 跟 ttpos 后台口径一致）"}
-      - {name: "营业额", field_index: 5, type: value, format: "0.00", merge: true, width: 12,
+      - {name: "营业额", field_index: 5, type: value, format: "0.00", merge: true, width: 12, metric: gmv,
          comment: "营业额（标价口径）\n堂食 = SUM(product_sale_price × product_num)\n外卖 = SUM(IF state IN (10,20,30,40), price × qty, 0)\n→ 不含 state=60 取消订单，但含赠品/赠送/退款件"}
       - {name: "标准金额", field_index: 6, type: block_formula, format: "0.00", merge: true, width: 12,
          formula: "=D{row}*E{row}",
          comment: "标准金额 = 当前标价 × 销量\n当 ≠ 营业额 时说明商品改过价（实际录入价 ≠ 商品管理标价）"}
-      - {name: "实收金额", field_index: 7, type: value, format: "0.00", merge: true, width: 12,
+      - {name: "实收金额", field_index: 7, type: value, format: "0.00", merge: true, width: 12, metric: net_sales,
          comment: "真实收入（SQL 直算）\n堂食 = SUM(IF 赠品/赠送>0, 0, 成交价 × (销量−退款数))\n外卖 = SUM(IF state IN (10,20,30,40), price × qty, 0)\n口径对齐 ttpos CountProductSale.actual_sale_amount"}
       - {name: "赠品数量", field_index: 9, type: value, format: "0.00", merge: true, width: 10,
          comment: "赠品件数\nstatistics_product.free_num；金额计 0"}
@@ -56,11 +56,11 @@ sheets:
       # === C. 退款 / 取消 ===
       - {name: "退款数量", field_index: 11, type: value, format: "0.00", merge: true, width: 10,
          comment: "退款件数（仅堂食）\nstatistics_product.refund_num"}
-      - {name: "退款金额", field_index: 12, type: value, format: "0.00", merge: true, width: 12,
+      - {name: "退款金额", field_index: 12, type: value, format: "0.00", merge: true, width: 12, metric: refund_amount,
          comment: "退款标价金额（仅堂食）\nSUM(product_sale_price × refund_num)；按标价计，不按成交价"}
       - {name: "取消数量", field_index: 32, type: value, format: "0.00", merge: true, width: 10,
          comment: "外卖取消订单件数\nIF(takeout_order.state = 60, quantity, 0) 累加；ttpos 销量含取消件，单独列出方便审计"}
-      - {name: "取消金额", field_index: 33, type: value, format: "0.00", merge: true, width: 12,
+      - {name: "取消金额", field_index: 33, type: value, format: "0.00", merge: true, width: 12, metric: cancelled_amount,
          comment: "外卖取消订单标价金额\nSUM(IF state=60, price × quantity, 0)\n这部分客户下单后取消，没产生营业额，是潜在损失"}
 
       # === C2. 审计列（标价口径 vs 真实收的差异，调价/赠送/折扣会显形）===
@@ -100,21 +100,21 @@ sheets:
          comment: "配方单位（g / pc / 份 等）"}
 
       # === F. 利润指标（Excel 公式，merge 整个 block）===
-      - {name: "单份总成本", field_index: 26, type: block_formula, format: "0.0000", merge: true, width: 12,
+      - {name: "单份总成本", field_index: 26, type: block_formula, format: "0.0000", merge: true, width: 12, metric: cogs,
          formula: "=SUMPRODUCT(Z{block_start}:Z{block_end},AA{block_start}:AA{block_end})",
          comment: "单份总成本 = SUMPRODUCT(消耗数量, 物料单价)\n按本商品块内所有 BOM 行累加"}
       - {name: "单品毛利", field_index: 27, type: block_formula, format: "0.00", merge: true, width: 12,
          formula: "=H{row}/E{row}-AC{row}", negative_red: true,
          comment: "单品毛利 = 平均实收单价 − 单份总成本\n= 实收金额 / 销量 − 单份总成本\n负值会标红（成本 > 售价）"}
-      - {name: "总毛利", field_index: 28, type: block_formula, format: "0.00", merge: true, width: 12,
+      - {name: "总毛利", field_index: 28, type: block_formula, format: "0.00", merge: true, width: 12, metric: gross_profit,
          formula: "=AD{row}*E{row}", negative_red: true,
          comment: "总毛利 = 单品毛利 × 销量\n该商品本月毛利合计"}
-      - {name: "毛利率", field_index: 29, type: block_formula, format: "0.00%", merge: true, width: 10,
+      - {name: "毛利率", field_index: 29, type: block_formula, format: "0.00%", merge: true, width: 10, metric: gross_margin,
          formula: "=AD{row}/(H{row}/E{row})", negative_red: true,
          comment: "毛利率 = 单品毛利 / 平均实收单价\n相对真实成交价的毛利百分比"}
-      - {name: "BOM来源", field_index: 34, merge: true, width: 22,
+      - {name: "BOM来源", field_index: 34, merge: true, width: 22, metric: bom_source,
          comment: "BOM 数量/单位 选取来源 (priority 栈):\n  外挂层名 → 客户调整版命中\n  bq_native → BQ 原生 BOM\n  无 → 无 BOM 数据"}
-      - {name: "价来源", field_index: 35, merge: true, width: 24,
+      - {name: "价来源", field_index: 35, merge: true, width: 24, metric: price_source,
          comment: "物料单价 选取来源 (priority 栈, 跟 BOM 数量解耦):\n  外挂层名 → 客户单品 sheet 命中\n  uploaded_price_list → --price-list 上传清单\n  ERPNext → ERPNext Item Price\n  bq_native → BQ ttpos_material 缺省价\n  '无 (strict)' → strict 模式且外挂层未命中\n  跨 BOM 行多源时用 ' + ' 拼接"}
 
   单品:
@@ -131,12 +131,12 @@ sheets:
          comment: "商品管理后台标价 ttpos_product_package.price"}
       - {name: "销量", field_index: 4, type: value, format: "0.00", merge: true, width: 10,
          comment: "总销量（堂食 + 外卖，含取消订单 + 退款件 + 赠品/赠送，跟 ttpos 后台一致）"}
-      - {name: "营业额", field_index: 5, type: value, format: "0.00", merge: true, width: 12,
+      - {name: "营业额", field_index: 5, type: value, format: "0.00", merge: true, width: 12, metric: gmv,
          comment: "营业额（标价口径）\n堂食 = sale_price × num；外卖 = state IN (10,20,30,40) 才算\n不含 state=60 取消"}
       - {name: "标准金额", field_index: 6, type: block_formula, format: "0.00", merge: true, width: 12,
          formula: "=D{row}*E{row}",
          comment: "标准金额 = 当前标价 × 销量\n≠ 营业额 时说明商品改过价"}
-      - {name: "实收金额", field_index: 7, type: value, format: "0.00", merge: true, width: 12,
+      - {name: "实收金额", field_index: 7, type: value, format: "0.00", merge: true, width: 12, metric: net_sales,
          comment: "真实收入：堂食 IF(赠/送, 0, 成交价×(num−refund))；外卖 state IN (10,20,30,40) 才算\n口径对齐 ttpos CountProductSale.actual_sale_amount"}
       - {name: "赠品数量", field_index: 9, type: value, format: "0.00", merge: true, width: 10,
          comment: "赠品件数 free_num；金额计 0"}
@@ -145,11 +145,11 @@ sheets:
 
       - {name: "退款数量", field_index: 11, type: value, format: "0.00", merge: true, width: 10,
          comment: "退款件数（仅堂食 sp.refund_num）"}
-      - {name: "退款金额", field_index: 12, type: value, format: "0.00", merge: true, width: 12,
+      - {name: "退款金额", field_index: 12, type: value, format: "0.00", merge: true, width: 12, metric: refund_amount,
          comment: "退款标价金额 = SUM(sale_price × refund_num)，按标价计"}
       - {name: "取消数量", field_index: 32, type: value, format: "0.00", merge: true, width: 10,
          comment: "外卖取消订单件数 (state=60)；销量含此件数，单独列出方便审计"}
-      - {name: "取消金额", field_index: 33, type: value, format: "0.00", merge: true, width: 12,
+      - {name: "取消金额", field_index: 33, type: value, format: "0.00", merge: true, width: 12, metric: cancelled_amount,
          comment: "外卖取消订单标价金额 (state=60)；潜在收入损失（客户下单后取消）"}
 
       - {name: "标价应收", field_index: 30, type: block_formula, format: "0.00", merge: true, width: 12,
@@ -185,19 +185,19 @@ sheets:
       - {name: "单位", field_index: 24, width: 8,
          comment: "配方单位 (g / pc 等)"}
 
-      - {name: "单份总成本", field_index: 26, type: block_formula, format: "0.0000", merge: true, width: 12,
+      - {name: "单份总成本", field_index: 26, type: block_formula, format: "0.0000", merge: true, width: 12, metric: cogs,
          formula: "=SUMPRODUCT(Z{block_start}:Z{block_end},AA{block_start}:AA{block_end})",
          comment: "单份总成本 = SUMPRODUCT(消耗数量, 物料单价)"}
       - {name: "单品毛利", field_index: 27, type: block_formula, format: "0.00", merge: true, width: 12,
          formula: "=H{row}/E{row}-AC{row}", negative_red: true,
          comment: "单品毛利 = 实收/销量 − 单份总成本"}
-      - {name: "总毛利", field_index: 28, type: block_formula, format: "0.00", merge: true, width: 12,
+      - {name: "总毛利", field_index: 28, type: block_formula, format: "0.00", merge: true, width: 12, metric: gross_profit,
          formula: "=AD{row}*E{row}", negative_red: true,
          comment: "总毛利 = 单品毛利 × 销量"}
-      - {name: "毛利率", field_index: 29, type: block_formula, format: "0.00%", merge: true, width: 10,
+      - {name: "毛利率", field_index: 29, type: block_formula, format: "0.00%", merge: true, width: 10, metric: gross_margin,
          formula: "=AD{row}/(H{row}/E{row})", negative_red: true,
          comment: "毛利率 = 单品毛利 / 平均实收单价"}
-      - {name: "BOM来源", field_index: 34, merge: true, width: 22,
+      - {name: "BOM来源", field_index: 34, merge: true, width: 22, metric: bom_source,
          comment: "BOM 数量/单位 来源 (priority 栈):\n  外挂层名 → 客户调整版命中\n  bq_native → BQ 原生\n  无 → 无 BOM"}
-      - {name: "价来源", field_index: 35, merge: true, width: 24,
+      - {name: "价来源", field_index: 35, merge: true, width: 24, metric: price_source,
          comment: "物料单价 来源 (priority 栈):\n  外挂层名 → 客户单品 sheet\n  uploaded_price_list / ERPNext / bq_native / 无 (strict)\n  多源用 ' + ' 拼接"}

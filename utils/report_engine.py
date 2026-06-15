@@ -77,6 +77,7 @@ class ColumnConfig:
     zero_yellow: bool = False           # 0 值标黄（用于"应有值却缺失"列，如 strict 模式下物料单价=0）
     hidden: bool = False                # 列隐藏（客户报表收敛视图，audit 脚本仍可读）
     comment: str = ""                   # 表头悬停备注（字段语义 / 取数说明）
+    metric: str = ""                    # 绑定的 registry 指标 id（口径真源，纯元数据，不影响 Excel 输出）
 
 
 @dataclass
@@ -479,6 +480,7 @@ def load_sheet_config(yaml_path: str, sheet_name: str) -> SheetConfig:
             zero_yellow=c.get("zero_yellow", False),
             hidden=c.get("hidden", False),
             comment=c.get("comment", ""),
+            metric=c.get("metric", ""),
         ))
 
     return SheetConfig(

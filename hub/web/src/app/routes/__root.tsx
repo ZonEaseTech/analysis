@@ -8,6 +8,7 @@ import {
   Ruler,
   ShieldCheck,
   Terminal,
+  Workflow,
 } from "lucide-react";
 import * as React from "react";
 import type { HealthResponse } from "@/shared/lib/api-types";
@@ -18,6 +19,7 @@ const NAV = [
   { to: "/", label: "脚本中心", icon: Terminal },
   { to: "/reports", label: "报表中心", icon: FileSpreadsheet },
   { to: "/metrics", label: "口径中心", icon: Ruler },
+  { to: "/lineage", label: "报表血缘", icon: Workflow },
   { to: "/datadict", label: "数据字典", icon: BookOpen },
   { to: "/audit", label: "审计中心", icon: ShieldCheck },
 ] as const;
