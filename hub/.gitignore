@@ -1,0 +1,18 @@
+# dependencies
+node_modules
+
+# build output (bun build src/index.ts --outdir dist)
+dist
+
+# local env / secrets
+.env
+.env.local
+*.local
+
+# logs
+*.log
+
+# os
+.DS_Store
+
+# note: bun.lock IS committed (reproducible installs) — do not ignore it
