@@ -1,6 +1,13 @@
 # Plan: hub memory + delivery floor (方向1 — SQLite run history + CI gate)
 
-- Status: **approved (开始执行) — implementing** (2026-06-15)
+- Status: **completed** `afc73dd` (2026-06-15)
+  - Drizzle + bun:sqlite store (switched from libSQL — sync driver fits the
+    single-instance hub); runs persist, survive restart (verified live).
+  - GET /api/runs + /api/runs/:id; /runs 运行历史 page; RunsRepo bun:test (4).
+  - CI: .github/workflows/ci.yml (metrics catalog --check + binding contract +
+    registry tests; hub typecheck/lint/test; web build). eslint @antfu wired.
+  - Web build runs `tsr generate` first so it builds from a clean checkout.
+  - Remaining gate (flagged, deferred): frontend Vitest harness.
 - Owner: weifashi (with Claude)
 - Task: docs/task/index.md → hub-memory
 - Stack: /pma-bun (backend) + /pma-web (frontend)
