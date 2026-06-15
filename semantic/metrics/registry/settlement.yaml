@@ -1,0 +1,40 @@
+# 结算域 — settlement domain metrics (variable-cost layer, currently estimated).
+metrics:
+  - id: platform_commission
+    name: "platform_commission / 平台抽佣（估算）"
+    domain: settlement
+    status: estimated
+    confidence: ESTIMATED
+    unit: THB
+    definition: >-
+      Grab/LINE MAN/Shopee 抽佣金额。当前是估算值（按 28% 默认率），待 Phase 2 接平台对账单升真值。
+    formula:
+      business: "takeout_gmv × commission_rate"
+      sql_refs:
+        - "semantic/aggregations/pnl_layers.py::build_pnl — commission_rate_resolver.resolve('default')"
+    lineage:
+      upstream_metrics: [takeout_gmv]
+    reconciliation:
+      anchor: "PlatformPayoutCheck — Grab/LINE MAN/Shopee 月度对账单 vs BQ 算的外卖营收"
+      impl: "semantic/reconciliation/checks/platform_payout.py"
+      status: "框架已就绪，loader 等客户给样本后实施（Phase 2）"
+    notes: >-
+      配置 resources/wallace.*/resolvers.yaml::commission_rate（P3 fact_overrides 加载）；
+      不传 yaml 时走 --commission-default-rate CLI 参数（默认 0.28）。
+    related_docs: [profit-report-takeout-semantics.md]
+
+  - id: contribution_margin
+    name: "contribution_margin / 贡献毛利"
+    domain: settlement
+    status: estimated
+    confidence: ESTIMATED
+    unit: THB
+    definition: >-
+      扣完所有变动成本（COGS + 平台抽佣 + 配送费分担 + 支付通道费）后的毛利，回答渠道层面赚不赚钱。
+    formula:
+      business: "Gross Profit − Platform Commission − Delivery Fee Share − Payment Processing"
+      sql_refs:
+        - "semantic/aggregations/pnl_layers.py::build_pnl — contribution_margin 节点"
+    lineage:
+      upstream_metrics: [gross_profit, platform_commission]
+    current_value: "2026-04 华莱士外卖 CM% = -51%（每卖 1 块亏 5 毛）— pnl_statement Sheet 4"

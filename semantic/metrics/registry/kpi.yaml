@@ -1,0 +1,88 @@
+# KPI 比率 — ratio metrics derived from the sales / settlement metrics.
+metrics:
+  - id: gross_margin
+    name: "Gross Margin / 毛利率"
+    domain: kpi
+    status: live
+    confidence: ACTUAL
+    unit: "%"
+    definition: "销售毛利占净销售额的比例。"
+    formula:
+      business: "Gross Profit / Net Sales"
+      excel: "=总毛利 / 实收"
+      sql_refs:
+        - "semantic/aggregations/kpi_ratios.py::compute_kpis"
+    lineage:
+      upstream_metrics: [gross_profit, net_sales]
+    industry_benchmark: "餐饮 60-70%（NRA 标准；kpi_ratios.INDUSTRY_BENCHMARKS['gross_margin']）"
+    current_value: "2026-04 = 5.1% 🔴 critical"
+
+  - id: food_cost
+    name: "Food Cost % / 食材成本率"
+    domain: kpi
+    status: live
+    confidence: ACTUAL
+    unit: "%"
+    definition: "食材成本占净销售额的比例。"
+    formula:
+      business: "COGS / Net Sales"
+    lineage:
+      upstream_metrics: [cogs, net_sales]
+    industry_benchmark: "28-35%"
+    current_value: "2026-04 = 94.9% 🔴 critical（ERP 单价虚高 + 部分 BOM 误匹配，业务侧治理，非 SQL bug）"
+
+  - id: prime_cost
+    name: "Prime Cost % / 餐饮核心"
+    domain: kpi
+    status: planned
+    confidence: NA
+    unit: "%"
+    definition: "餐饮最关键运营指标。依赖 Phase 3 Labor 数据，当前 N/A。"
+    formula:
+      business: "(COGS + Labor) / Net Sales"
+    lineage:
+      upstream_metrics: [cogs, labor, net_sales]
+    industry_benchmark: "55-65%"
+
+  - id: aov
+    name: "AOV / 客单价"
+    domain: kpi
+    status: live
+    confidence: ESTIMATED
+    unit: THB
+    definition: "平均每单实收。"
+    formula:
+      business: "Net Sales / Order Count"
+    lineage:
+      upstream_metrics: [net_sales]
+    current_value: "~142.83 THB"
+    notes: >-
+      order_count 目前用按 (item, price, channel) 拆出来的行数，不是真订单数，故标 ESTIMATED。
+      下一步可能扩展 entity 加 order_count 字段。
+
+  - id: channel_mix
+    name: "Channel Mix / 渠道占比"
+    domain: kpi
+    status: live
+    confidence: ACTUAL
+    unit: "%"
+    definition: "堂食 / 外卖销售额占比。"
+    formula:
+      business: "dine_mix = dine_sales / (dine_sales + takeout_sales)；takeout_mix 同理"
+    lineage:
+      upstream_metrics: [dine_gmv, takeout_gmv]
+    current_value: "堂食 84.9% / 外卖 15.1%"
+
+  - id: effective_take_rate
+    name: "Effective Take Rate / 抽佣率"
+    domain: kpi
+    status: estimated
+    confidence: ESTIMATED
+    unit: "%"
+    definition: "平台抽佣占外卖销售额的比例。"
+    formula:
+      business: "Platform Commission / Takeout Sales"
+    lineage:
+      upstream_metrics: [platform_commission, takeout_gmv]
+    industry_benchmark: "20-30%"
+    current_value: "= commission_rate_resolver 解析值，目前 28%"
