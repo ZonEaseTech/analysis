@@ -1,5 +1,5 @@
 import type { DB } from '@/db'
-import type { NewRunRow, RunRow } from '@/db/schema'
+import type { NewRunRow, RunRow, RunValidation } from '@/db/schema'
 import { desc, eq, sql } from 'drizzle-orm'
 import { getDb } from '@/db'
 import { runs } from '@/db/schema'
@@ -12,7 +12,7 @@ export class RunsRepo {
     this.db.insert(runs).values(row).run()
   }
 
-  finish(id: string, patch: { finishedAt: string, exitCode: number | null, status: RunRow['status'], log: string }): void {
+  finish(id: string, patch: { finishedAt: string, exitCode: number | null, status: RunRow['status'], log: string, validation: RunValidation | null }): void {
     this.db.update(runs).set(patch).where(eq(runs.id, id)).run()
   }
 

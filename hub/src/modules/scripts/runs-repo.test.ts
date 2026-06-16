@@ -41,18 +41,32 @@ test('create then get returns the row', () => {
   expect(row?.exitCode).toBeNull()
 })
 
-test('finish updates exit code, status and log', () => {
+test('finish updates exit code, status, log and validation', () => {
   seed('run-1', 'alpha', '2026-06-15T01:00:00.000Z')
   repo.finish('run-1', {
     finishedAt: '2026-06-15T01:01:00.000Z',
     exitCode: 0,
     status: 'done',
     log: 'line1\nline2',
+    validation: { totalRows: 100, mustFix: 0, needsReview: 3 },
   })
   const row = repo.get('run-1')
   expect(row?.status).toBe('done')
   expect(row?.exitCode).toBe(0)
   expect(row?.log).toBe('line1\nline2')
+  expect(row?.validation).toEqual({ totalRows: 100, mustFix: 0, needsReview: 3 })
+})
+
+test('finish accepts null validation (script ran no validators)', () => {
+  seed('run-2', 'beta', '2026-06-15T02:00:00.000Z')
+  repo.finish('run-2', {
+    finishedAt: '2026-06-15T02:01:00.000Z',
+    exitCode: 0,
+    status: 'done',
+    log: 'no validators here',
+    validation: null,
+  })
+  expect(repo.get('run-2')?.validation).toBeNull()
 })
 
 test('list returns most recent first', () => {

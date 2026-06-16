@@ -12,7 +12,16 @@ export const runs = sqliteTable('runs', {
   exitCode: integer('exit_code'), // null while running
   status: text('status').notNull().$type<'running' | 'done' | 'error'>(),
   log: text('log'), // full captured log, flushed on completion
+  // 对账 summary captured from the run log's [[hub:validation]] markers, as
+  // JSON {totalRows, mustFix, needsReview}; null when the script ran no validators.
+  validation: text('validation', { mode: 'json' }).$type<RunValidation | null>(),
 })
+
+export interface RunValidation {
+  totalRows: number
+  mustFix: number
+  needsReview: number
+}
 
 export type RunRow = typeof runs.$inferSelect
 export type NewRunRow = typeof runs.$inferInsert

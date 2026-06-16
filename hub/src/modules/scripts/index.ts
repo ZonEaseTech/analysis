@@ -1,3 +1,4 @@
+import type { RunValidation } from '@/db/schema'
 import { readFileSync } from 'node:fs'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
@@ -5,6 +6,29 @@ import { fromAnalysis } from '@/root'
 import { spawnPython } from '@/shared/python'
 import { decodeId, scanScripts } from '@/shared/scripts-scan'
 import { RunsRepo } from './runs-repo'
+
+const VALIDATION_MARKER = '[[hub:validation]]'
+
+/**
+ * Aggregate the 对账 summary the report scripts emit via print_result()'s
+ * `[[hub:validation]] {json}` marker lines. null when no validators ran.
+ */
+export function parseValidation(logs: string[]): RunValidation | null {
+  const marks = logs.filter(l => l.startsWith(VALIDATION_MARKER))
+  if (marks.length === 0)
+    return null
+  const acc: RunValidation = { totalRows: 0, mustFix: 0, needsReview: 0 }
+  for (const line of marks) {
+    try {
+      const o = JSON.parse(line.slice(VALIDATION_MARKER.length).trim()) as Record<string, number>
+      acc.totalRows += Number(o.total_rows) || 0
+      acc.mustFix += Number(o.must_fix) || 0
+      acc.needsReview += Number(o.needs_review) || 0
+    }
+    catch { /* ignore malformed marker */ }
+  }
+  return acc
+}
 
 /**
  * Live, in-memory state for an active run — drives the SSE stream while the
@@ -121,6 +145,7 @@ export const scripts = new Hono()
           exitCode: state.exitCode,
           status: state.exitCode === 0 ? 'done' : 'error',
           log: state.logs.join('\n'),
+          validation: parseValidation(state.logs),
         })
       }
     })()

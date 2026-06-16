@@ -17,6 +17,7 @@ Design points worth knowing before changing:
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable
@@ -77,6 +78,16 @@ class Result:
     @property
     def has_must_fix(self) -> bool:
         return any(v.severity == Severity.MUST_FIX for v in self.violations)
+
+    def summary(self) -> dict:
+        """Machine-readable counts. The hub captures this from the run log to
+        show a ✅/🟡/🔴 对账 status per run (status = 🔴 if must_fix, 🟡 if
+        needs_review, ✅ otherwise)."""
+        return {
+            "total_rows": self.total_rows,
+            "must_fix": len(self.by_severity(Severity.MUST_FIX)),
+            "needs_review": len(self.by_severity(Severity.NEEDS_REVIEW)),
+        }
 
 
 def check(rows: list[dict], identities: list[Identity]) -> Result:
@@ -142,6 +153,10 @@ def print_result(
             if len(review) > top_n_review:
                 print(f"  ⏬ 还有 {len(review) - top_n_review} 条略")
             print()
+
+    # Machine-readable marker — lets the hub capture 对账 status from the run
+    # log without per-script changes. Harmless extra line for console users.
+    print(f"[[hub:validation]] {json.dumps(result.summary(), ensure_ascii=False)}")
 
 
 def _print_violations(viols: list[Violation], row_label: Callable[[dict], str]) -> None:

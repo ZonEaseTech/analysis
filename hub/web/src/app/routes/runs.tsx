@@ -1,4 +1,4 @@
-import type { RunStatus, RunSummary } from "@/shared/lib/api-types";
+import type { RunStatus, RunSummary, RunValidation } from "@/shared/lib/api-types";
 import { createFileRoute } from "@tanstack/react-router";
 import * as React from "react";
 import { useRunDetailQuery, useRunsQuery } from "@/features/runs/api";
@@ -14,6 +14,17 @@ function StatusBadge({ s, exitCode }: { s: RunStatus; exitCode: number | null })
   if (s === "done")
     return <Badge className="text-emerald-500 border-emerald-500/40">完成 (0)</Badge>;
   return <Badge className="text-red-500 border-red-500/40">退出 {exitCode ?? "?"}</Badge>;
+}
+
+// 对账状态：🔴 有离谱 / 🟡 需复核 / ✅ 全平 / — 该脚本没跑校验
+function ReconBadge({ v }: { v: RunValidation | null }): React.ReactElement {
+  if (!v)
+    return <span className="text-muted-foreground">—</span>;
+  if (v.mustFix > 0)
+    return <Badge className="text-red-500 border-red-500/40">🔴 {v.mustFix} 离谱</Badge>;
+  if (v.needsReview > 0)
+    return <Badge className="text-amber-500 border-amber-500/40">🟡 {v.needsReview} 复核</Badge>;
+  return <Badge className="text-emerald-500 border-emerald-500/40">✅ 对平</Badge>;
 }
 
 function fmt(ts: string | null): string {
@@ -59,6 +70,17 @@ function RunLogDrawer({
             <dd>
               <StatusBadge s={data.status} exitCode={data.exitCode} />
             </dd>
+            <dt className="text-muted-foreground">对账</dt>
+            <dd className="flex items-center gap-2">
+              <ReconBadge v={data.validation} />
+              {data.validation ? (
+                <span className="text-xs text-muted-foreground">
+                  校验 {data.validation.totalRows} 行
+                </span>
+              ) : (
+                <span className="text-xs text-muted-foreground">该脚本未跑校验</span>
+              )}
+            </dd>
           </dl>
           <pre className="max-h-[60vh] overflow-auto rounded-md border border-border bg-black/40 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap break-all">
             {data.log || "（无日志）"}
@@ -90,6 +112,7 @@ function RunsPage(): React.ReactElement {
               <TH>开始时间</TH>
               <TH>耗时</TH>
               <TH>状态</TH>
+              <TH>对账</TH>
             </TR>
           </THead>
           <TBody>
@@ -105,6 +128,9 @@ function RunsPage(): React.ReactElement {
                 <TD className="text-xs">{duration(r.startedAt, r.finishedAt)}</TD>
                 <TD>
                   <StatusBadge s={r.status} exitCode={r.exitCode} />
+                </TD>
+                <TD>
+                  <ReconBadge v={r.validation} />
                 </TD>
               </TR>
             ))}

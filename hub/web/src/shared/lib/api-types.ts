@@ -38,6 +38,12 @@ export interface RunResponse {
 
 export type RunStatus = "running" | "done" | "error";
 
+export interface RunValidation {
+  totalRows: number;
+  mustFix: number;
+  needsReview: number;
+}
+
 export interface RunSummary {
   id: string;
   scriptId: string;
@@ -48,6 +54,7 @@ export interface RunSummary {
   finishedAt: string | null;
   exitCode: number | null;
   status: RunStatus;
+  validation: RunValidation | null;
 }
 
 export interface RunDetail extends RunSummary {
