@@ -1,3 +1,4 @@
+import type { Metric } from "@/shared/lib/api-types";
 import { createFileRoute } from "@tanstack/react-router";
 import { Search } from "lucide-react";
 import * as React from "react";
@@ -8,7 +9,6 @@ import { Badge } from "@/shared/components/ui/badge";
 import { Card } from "@/shared/components/ui/card";
 import { Drawer } from "@/shared/components/ui/drawer";
 import { Input } from "@/shared/components/ui/input";
-import type { Metric } from "@/shared/lib/api-types";
 
 const CONFIDENCE_COLOR: Record<Metric["confidence"], string> = {
   ACTUAL: "text-emerald-500 border-emerald-500/40",
@@ -27,7 +27,8 @@ function Field({
   label: string;
   children: React.ReactNode;
 }): React.ReactElement | null {
-  if (children == null || children === "") return null;
+  if (children == null || children === "")
+    return null;
   return (
     <div>
       <div className="mb-1 text-xs font-medium text-muted-foreground">{label}</div>
@@ -91,7 +92,7 @@ function MetricDetail({
           {metric.lineage.sourceTables.length > 0 ? (
             <Field label="源表">
               <div className="flex flex-wrap gap-1.5">
-                {metric.lineage.sourceTables.map((t) => (
+                {metric.lineage.sourceTables.map(t => (
                   <Badge key={t} className="font-mono">
                     {t}
                   </Badge>
@@ -102,7 +103,7 @@ function MetricDetail({
           {metric.lineage.upstreamMetrics.length > 0 ? (
             <Field label="上游指标（点击跳转）">
               <div className="flex flex-wrap gap-1.5">
-                {metric.lineage.upstreamMetrics.map((id) => (
+                {metric.lineage.upstreamMetrics.map(id => (
                   <button
                     key={id}
                     type="button"
@@ -141,7 +142,7 @@ function MetricDetail({
           {metric.relatedDocs.length > 0 ? (
             <Field label="相关文档">
               <div className="flex flex-col gap-0.5">
-                {metric.relatedDocs.map((d) => (
+                {metric.relatedDocs.map(d => (
                   <span key={d} className="font-mono text-xs text-muted-foreground">
                     docs/{d}
                   </span>
@@ -188,17 +189,19 @@ function MetricsPage(): React.ReactElement {
 
   const byId = React.useMemo(() => {
     const m = new Map<string, Metric>();
-    for (const d of data?.domains ?? []) for (const x of d.metrics) m.set(x.id, x);
+    for (const d of data?.domains ?? []) {
+      for (const x of d.metrics) m.set(x.id, x);
+    }
     return m;
   }, [data]);
 
   const needle = q.trim().toLowerCase();
   const match = (m: Metric): boolean =>
-    !needle ||
-    m.id.toLowerCase().includes(needle) ||
-    m.name.toLowerCase().includes(needle) ||
-    m.definition.toLowerCase().includes(needle) ||
-    m.formula.business.toLowerCase().includes(needle);
+    !needle
+    || m.id.toLowerCase().includes(needle)
+    || m.name.toLowerCase().includes(needle)
+    || m.definition.toLowerCase().includes(needle)
+    || m.formula.business.toLowerCase().includes(needle);
 
   return (
     <Page
@@ -209,7 +212,7 @@ function MetricsPage(): React.ReactElement {
         <Search className="pointer-events-none absolute left-2.5 top-2.5 size-4 text-muted-foreground" />
         <Input
           value={q}
-          onChange={(e) => setQ(e.target.value)}
+          onChange={e => setQ(e.target.value)}
           placeholder="搜指标名 / 公式 / 含义…"
           className="pl-8"
         />
@@ -225,7 +228,8 @@ function MetricsPage(): React.ReactElement {
         <div className="space-y-6">
           {data.domains.map((d) => {
             const items = d.metrics.filter(match);
-            if (items.length === 0) return null;
+            if (items.length === 0)
+              return null;
             return (
               <div key={d.key}>
                 <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
@@ -235,7 +239,7 @@ function MetricsPage(): React.ReactElement {
                   </span>
                 </h2>
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                  {items.map((m) => (
+                  {items.map(m => (
                     <MetricCard
                       key={m.id}
                       metric={m}
@@ -252,7 +256,7 @@ function MetricsPage(): React.ReactElement {
       <MetricDetail
         metric={selectedId ? (byId.get(selectedId) ?? null) : null}
         byId={byId}
-        onJump={(id) => setSelectedId(id)}
+        onJump={id => setSelectedId(id)}
         onClose={() => setSelectedId(null)}
       />
     </Page>

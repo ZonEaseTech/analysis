@@ -6,3 +6,4 @@
 | metrics-registry | Metrics Registry — single source of truth for 口径/formulas, rendered by hub 口径中心 | done | weifashi+Claude | docs/plan/2026-06-15-metrics-registry.md |
 | sustainable-derivation | Sustainable report derivation — declarative report specs + contracts + blast-radius isolation | proposed | weifashi+Claude | docs/plan/2026-06-15-sustainable-report-derivation.md |
 | hub-memory | hub memory + delivery floor — SQLite run history (Drizzle) + CI gate | done | weifashi+Claude | docs/plan/2026-06-15-hub-memory-and-ci.md |
+| hub-web-compliance | hub/web pma-web compliance — Vitest 4 + @antfu eslint (UI-lib migration deferred) | done | weifashi+Claude | docs/plan/2026-06-16-hub-web-compliance.md |

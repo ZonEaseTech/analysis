@@ -1,8 +1,8 @@
-import { useQuery } from "@tanstack/react-query";
 import type {
   AuditFileContent,
   AuditRunsResponse,
 } from "@/shared/lib/api-types";
+import { useQuery } from "@tanstack/react-query";
 import { apiGet } from "@/shared/lib/http";
 
 export function useAuditRunsQuery() {

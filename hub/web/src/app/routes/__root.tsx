@@ -1,5 +1,6 @@
+import type { HealthResponse } from "@/shared/lib/api-types";
 import { useQuery } from "@tanstack/react-query";
-import { Link, Outlet, createRootRoute } from "@tanstack/react-router";
+import { createRootRoute, Link, Outlet } from "@tanstack/react-router";
 import {
   BookOpen,
   CircleCheck,
@@ -12,7 +13,6 @@ import {
   Workflow,
 } from "lucide-react";
 import * as React from "react";
-import type { HealthResponse } from "@/shared/lib/api-types";
 import { cn } from "@/shared/lib/cn";
 import { apiGet } from "@/shared/lib/http";
 
@@ -55,7 +55,7 @@ function RootLayout(): React.ReactElement {
           <div className="text-xs text-muted-foreground">Wallace Report Hub</div>
         </div>
         <nav className="flex-1 p-2 space-y-1">
-          {NAV.map((item) => (
+          {NAV.map(item => (
             <Link
               key={item.to}
               to={item.to}

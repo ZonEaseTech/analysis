@@ -6,7 +6,7 @@ import { Page } from "@/shared/components/page";
 import { EmptyView, ErrorView, LoadingView } from "@/shared/components/state-view";
 import { Badge } from "@/shared/components/ui/badge";
 import { Card } from "@/shared/components/ui/card";
-import { TBody, TD, TH, THead, TR, Table } from "@/shared/components/ui/table";
+import { Table, TBody, TD, TH, THead, TR } from "@/shared/components/ui/table";
 
 function FileContent({
   dir,
@@ -16,9 +16,12 @@ function FileContent({
   file: string;
 }): React.ReactElement {
   const { data, isLoading, isError, error } = useAuditFileQuery(dir, file);
-  if (isLoading) return <LoadingView />;
-  if (isError) return <ErrorView error={error} />;
-  if (!data) return <EmptyView />;
+  if (isLoading)
+    return <LoadingView />;
+  if (isError)
+    return <ErrorView error={error} />;
+  if (!data)
+    return <EmptyView />;
 
   if (data.kind === "txt") {
     return (
@@ -71,7 +74,7 @@ function AuditPage(): React.ReactElement {
       ) : (
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-[20rem_1fr]">
           <div className="max-h-[78vh] space-y-3 overflow-auto">
-            {data.runs.map((run) => (
+            {data.runs.map(run => (
               <Card key={run.dir} className="p-3">
                 <div className="mb-2 flex items-center gap-2 text-sm font-medium">
                   <Folder className="size-4 text-amber-500" />
@@ -79,8 +82,8 @@ function AuditPage(): React.ReactElement {
                 </div>
                 <div className="space-y-1">
                   {run.files.map((f) => {
-                    const active =
-                      sel?.dir === run.dir && sel?.file === f.file;
+                    const active
+                      = sel?.dir === run.dir && sel?.file === f.file;
                     return (
                       <button
                         key={f.file}

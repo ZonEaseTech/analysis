@@ -17,13 +17,14 @@ export function useRunStream(runId: string | null): RunStreamState {
   });
 
   React.useEffect(() => {
-    if (!runId) return;
+    if (!runId)
+      return;
     setState({ lines: [], running: true, exitCode: null, error: null });
 
     const es = new EventSource(apiUrl(`/runs/${runId}/stream`));
 
     es.onmessage = (ev) => {
-      setState((s) => ({ ...s, lines: [...s.lines, ev.data] }));
+      setState(s => ({ ...s, lines: [...s.lines, ev.data] }));
     };
 
     es.addEventListener("done", (ev) => {
@@ -31,15 +32,16 @@ export function useRunStream(runId: string | null): RunStreamState {
       try {
         exitCode = (JSON.parse((ev as MessageEvent).data) as { exitCode: number })
           .exitCode;
-      } catch {
+      }
+      catch {
         exitCode = null;
       }
-      setState((s) => ({ ...s, running: false, exitCode }));
+      setState(s => ({ ...s, running: false, exitCode }));
       es.close();
     });
 
     es.onerror = () => {
-      setState((s) =>
+      setState(s =>
         s.running
           ? { ...s, running: false, error: "日志流中断（后端可能未就绪）" }
           : s,

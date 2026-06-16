@@ -17,7 +17,8 @@ export function Drawer({
   children,
   width = "max-w-2xl",
 }: DrawerProps): React.ReactElement | null {
-  if (!open) return null;
+  if (!open)
+    return null;
   return (
     <div className="fixed inset-0 z-50 flex">
       <button

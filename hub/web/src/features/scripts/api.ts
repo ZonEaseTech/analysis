@@ -1,9 +1,9 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
 import type {
   RunResponse,
   ScriptDetail,
   ScriptsResponse,
 } from "@/shared/lib/api-types";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { apiGet, apiPost } from "@/shared/lib/http";
 
 export function useScriptsQuery() {

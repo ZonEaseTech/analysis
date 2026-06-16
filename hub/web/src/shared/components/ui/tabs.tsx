@@ -21,7 +21,7 @@ export function Tabs({
         className,
       )}
     >
-      {tabs.map((t) => (
+      {tabs.map(t => (
         <button
           key={t.key}
           type="button"

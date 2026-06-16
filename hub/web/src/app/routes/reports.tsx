@@ -8,8 +8,8 @@ import { Badge } from "@/shared/components/ui/badge";
 import { Button } from "@/shared/components/ui/button";
 import { Card } from "@/shared/components/ui/card";
 import { Drawer } from "@/shared/components/ui/drawer";
+import { Table, TBody, TD, TH, THead, TR } from "@/shared/components/ui/table";
 import { Tabs } from "@/shared/components/ui/tabs";
-import { TBody, TD, TH, THead, TR, Table } from "@/shared/components/ui/table";
 import { apiUrl } from "@/shared/lib/http";
 
 const PAGE_SIZE = 100;
@@ -138,11 +138,11 @@ function ReportsPage(): React.ReactElement {
         <EmptyView label="暂无报表" />
       ) : (
         <div className="space-y-6">
-          {data.groups.map((g) => (
+          {data.groups.map(g => (
             <div key={g.name}>
               <h2 className="mb-2 text-sm font-semibold">{g.name}</h2>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {g.files.map((f) => (
+                {g.files.map(f => (
                   <Card
                     key={f.file}
                     className="cursor-pointer p-3 transition-colors hover:bg-accent"

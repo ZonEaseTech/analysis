@@ -16,7 +16,8 @@ export async function apiGet<T>(
   const url = new URL(API_BASE + path, window.location.origin);
   if (params) {
     for (const [k, v] of Object.entries(params)) {
-      if (v !== undefined) url.searchParams.set(k, String(v));
+      if (v !== undefined)
+        url.searchParams.set(k, String(v));
     }
   }
   const res = await fetch(url.toString(), {
@@ -31,7 +32,7 @@ export async function apiGet<T>(
 export async function apiPost<T>(path: string, body?: unknown): Promise<T> {
   const res = await fetch(API_BASE + path, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) {
@@ -47,7 +48,8 @@ export function apiUrl(
   const url = new URL(API_BASE + path, window.location.origin);
   if (params) {
     for (const [k, v] of Object.entries(params)) {
-      if (v !== undefined) url.searchParams.set(k, String(v));
+      if (v !== undefined)
+        url.searchParams.set(k, String(v));
     }
   }
   return url.pathname + url.search;

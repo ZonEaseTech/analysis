@@ -193,6 +193,6 @@ export interface AuditRunsResponse {
   runs: AuditRun[];
 }
 
-export type AuditFileContent =
-  | { kind: "csv"; header: string[]; rows: string[][] }
-  | { kind: "txt"; text: string };
+export type AuditFileContent
+  = | { kind: "csv"; header: string[]; rows: string[][] }
+    | { kind: "txt"; text: string };

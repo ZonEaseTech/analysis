@@ -1,3 +1,4 @@
+import type { RunStatus, RunSummary } from "@/shared/lib/api-types";
 import { createFileRoute } from "@tanstack/react-router";
 import * as React from "react";
 import { useRunDetailQuery, useRunsQuery } from "@/features/runs/api";
@@ -5,8 +6,7 @@ import { Page } from "@/shared/components/page";
 import { EmptyView, ErrorView, LoadingView } from "@/shared/components/state-view";
 import { Badge } from "@/shared/components/ui/badge";
 import { Drawer } from "@/shared/components/ui/drawer";
-import { TBody, TD, TH, THead, TR, Table } from "@/shared/components/ui/table";
-import type { RunStatus, RunSummary } from "@/shared/lib/api-types";
+import { Table, TBody, TD, TH, THead, TR } from "@/shared/components/ui/table";
 
 function StatusBadge({ s, exitCode }: { s: RunStatus; exitCode: number | null }) {
   if (s === "running")
@@ -21,9 +21,11 @@ function fmt(ts: string | null): string {
 }
 
 function duration(start: string, end: string | null): string {
-  if (!end) return "—";
+  if (!end)
+    return "—";
   const ms = Date.parse(end) - Date.parse(start);
-  if (Number.isNaN(ms)) return "—";
+  if (Number.isNaN(ms))
+    return "—";
   const s = Math.round(ms / 1000);
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`;
 }

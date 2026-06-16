@@ -1,3 +1,4 @@
+import type { DataDictTable } from "@/shared/lib/api-types";
 import { createFileRoute } from "@tanstack/react-router";
 import { Search, Table2 } from "lucide-react";
 import * as React from "react";
@@ -6,21 +7,21 @@ import { Page } from "@/shared/components/page";
 import { EmptyView, ErrorView, LoadingView } from "@/shared/components/state-view";
 import { Card } from "@/shared/components/ui/card";
 import { Input } from "@/shared/components/ui/input";
+import { Table, TBody, TD, TH, THead, TR } from "@/shared/components/ui/table";
 import { Tabs } from "@/shared/components/ui/tabs";
-import { TBody, TD, TH, THead, TR, Table } from "@/shared/components/ui/table";
-import type { DataDictTable } from "@/shared/lib/api-types";
 
 function relationLinks(tables: DataDictTable[]): {
   from: string;
   field: string;
   to: string;
 }[] {
-  const names = new Set(tables.map((t) => t.table));
+  const names = new Set(tables.map(t => t.table));
   const links: { from: string; field: string; to: string }[] = [];
   for (const t of tables) {
     for (const f of t.fields) {
       const m = /^(.*)_(?:id|num|code)$/.exec(f.name);
-      if (!m) continue;
+      if (!m)
+        continue;
       const stem = m[1];
       for (const cand of [
         stem,
@@ -43,23 +44,26 @@ function TablesView(): React.ReactElement {
   const [q, setQ] = React.useState("");
   const [selected, setSelected] = React.useState<string | null>(null);
 
-  if (isLoading) return <LoadingView />;
-  if (isError) return <ErrorView error={error} />;
-  if (!data || data.tables.length === 0) return <EmptyView label="暂无表" />;
+  if (isLoading)
+    return <LoadingView />;
+  if (isError)
+    return <ErrorView error={error} />;
+  if (!data || data.tables.length === 0)
+    return <EmptyView label="暂无表" />;
 
   const ql = q.trim().toLowerCase();
   const filtered = ql
     ? data.tables.filter(
-        (t) =>
-          t.table.toLowerCase().includes(ql) ||
-          t.description.toLowerCase().includes(ql),
+        t =>
+          t.table.toLowerCase().includes(ql)
+          || t.description.toLowerCase().includes(ql),
       )
     : data.tables;
-  const current =
-    data.tables.find((t) => t.table === selected) ?? filtered[0] ?? null;
+  const current
+    = data.tables.find(t => t.table === selected) ?? filtered[0] ?? null;
   const links = relationLinks(data.tables);
   const relatedLinks = current
-    ? links.filter((l) => l.from === current.table || l.to === current.table)
+    ? links.filter(l => l.from === current.table || l.to === current.table)
     : [];
 
   return (
@@ -71,11 +75,11 @@ function TablesView(): React.ReactElement {
             className="pl-8"
             placeholder="搜索表名 / 描述"
             value={q}
-            onChange={(e) => setQ(e.target.value)}
+            onChange={e => setQ(e.target.value)}
           />
         </div>
         <div className="max-h-[70vh] space-y-1 overflow-auto">
-          {filtered.map((t) => (
+          {filtered.map(t => (
             <button
               key={t.table}
               type="button"
@@ -115,7 +119,7 @@ function TablesView(): React.ReactElement {
                   </TR>
                 </THead>
                 <TBody>
-                  {current.fields.map((f) => (
+                  {current.fields.map(f => (
                     <TR key={f.name}>
                       <TD className="font-mono text-xs">{f.name}</TD>
                       <TD className="text-xs text-muted-foreground">{f.type}</TD>
@@ -150,9 +154,12 @@ function TablesView(): React.ReactElement {
 
 function MetricsView(): React.ReactElement {
   const { data, isLoading, isError, error } = useMetricsQuery();
-  if (isLoading) return <LoadingView />;
-  if (isError) return <ErrorView error={error} />;
-  if (!data || data.metrics.length === 0) return <EmptyView label="暂无指标" />;
+  if (isLoading)
+    return <LoadingView />;
+  if (isError)
+    return <ErrorView error={error} />;
+  if (!data || data.metrics.length === 0)
+    return <EmptyView label="暂无指标" />;
   return (
     <Card>
       <Table>
@@ -164,7 +171,7 @@ function MetricsView(): React.ReactElement {
           </TR>
         </THead>
         <TBody>
-          {data.metrics.map((m) => (
+          {data.metrics.map(m => (
             <TR key={m.name}>
               <TD className="font-medium">{m.name}</TD>
               <TD>{m.definition}</TD>

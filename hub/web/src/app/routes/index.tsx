@@ -1,3 +1,4 @@
+import type { ScriptGroup } from "@/shared/lib/api-types";
 import { createFileRoute } from "@tanstack/react-router";
 import { Info, Play } from "lucide-react";
 import * as React from "react";
@@ -12,8 +13,7 @@ import { EmptyView, ErrorView, LoadingView } from "@/shared/components/state-vie
 import { Badge } from "@/shared/components/ui/badge";
 import { Button } from "@/shared/components/ui/button";
 import { Drawer } from "@/shared/components/ui/drawer";
-import { TBody, TD, TH, THead, TR, Table } from "@/shared/components/ui/table";
-import type { ScriptGroup } from "@/shared/lib/api-types";
+import { Table, TBody, TD, TH, THead, TR } from "@/shared/components/ui/table";
 
 const GROUP_COLOR: Record<ScriptGroup, string> = {
   bq_reports: "text-sky-500 border-sky-500/40",
@@ -118,7 +118,7 @@ function ScriptsPage(): React.ReactElement {
 
   function handleRun(id: string, name: string): void {
     runMutation.mutate(id, {
-      onSuccess: (res) => setRun({ runId: res.runId, name }),
+      onSuccess: res => setRun({ runId: res.runId, name }),
     });
   }
 
@@ -144,7 +144,7 @@ function ScriptsPage(): React.ReactElement {
             </TR>
           </THead>
           <TBody>
-            {data.scripts.map((s) => (
+            {data.scripts.map(s => (
               <TR key={s.id}>
                 <TD className="font-medium">{s.name}</TD>
                 <TD className="font-mono text-xs text-muted-foreground">

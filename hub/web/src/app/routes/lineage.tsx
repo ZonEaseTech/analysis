@@ -1,3 +1,4 @@
+import type { ReportBindingColumn } from "@/shared/lib/api-types";
 import { createFileRoute } from "@tanstack/react-router";
 import { FileSpreadsheet } from "lucide-react";
 import * as React from "react";
@@ -5,8 +6,7 @@ import { useReportBindingsQuery } from "@/features/metrics/api";
 import { Page } from "@/shared/components/page";
 import { EmptyView, ErrorView, LoadingView } from "@/shared/components/state-view";
 import { Badge } from "@/shared/components/ui/badge";
-import { TBody, TD, TH, THead, TR, Table } from "@/shared/components/ui/table";
-import type { ReportBindingColumn } from "@/shared/lib/api-types";
+import { Table, TBody, TD, TH, THead, TR } from "@/shared/components/ui/table";
 
 const CONFIDENCE_COLOR: Record<string, string> = {
   ACTUAL: "text-emerald-500 border-emerald-500/40",
@@ -15,7 +15,8 @@ const CONFIDENCE_COLOR: Record<string, string> = {
 };
 
 function ConfidenceCell({ c }: { c: ReportBindingColumn }): React.ReactElement {
-  if (!c.confidence) return <span className="text-muted-foreground">—</span>;
+  if (!c.confidence)
+    return <span className="text-muted-foreground">—</span>;
   return (
     <Badge className={CONFIDENCE_COLOR[c.confidence] ?? ""}>{c.confidence}</Badge>
   );
@@ -37,7 +38,7 @@ function LineagePage(): React.ReactElement {
         <EmptyView label="暂无绑定（在 resources/reports/*.yaml 列上加 metric: <id> 即可出现）" />
       ) : (
         <div className="space-y-6">
-          {data.reports.map((r) => (
+          {data.reports.map(r => (
             <div key={r.report}>
               <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold">
                 <FileSpreadsheet className="size-4 text-emerald-500" />
@@ -58,7 +59,7 @@ function LineagePage(): React.ReactElement {
                   </TR>
                 </THead>
                 <TBody>
-                  {r.columns.map((c) => (
+                  {r.columns.map(c => (
                     <TR key={c.column}>
                       <TD className="font-medium">{c.column}</TD>
                       <TD>
@@ -77,7 +78,7 @@ function LineagePage(): React.ReactElement {
                       <TD className="text-xs">
                         {c.sourceTables.length > 0 ? (
                           <div className="flex flex-wrap gap-1">
-                            {c.sourceTables.map((t) => (
+                            {c.sourceTables.map(t => (
                               <Badge key={t} className="font-mono">
                                 {t}
                               </Badge>
