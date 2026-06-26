@@ -1,0 +1,105 @@
+# BOM Pipeline — Wallace 商品成本毛利分析
+
+> 生产口径走同事脚本（payment 锚定实收）。v26→v40 多轮迭代后于 2026-06-26 收编为
+> `bom_pipeline/` 包。本文档是该流程的完整说明。代码 README 见 `bom_pipeline/README.md`。
+
+## 1. 背景与定位
+
+华莱士（泰国）商品成本毛利分析。多轮迭代散落了几十个 xlsx/csv/脚本，2026-06-26
+整理收编：可复用纯 Python 进 `bom_pipeline/`，数据按 `resources/wallace.<YYYYMMDD>/` 归档，
+交付物落 `exports/`。
+
+参见决策稿：`docs/superpowers/specs/2026-06-26-bom-pipeline-refactor-design.md`。
+
+## 2. 目录结构
+
+```
+bom_pipeline/
+├── wallace_bom_margin.py    # 成本毛利生成器
+├── bom_rules.py             # 渠道过滤 / 物料删除规则
+├── erpnext_price.py         # 物料采购成本复刻（calculateFinalItemUnitCost）
+├── 名称映射_中英泰.json      # --lang en/th 时的名称映射
+└── README.md
+
+resources/wallace.20260626/
+├── clean_bom.csv            # BOM 单源（商品×物料×消耗×单价×渠道）
+├── sales_fixed.xlsx         # 修正销量表（多 sheet：堂食实收/外卖促销/套餐/单品）
+├── recon.json               # 门店实收明细（实收对齐锚）
+└── _archive/                # 历史版本
+
+exports/Wallace商品成本毛利分析_2026-05_v40.xlsx   # 交付物
+```
+
+> 注：`sales_fixed` 是**多 sheet 工作簿**（`load_sales` 逐 sheet 读），不能转单 csv，保留 xlsx。
+> 只有单表文件（BOM）用 csv。
+
+## 3. 数据流与口径
+
+### 3.1 总流程
+
+```
+clean_bom.csv → load_clean_bom() → 套 bom_rules 删除规则 → price + 渠道感知 BOM
+sales_fixed.xlsx → load_sales() → 净销量 + 堂食/外卖实收率
+recon.json → 实收对齐
+        ↓
+   build() → 堂食-单品 / 堂食-套餐 / 外卖-单品 / 外卖-套餐 四 sheet → exports/*.xlsx
+```
+
+### 3.2 成本口径
+
+- 单份总成本 = Σ(消耗数量 × 物料单价)
+- 物料单价 = `clean_bom.csv` 的「物料单价」列 = ERPNext 采购终价（见 §4）
+- 套餐：clean_bom 已展开的套餐配方；缺则「明细组分 × 单品 BOM」拼，再缺模板补
+
+### 3.3 实收对齐（recon）
+
+把每店每渠道的实收率分子换成门店汇总口径实收（堂食 payment−退款−挂账 / 外卖 platform_total），
+分母用毛利表该店该渠道实际原价和，使 Σ(原价×rate) = 门店汇总实收，4 sheet 合计与 ttpos shop 报表一致。
+
+## 4. 价格口径 — erpnext_price.py（复刻 ttpos 后端）
+
+复刻 `ttpos-server-go/ttpos-bmp/app/ttpos-erp/internal/logic/stock/item.go` 的
+`calculateFinalItemUnitCost`，确保与后端 `GetItemUnitCost` 同口径。
+
+```
+净价 netCost = baseCost 依次套 ERPNext buying Pricing Rules
+              （Percentage → ×(1+rate/100)；Amount → +amount）
+终价         = netCost==0 或 taxRate==0 ? netCost : netCost × (1+taxRate/100)
+税率         = 物料 Item Tax 缺失时兜底泰国 VAT 7%（defaultItemUnitCostTaxRate）
+```
+
+- `baseCost` = ERPNext Item Price（Buying 价表）`price_list_rate`，按匹配 UOM 取
+- 默认 buying 规则 = Percentage 5%（`DEFAULT_BUYING_RULE`，由后端 Pricing Rule 决定）
+- **验收**：对 `bom_with_erp_price_v4.xlsx` 每行用 (基价原始, 税率) 复算终价，与 `ERPNext新单价` 列
+  逐行一致（4465/4465）。单测 `tests/test_erpnext_price.py`。
+
+### 4.1 实时拉取（UOM + Item Price）
+
+`erpnext_price.py` 只做「基价 → 终价」纯算法（可离线复跑、可单测）。实时拉 Item Price +
+UOM 换算复用 `bq_reports/utils/erpnext_api.py` / `semantic/cogs/material_price.py`。
+`bom_with_erp_price_v4.xlsx` 即上游拉取 + 本算法的产物。
+
+## 5. 删除规则 — bom_rules.py
+
+| 规则 | 语义 |
+|------|------|
+| `DINEIN_DEL` | 外卖才用的包材/酱料，堂食侧删除（通用行降级为仅外卖，堂食专属行丢弃） |
+| `TAKEOUT_SINGLE_DEL` | 堂食才用的物料，外卖单品侧删除 |
+| `PRODUCT_DEL` | 按商品名精确删指定物料 |
+
+口径只在 `bom_rules.py` 改，不要把"特殊容忍"散落进报表脚本。
+
+## 6. 运行与验证
+
+运行命令见 `bom_pipeline/README.md §运行`。
+
+- **复跑一致性闸门**：重构只移位置/抽规则，未改数 —— 输出须与上一版 v40 逐格 0 差异。
+- **价格复刻闸门**：`venv/bin/python -m unittest tests.test_erpnext_price -v`（含 v4 基准）。
+
+## 7. 已知遗留
+
+- `wallace_bom_margin.py` 内 `resolve_recon_path` 引用未定义的 `BASE`（自动查找 recon 时报错）；
+  当前都显式传 `--recon` 规避。后续应改为相对 sales 路径或脚本目录。
+- `drop_wrong_sauce` / `drop_dinein_packaging` / `drop_takeout_single` / `drop_product_bom`
+  是 clean_bom 时代前的死代码（从不调用），规则已迁入 `bom_rules.py` + `load_clean_bom`；待清理。
+- 根目录散落的历史 xlsx 尚未清理（需逐个确认，多为同事/客户原件）。
