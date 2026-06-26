@@ -42,7 +42,7 @@ from semantic.comparison import compute_mom_changes, compute_yoy_changes
 from semantic.dimensions.time import month_to_ts_range, assert_month_not_frozen
 from semantic.entities import sale_event
 from semantic.resolvers import Resolver, load_resolvers_from_yaml
-from utils.report_engine import ReportEngine
+from bq_reports.shared.report_engine import ReportEngine
 
 
 # ───────────────────────────────────────────────────────────────

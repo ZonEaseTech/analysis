@@ -30,6 +30,7 @@ class CogsPublicApi(unittest.TestCase):
             resolve_unit_price,
         ):
             self.assertTrue(callable(fn))
+        # BOM_UNIT_CORRECTIONS 过渡期 legacy 修正仍在用 (待 desired-UOM 接进生产后退役)
         self.assertIn("MK01018", BOM_UNIT_CORRECTIONS)
 
 
@@ -101,14 +102,80 @@ class MaterialPrice(unittest.TestCase):
         self.assertEqual(src, "无 (strict)")
 
     def test_erp_unit_correction_applied(self):
-        # MK01018 在 BOM_UNIT_CORRECTIONS = {"MK01018": 50} → ERP 价 / 50
+        # 过渡期 legacy 修正: MK01018 在 BOM_UNIT_CORRECTIONS = {"MK01018": 50}。
+        # 不传 desired_uoms → 仅走 legacy 修正 → ERP 价 / 50。
         price, src = resolve_unit_price(
             "MK01018", 0,
             uploaded_prices={},
             erp_prices={"MK01018": (250.0, "kg")},
         )
-        self.assertEqual(price, 5.0)
+        self.assertEqual(price, 5.0)   # 250 / 50
         self.assertEqual(src, "ERPNext")
+
+    def test_erp_layer_rejects_uom_mismatch(self):
+        # ERP 行单位 'ctn', desired 'g' → ERP provider 返回 None (本层不匹配,
+        # 不是硬缺口; Resolver 会续走低优先级 / bq_native 兜底)
+        erp = {"X": (300.0, "ctn")}
+        r = build_material_price_resolver({}, erp, [], desired_uoms={"X": "g"})
+        self.assertIsNone(r.resolve(("X", None)))  # ERP 层不命中, 交回 Resolver 续走
+
+    def test_erp_layer_accepts_uom_match(self):
+        # ERP 行单位 'g' == desired 'g' → 命中
+        erp = {"X": (0.3, "g")}
+        r = build_material_price_resolver({}, erp, [], desired_uoms={"X": "g"})
+        res = r.resolve(("X", None))
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res.value, 0.3)
+
+    def test_erp_uom_mismatch_falls_back_to_bq_native_end_to_end(self):
+        # M-3: 端到端钉死 "UOM 不匹配 → bq_native 兜底" 的真实行为。
+        # ERP 有 X 但 UOM 'ctn' ≠ desired 'g' → ERP 层返回 None → 全栈未命中 →
+        # resolve_unit_price 末尾落 bq_native(返回 bq_price)。证明 UOM 不匹配
+        # 不是硬缺口/告警, 而是被 bq 静默吸收(佐证 _fetch_erp 注释)。
+        price, src = resolve_unit_price(
+            "X", bq_price=2.0,
+            uploaded_prices={}, erp_prices={"X": (0.3, "ctn")},
+            desired_uoms={"X": "g"},
+        )
+        self.assertEqual(price, 2.0)
+        self.assertEqual(src, "bq_native")
+
+    def test_erp_uom_none_falls_back_to_bq_native(self):
+        # M-3 补: ERP 行 UOM 为空 (None) 而 desired='g' → 视为不匹配 → bq 兜底。
+        price, src = resolve_unit_price(
+            "X", bq_price=2.0,
+            uploaded_prices={}, erp_prices={"X": (1.0, None)},
+            desired_uoms={"X": "g"},
+        )
+        self.assertEqual(price, 2.0)
+        self.assertEqual(src, "bq_native")
+
+    def test_erp_uom_check_key_case_insensitive(self):
+        # M-2: desired_uoms 的 key 大小写与 erp_prices 命中 key 不同时,
+        # UOM 校验仍须生效 (三 key fallback), 不能被静默跳过。
+        # erp 命中键小写 'mk', desired key 大写 'MK' → 校验应触发 → 不匹配 → None。
+        erp = {"mk": (250.0, "pack")}
+        r = build_material_price_resolver(
+            {}, erp, [], desired_uoms={"MK": "g"})
+        self.assertIsNone(r.resolve(("mk", None)))  # 校验生效, 大小写不一致仍命中规则
+
+    def test_erp_uom_match_still_applies_legacy_correction(self):
+        # 共存: MK01018 传 desired_uoms 且 UOM 匹配 (ERP 也是 'pack') → UOM 校验
+        # 通过后仍走 legacy ÷50, 证明新机制与过渡期修正共存不打架。
+        erp = {"MK01018": (250.0, "pack")}
+        r = build_material_price_resolver(
+            {}, erp, [], desired_uoms={"MK01018": "pack"})
+        res = r.resolve(("MK01018", None))
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res.value, 5.0)  # 250 / 50, UOM 匹配后仍修正
+
+    def test_erp_uom_mismatch_short_circuits_before_correction(self):
+        # 共存边界: MK01018 desired='g' 而 ERP 是 'pack' → UOM 不匹配先返回 None,
+        # legacy ÷50 不应执行 (返回 None, 不是 5.0)。
+        erp = {"MK01018": (250.0, "pack")}
+        r = build_material_price_resolver(
+            {}, erp, [], desired_uoms={"MK01018": "g"})
+        self.assertIsNone(r.resolve(("MK01018", None)))
 
 
 class ExpandItemBom(unittest.TestCase):

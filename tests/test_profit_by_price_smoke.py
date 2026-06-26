@@ -29,7 +29,7 @@ from bq_reports.profit_by_price_report import (
     _rollup_per_sku,
 )
 from semantic.aggregations.by_grain import aggregate_by_grain
-from utils.report_engine import load_sheet_config, write_configured_sheet
+from bq_reports.shared.report_engine import load_sheet_config, write_configured_sheet
 
 
 YAML_PATH = REPO_ROOT / "resources/reports/profit_by_price.yaml"

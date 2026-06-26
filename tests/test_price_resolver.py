@@ -57,6 +57,9 @@ class UnitCorrectionTests(unittest.TestCase):
 
     Rationale (locked here): uploaded sheet is already in the recipe unit (we
     divided by 销售换算系数 at load time), but ERP price is per inventory unit.
+
+    过渡期 hack (Task 3.1): 此修正在 UOM 校验通过后才应用, 待 desired-UOM 校验
+    接进生产路径 (Phase 5 / Task #6) 后退役 (见 Task 4.1 anchor)。
     """
 
     def test_correction_applied_only_to_erp(self):

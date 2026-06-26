@@ -65,11 +65,22 @@ def _ensure(pkg, pip_name=None):
             return __import__(pkg)
 
 
-pymysql = _ensure("pymysql")
-openpyxl = _ensure("openpyxl")
-from openpyxl import Workbook  # noqa: E402
-from openpyxl.styles import Font, Alignment, PatternFill, Border, Side  # noqa: E402
-from openpyxl.utils import get_column_letter  # noqa: E402
+# Lazy imports — MySQL 依赖不在 venv 里, 只在作为脚本直接运行时才加载。
+# 其它模块 import 本文件不会触发 pymysql/openpyxl 导入。
+_pymysql = None
+_openpyxl = None
+
+def _get_pymysql():
+    global _pymysql
+    if _pymysql is None:
+        _pymysql = _ensure("pymysql")
+    return _pymysql
+
+def _get_openpyxl():
+    global _openpyxl
+    if _openpyxl is None:
+        _openpyxl = _ensure("openpyxl")
+    return _openpyxl
 
 
 def load_env(path):
@@ -215,6 +226,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     out_path = args.output or os.path.join(out_dir, f"营业数据汇总-{biz_date}.xlsx")
 
+    pymysql = _get_pymysql()
     conn = pymysql.connect(
         host=env["DB_HOST"], port=int(env.get("DB_PORT", 3306)),
         user=env["DB_USER"], password=env.get("DB_PASS", ""),
@@ -283,6 +295,10 @@ def main():
 
 
 def write_excel(rows, biz_date, out_path):
+    openpyxl = _get_openpyxl()
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
     wb = Workbook()
     ws = wb.active
     ws.title = "Sheet1"

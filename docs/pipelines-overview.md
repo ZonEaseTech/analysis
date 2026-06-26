@@ -1,188 +1,247 @@
-# 两套管线全景图 — semantic 平台层 vs 同事脚本生产线
+# 数据架构全景 — 华莱士分析工作区
 
-> 华莱士成本毛利/报表工作区里**并存两套管线**，目标重叠（都算成本毛利）但定位、数据源、
-> 运行方式完全不同。这份文档理清它们各是什么、谁负责什么、关系如何，避免把两者混为一谈。
+> 从数据源到导出，六层架构逐层展开。**每个口径都有 ttpos 源码溯源**。
 
-## 0. 全景
+## 0. 六层全貌
 
 ```mermaid
 flowchart TB
-    subgraph SRC["数据源"]
-        BQ[("BQ ttpos_* 事实表")]
-        ERP[("ERPNext<br/>Item Price")]
-        EXT["外挂人工源<br/>最终BOM/上传清单/同事BOM"]
-        CB["clean_bom.csv 单源<br/>(离线攒, 价格已烤入)"]
-        SALES["sales_fixed.xlsx<br/>+ recon.json"]
+    subgraph SRC["Layer 1 · 数据源"]
+        BQ["BigQuery ttpos_* (Datastream→live)"]
+        ERP["ERPNext Item Price (Buying-Internal)·PRLE-0003·Item Tax"]
+        EXT["External 客户BOM·物料价·sales_fixed·recon.json"]
     end
-
-    subgraph P1["① semantic / bq_reports 管线 — 平台底座 (live, 可审计)"]
-        SEM["semantic/entities + cogs + resolvers<br/>多层 priority 解析(两条路)"]
-        VAL["validators + reconciliation<br/>会计恒等式 / 对账"]
-        OUT1["bq_reports/*.py → exports/*.xlsx<br/>(profit_margin / profit_by_price / pnl …)"]
-        SEM --> VAL --> OUT1
+    subgraph SEM["Layer 2 · 语义层 semantic/ — 口径真源"]
+        ENT["entities/ CTE: sale_event·sale_line·takeout·total·order·bom·recursive_bom"]
+        COGS["cogs/: material_price 4-layer priority ①外挂100+ ②uploaded80 ③ERPNext50 ④BQ兜底"]
+        AGG["aggregations/: by_grain·pnl_layers·kpi_ratios"]
     end
-
-    subgraph P2["② 同事脚本 bom_pipeline — 当前生产 (离线单源)"]
-        WBM["wallace_bom_margin.py<br/>+ bom_rules / erpnext_price"]
-        OUT2["四 sheet 成本毛利 → exports/*.xlsx<br/>(payment 锚定实收)"]
-        WBM --> OUT2
+    subgraph PIPE["Layer 3 · 双管线"]
+        P1["① bq_reports/ (平台live) profit_margin·pnl·19报表 ✅闸门"]
+        P2["② bom_pipeline/ (生产offline) clean_bom.csv单源 ⚠无闸门"]
     end
+    subgraph REC["Layer 4 · 对账&恒等式"]
+        ID["identities: SALES_QTY·AMOUNT(零容差)·GROSS_AMOUNT·BOM/PRICE_COVERAGE·3band"]
+        CHK["checks: ttpos_anchor(NetSales 0.0002%)·ttpos_cost_anchor(NEW)·platform_payout"]
+        GATE["gate: validate_and_gate → 🟢export / 🔴exit(2) / 🔴+--force→水印"]
+    end
+    subgraph REG["Layer 5 · 指标注册表 metrics/"]
+        MR["registry/*.yaml: 30指标, 每条带business含义·formula·SQL refs·lineage·ttpos_source"]
+        RC["render_catalog.py → metrics-catalog.md (CI --check防漂)"]
+    end
+    OUT["Layer 6 · exports/*.xlsx → 客户/老板"]
 
-    BQ -->|live 查询| SEM
-    ERP -->|priority 50| SEM
-    EXT -->|priority 高| SEM
-
-    ERP -. 离线复刻 calculateFinalItemUnitCost .-> CB
-    EXT -. 离线人工纠正 .-> CB
-    CB --> WBM
-    SALES --> WBM
-
-    OUT1 -. 价格口径同源 .- OUT2
+    BQ-->ENT; ERP-->COGS; EXT-->COGS
+    ENT-->COGS-->AGG-->P1; EXT-.->|离线攒|P2
+    P1-->ID-->CHK-->GATE-->OUT; P2-->OUT
+    REG-->RC
 ```
 
-## 1. 一句话区分
+## 1. 双管线一句话区分
 
-| | ① semantic / bq_reports | ② 同事脚本（bom_pipeline） |
+| | ① semantic / bq_reports | ② bom_pipeline |
 |---|---|---|
-| **定位** | 平台底座 / 未来方向（可审计、对账中台、指标平台） | **当前生产交付**（《商品成本毛利分析》） |
-| **数据源** | 实时读 BQ（`ttpos_*` 事实表）+ ERP/外挂 | 离线攒好的 `clean_bom.csv` 单源 + 销量 xlsx + recon |
-| **运行时** | live 查询 + 多层 priority 解析 | 读拍平的单源，**不碰 BQ/ERP** |
-| **"两条路"数据源** | ✅ 在这（外挂人工源 覆盖 ERP/BQ 原生） | ❌ 运行时单源（两条路只发生在离线攒 csv 时） |
-| **实收口径** | 实收恒等式待复核（遗留 158） | payment 锚定，已对齐同事/门店汇总（生产） |
-| **状态** | 成本毛利交付物 `combo_bom_detail` 搁置（口径未定稿） | 生产口径走这套 |
+| **定位** | 平台底座(可审计、对账中台、指标平台) | 当前生产交付(`《商品成本毛利分析》`) |
+| **数据源** | BQ live + ERP/外挂 real-time | `clean_bom.csv` 单源(离线攒,价格已烤入) |
+| **成本价格** | material_price 4-layer priority + Buying-Internal + desired-UOM | clean_bom 冻存的 base×1.05×(1+tax) |
+| **实收锚** | Net Sales = ttpos actual_amount(应收),恒等式待复核 | payment−退款−挂账 = 门店汇总实收(已对齐) |
+| **闸门** | ✅ gated(恒等式不通过 block export) | ⚠ 无闸门 |
+| **对账锚** | ttpos_anchor(NetSales 0.0002%) + ttpos_cost_anchor(待sid) | 靠 recon.json 实收对齐 |
 
-## 2. ① semantic / bq_reports 管线
+## 2. 语义层 & 成本解析
 
-我们自己的语义平台层。强调**可审计、配置驱动、口径收口**。
+### 2.1 业务实体 CTE 工厂 (`semantic/entities/`)
 
-```mermaid
-flowchart TB
-    BQ[("BQ ttpos_* 事实表 (live)")]
-    ENT["semantic/entities/ — 业务实体 SQL CTE 工厂<br/>sale_event / sale_line / takeout_line / total_line<br/>bom / combo / recursive_bom / price_breakdown …"]
+| 实体 | BQ 源表 | 粒度 | 用途 |
+|---|---|---|---|
+| `sale_event` | statistics_product + takeout_order_item | (item, price, channel) | 最细事实表,含 actual_amount |
+| `sale_line` | statistics_product | (item) | 旧粒度,profit_margin 等消费 |
+| `takeout_line` | takeout_order_item | (item) | 外卖,按 state 过滤取消 |
+| `total_line` | sale_line FULL JOIN takeout_line | (item) | 合并表 |
+| `order_line` | sale_order_product + takeout_order | (order × item) | 套餐子品拆解 + 凭证账 |
+| `order_discount` | statistics_product + sale_order | (item_uuid) | 7 项订单折扣分摊 |
+| `bom` / `combo` / `recursive_bom` | product_bom + package_group + group_item + related_material | (combo × material) | 套餐"订单→子品→物料"递归拆解 |
 
-    subgraph COST["成本解析 — 两条路, 按 priority"]
-        direction TB
-        BOMRES["配方 BOM: config.yaml bom_sources<br/>外挂人工源(高): 最终BOM=100 / huku=90 / 同事套餐=10<br/>原生兜底(低): 未命中 → BQ ttpos_product_bom"]
-        PRICERES["物料单价: material_price.py 四层栈<br/>客户外挂(100+) > 上传清单(80) > ERPNext(50) > BQ ttpos_material 兜底<br/>(strict=True 时只走外挂层, 未命中=无)"]
-    end
+- `recursive_bom` = 套餐成本**唯一真源**:可选组按订单真实选择展开,禁摊销 weight=optional_count/candidate_count(踩坑 v6~v15)
+- `order_discount` = 实收拆分真源: 应收(actual_amount) − coupon+member+activity+custom+rounding+gift+pay_points
 
-    AGG["semantic/aggregations/ — by_grain / kpi_ratios / pnl_layers"]
-    RECVAL["reconciliation 对账 + validators 恒等式<br/>(ttpos_anchor / platform_payout / internal_consistency)"]
-    METRICS["semantic/metrics/ — 指标注册表 / 绑定 / catalog"]
-    ENGINE["utils/report_engine.py — 并发查询 + 配置驱动 Excel"]
-    OUT["bq_reports/*.py → exports/*.xlsx<br/>profit_margin(对账锚) / profit_by_price(交付物) / pnl / …"]
+### 2.2 物料单价五层 priority 栈 (`semantic/cogs/material_price.py`)
 
-    BQ --> ENT --> COST --> AGG --> RECVAL --> METRICS --> ENGINE --> OUT
+```
+L1 客户外挂 price_layers · priority 100+  →  index_by: code/name, value: float/{price,source_tag}
+L2 uploaded_prices · priority 80           →  --price-list 上传清单, 按编码精确匹配
+L3 ERPNext Buying-Internal · priority 50   →  desired-UOM 选行, mismatch→跳过→兜底 (NEW · 2026-06 对齐 ttpos)
+L4 BQ ttpos_material 兜底                  →  per-row bq_price (全0,实际无用)
 ```
 
-特点：**live、多层覆盖、带校验与对账**。所谓"两条路"（外挂人工源 vs ERP/BQ 原生，
-高优先覆盖低优先兜底）就是这套里的 priority 解析机制。
+- `strict=True` = 只走 L1,未命中 → `(0, '无(strict)')`,客户没维护的物料按 0 成本。
+- 审计列 `price_source` 可见真实命中层,`SOURCE_COVERAGE` identity 报警 missing。
 
-## 3. ② 同事脚本管线（bom_pipeline）
+### 2.3 ERP 价格对齐 (2026-06 完成, `feature/erp-cost-ttpos-alignment`)
 
-当前《商品成本毛利分析》的生产口径。强调**单源、payment 锚定实收、跟同事逐店对齐**。
+ttpos Go 真源 (`business_cost_profit_erp_cost.go:103` priceList=`"Buying - Internal"`, `item.go:107 GetItemUnitCost`):
+
+| 维度 | 修正前 | 修正后 |
+|---|---|---|
+| 价表 | Standard Buying (错表) | Buying - Internal → `erpnext_api.py` |
+| 字段 | 403 回退 Item.last_purchase_rate | Item Price.price_list_rate |
+| UOM | 写死 g>pc>nos 优先级 + 消费侧丢弃 _uom | desired-UOM 选行 + material_price 校验 |
+| margin | 无条件 ×1.05 | PRLE-0003 条件: buying & !disabled & for_price_list & PriceOrDiscount & dates |
+| 税 | 适用税率% (来源未验) | Item Tax 税率 (留子集,单一 VAT 等价) |
+
+对账锚: `semantic/reconciliation/checks/ttpos_cost_anchor.py`(5 guard 完整复刻,可注入 erp_get, 待接 sid live)。
+Phase 5: 修正算法 vs v40, 在假设 PRLE-0003 条件满足时**算法差异=0**(仅 ฿28.56 舍入差)。
+
+## 3. 对账 & 恒等式体系 (`semantic/validators/` + `reconciliation/`)
+
+### 3.1 闸门级恒等式 (不通过 block export)
+
+| Identity | 阈值 | 说明 |
+|---|---|---|
+| SALES_QTY | abs≤1, rel≤0.1% | 销量从多个实体汇总必须 self-consistent |
+| AMOUNT | abs≤1 satang, rel≤0.1% | 金额恒等式,零容差(int 化后) |
+| GROSS_AMOUNT | abs≤1 satang, rel≤0.1% | 毛额守恒 |
+| BOM_SOURCE_COVERAGE | missing≤20% | BOM 来源完整性 |
+| PRICE_SOURCE_COVERAGE | missing≤50% | 物料单价来源完整性 |
+
+### 3.2 合理性区间 (soft, 不 block)
+
+| Band | 阈值 | 说明 |
+|---|---|---|
+| REFUND_RATIO | ≤X% | 退款率合理性 |
+| FREE_GIVE_RATIO | ≤Y% | 赠品/赠送率合理性 |
+| CANCEL_RATIO | ≤Z% | 外卖取消率合理性 |
+
+### 3.3 跨系统对账 (reconciliation checks)
+
+| Check | 对什么 | 状态 |
+|---|---|---|
+| `ttpos_anchor` | BQ Net Sales vs ttpos 后端 SQL | 2026-04 差 0.0002% ✅ |
+| `ttpos_cost_anchor` | BQ COGS vs ERP 复算 ttpos 算法 | **NEW** (5 guard 完整复刻,待 sid live) |
+| `platform_payout` | 外卖营收 vs Grab/LINE MAN 对账单 | 框架就绪,待 loader |
+
+### 3.4 观察模式 (不进闸门, 定期审视)
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| CROSS_LEDGER | qty 89.5%, 结构天花板 | voucher vs stat 后端写入不对称, ~10% 不可控残差不进闸门 |
+| PAYMENT_TIEOUT | 半覆盖 | payment_amount 仅含堂食 POS, 外卖待平台对账单 |
+
+### 3.5 导出闸门 (gate)
+
+```python
+validate_and_gate(check_rows, FULL_IDENTITIES)
+# 🟢 全绿 → export Excel
+# 🔴 有红 → exit(2), NO file
+# 🔴 + --force → 水印 "⚠️校验未通过"
+```
+
+无闸门脚本 → `test_validator_coverage.py` AST 扫描 → CI block。
+
+非销售类导出(如 BOM/菜单)用 `make_required_fields_identity` / `make_unique_key_identity` 基线。
+
+## 4. 指标注册表 (`semantic/metrics/`)
+
+### 4.1 结构
+
+```
+semantic/metrics/registry/
+├── sales.yaml      15 指标 (含 receivable/net_revenue + 支付三口径)
+├── settlement.yaml  2 指标 (platform_commission / contribution_margin)
+├── finance.yaml     5 指标 (labor/rent/utilities/marketing/operating_income)
+├── kpi.yaml         6 指标 (gross_margin/food_cost/prime_cost/aov/channel_mix/take_rate)
+└── metadata.yaml    2 指标 (bom_source / price_source)
+────────────────────────────────────────────────
+                   30 指标, 每条带 ttpos_source 溯源
+```
+
+每条指标 = `id` + `name` + `definition` + `formula`(business + SQL refs) + `lineage`(source_tables + upstream/downstream) + `reconciliation`(anchor + impl + status) + `ttpos_source`(Go file:line / BQ table.field) + `confidence`(ACTUAL / ESTIMATED / NA)
+
+### 4.2 支付口径拆分 (关键, 防客户喊"数据错")
+
+| 指标 | 含义 | ttpos 对应 |
+|---|---|---|
+| `turnover` (营业额) | 成本表口径 = receivable + takeout subtotal | CountProductSales + CountTakeoutSale(subtotal) |
+| `receivable` (应收) | = actual_amount,已扣行级折扣,未扣订单级折扣 | CountProductSale.actual_sale_amount |
+| `net_revenue` (实收) | = receivable − 7 项订单折扣 | receivable − sale_order 营销减项 |
+| `payment_collected` (支付净额) | 汇总表口径 = payment−refund−balance + platform_total | CountSale + CountTakeoutSale(platform_total) |
+| `bank_deposited` (实际到账) | 银行流水 / 平台结算单 | **外部**(银行·Grab·LINEMAN), 非 ttpos |
+
+桥关系(已验证, `scripts/adhoc/recon_cost_vs_summary_bridge.py`):
+
+```
+turnover − payment_collected ≈ coupon + other_disc − refund_gap + takeout_gap (残差抹零级)
+```
+
+改口径只改 yaml → `venv/bin/python -m semantic.metrics.render_catalog` → CI `--check` 防文档漂移。
+代码改了 registry 没同步 → CI block。
+
+## 5. ② bom_pipeline 生产口径的指标谱系
+
+### 5.1 运行流程
 
 ```mermaid
 flowchart TB
-    CB["clean_bom.csv — BOM 单源<br/>价格配方已烤入(离线攒, 见 bom-pipeline.md §1.5)"]
+    CB["clean_bom.csv — BOM 单源,价格配方已烤入"]
     SALES["sales_fixed.xlsx — 多 sheet 销量"]
     RECON["recon.json — 门店实收锚"]
-
-    subgraph WBM["bom_pipeline/wallace_bom_margin.py"]
-        direction TB
-        L1["load_clean_bom() — 套 bom_rules.py 删除规则 → price + 渠道感知 BOM"]
-        L2["load_sales() — 净销量 + 堂食/外卖实收率"]
-        L3["recon 实收对齐 — payment−退款−挂账 / platform_total"]
+    subgraph WBM["wallace_bom_margin.py"]
+        L1["load_clean_bom → bom_rules 渠道/物料删除"]
+        L2["load_sales → 净销量 + 实收率"]
+        L3["recon 对齐: 实收率 = payment−退款−挂账 / Σ原价"]
     end
-
-    OUT["build() → 堂食/外卖 × 单品/套餐 四 sheet → exports/*.xlsx"]
-
-    CB --> L1
-    SALES --> L2
-    RECON --> L3
-    WBM --> OUT
+    OUT["四 sheet: 堂食/外卖 × 单品/套餐 → exports/*.xlsx"]
+    CB-->L1; SALES-->L2; RECON-->L3; WBM-->OUT
 ```
 
-> `erpnext_price.py` 不在运行时图里 —— 它是**离线攒 clean_bom 价格列**时复刻 ERP 终价的算法。
+### 5.2 指标计算公式
 
-特点：**运行时单源、不查 BQ/ERP、快而稳**。两条路只发生在**离线攒 `clean_bom.csv`** 的阶段
-（ERP 直接 load + 反复人工纠正），运行时已经拍平成一张表。
-
-## 4. 指标计算谱系（② 生产口径，每个数字怎么算出来的）
-
-下面是 ② 四 sheet 报表里**每个输出列**的真实算法（抠自 `wallace_bom_margin.py` `build()`）。
-先看字段级推导图，再看逐列公式表。
-
-```mermaid
-flowchart LR
-    subgraph SRC["源字段"]
-        AMT["原价金额 amt<br/>(销量表 套餐/单品 sheet)"]
-        QTY["净销量 qty<br/>(销量表)"]
-        RECV["门店实收<br/>堂食=payment−退款−挂账<br/>外卖=platform_total<br/>(recon.json)"]
-        BQ["消耗数量 q_i<br/>(clean_bom)"]
-        BP["物料单价 p_i<br/>(clean_bom, ERP 复刻)"]
-    end
-
-    RATE["实收率 rate<br/>= 门店实收 / Σ原价(店×渠道, qty&gt;0)"]
-    REV["实收金额 L<br/>= round(amt × rate)"]
-    UCOST["单份总成本 N<br/>= Σ(q_i × p_i)  [SUMPRODUCT]"]
-    TCOST["总成本<br/>= N × 净销量 K"]
-    GM["总毛利 O<br/>= L − N×K"]
-    GMR["毛利率 B<br/>= O / L"]
-
-    RECV --> RATE
-    AMT --> RATE
-    AMT --> REV
-    RATE --> REV
-    BQ --> UCOST
-    BP --> UCOST
-    UCOST --> TCOST
-    QTY --> TCOST
-    REV --> GM
-    TCOST --> GM
-    GM --> GMR
-    REV --> GMR
-```
-
-逐列公式（Excel 列号 = 报表实际列；公式列写的是单元格真公式）：
-
-| 列 | 指标 | 公式 | 源 / 说明 |
+| Excel 列 | 指标 | 公式 | 源 |
 |---|---|---|---|
-| K | 净销量 | 销量表净销量 `qty` | sales（qty≤0 行跳过） |
-| L | **实收金额** | `round(原价 amt × 实收率 rate)` | sales × recon。实收率 = 门店实收 ÷ Σ原价(该店该渠道) |
-| M | 净利润 | `= L` | **当前等于实收**（预留位，未扣平台抽佣/税） |
-| N | **单份总成本** | `SUMPRODUCT(消耗数量, 物料单价)` = Σ(q_i×p_i) | clean_bom；物料单价 = ERP 复刻终价 |
-| O | **总毛利** | `= L − N×K`（实收 − 单份成本×净销量） | 派生 |
-| P | 净总毛利 | `= O` | **当前等于总毛利**（预留位） |
-| B | **毛利率** | `= IF(L=0,0, O/L)` = 总毛利 / 实收 | 派生 |
-| C | 净毛利率 | `= B` | 当前等于毛利率（预留位） |
+| K | 净销量 | 销量表 `qty`(qty>0) | sales |
+| L | 实收金额 | `round(原价 amt × 实收率 rate)` | sales × recon |
+| N | 单份总成本 | `Σ(消耗数量 × 物料单价)` | clean_bom |
+| O | 总毛利 | `L − N×K` | 派生 |
+| B | 毛利率 | `IF(L=0, 0, O/L)` | 派生 |
 
-明细行（每个物料一行）：H=消耗数量、I=物料单价、F=物料名、G=编码、J=单位；
-N 列就是对这些 H×I 求 SUMPRODUCT。
+> "净"系列列 (M 净利润 / P 净总毛利 / C 净毛利率) 当前等于对应毛列, 是给后续扣平台抽佣/税预留的位。
 
-**两个要点（避免误读）**：
-- **`净` 系列列（M 净利润 / P 净总毛利 / C 净毛利率）当前 = 对应毛列**，是给后续扣平台抽佣/税
-  预留的位，现阶段没扣，所以数值一样。别把 M「净利润」当真利润 —— 它现在就是实收 L。
-- **无 BOM 的商品**：成本走估算 `成本 = round(实收 × 该 sheet 已匹配商品平均成本率)`，
-  并在物料名标「(估算·未映射)」。这类不进上面的 SUMPRODUCT 链。
+### 5.3 clean_bom.csv 谱系
 
-> ① 管线的成本谱系不同：成本 = 逐组分 `Σ(组分消耗 × 料价)`，料价走四层 priority resolver（live），
-> 套餐按订单真实拆解（`semantic/entities/recursive_bom.py`，禁摊销）。同样产出 实收/成本/毛利/毛利率，
-> 但每个量的取数路径是 live 多层，不是这张离线单源表。
+```
+ERP (ERPNext) → 初版全量 BOM → 反复人工纠正(历代 xlsx, 已归档 exports/_archive/)
+    → resources/wallace.20260626/clean_bom.csv (4466 行, 14 列)
+```
 
-## 5. 关系与分工
+配方来自 ERP, 价格来自 `erpnext_price.py` 复刻 `calculateFinalItemUnitCost`(base × 1.05 × 1.07)。
+过程非线性, 归档 xlsx + git history 可回溯。新月份应从 ERP 重新 load, 不手工改历史 xlsx。
 
-- **目标重叠**：两套都产出"成本毛利"，口径理论同源（成本都基于 ERP 复刻的物料采购价
-  `calculateFinalItemUnitCost`），但实现路径不同：① live 多层覆盖，② 离线拍平单源。
-- **当前生产 = ②**：客户/老板拿到的成本毛利分析走同事脚本（payment 锚定实收、逐店对齐）。
-- **平台方向 = ①**：可审计（validators + 对账）、指标平台、对账中台；但其成本毛利交付物
-  `combo_bom_detail` 因实收/恒等式口径未定稿而**搁置**，遗留 158 未解。
-- **价格同源**：① 的 `material_price.py` ERPNext 层 与 ② 的 `erpnext_price.py` 复刻的是
-  **同一个后端 `calculateFinalItemUnitCost`**（`ttpos-bmp/.../stock/item.go`）。一个 live、一个离线。
-- **不要混淆**：看到 "priority / 两条路 / 外挂源覆盖" → 是 ①；看到 "clean_bom.csv 单源 /
-  payment 锚定 / 四 sheet 交付" → 是 ②。
+## 6. 文件结构速查
 
-## 6. 各自文档
+```
+semantic/entities/       — SQL CTE 工厂 (12 实体)
+semantic/cogs/           — 成本解析 (material_price + bom_match + item_cogs)
+semantic/aggregations/   — 聚合 (by_grain + pnl_layers + kpi_ratios)
+semantic/validators/     — 恒等式 + 闸门 + gate
+semantic/reconciliation/ — 跨系统对账 (ttpos_anchor + cost_anchor + platform_payout)
+semantic/metrics/        — 指标注册表 + catalog 自动生成
+bq_reports/              — 19 份报表脚本 (平台管线入口)
+bom_pipeline/            — 生产管线 (wallace_bom_margin + erpnext_price + bom_rules)
+utils/                   — 通用 (report_engine + cache + resource_adapter)
+resources/               — 活配置 (config.yaml) + wallace.{date}/ 归档
+scripts/adhoc/           — 一次性排查/对账/审计脚本
+tests/                   — 584 测试 (unittest + AST 扫描)
+```
 
-- ① semantic 平台层：`CLAUDE.md` §2/§3、`docs/bq-schema-reference.md`、`resources/config.yaml`（bom_sources 栈）、`docs/metrics-*`、各 `docs/plan/*`
-- ② 同事脚本生产线：`docs/bom-pipeline.md`（含 §1.5 数据源谱系）、`bom_pipeline/README.md`
+## 7. 相关文档
+
+- `docs/metrics-catalog.md` — 30 指标完整目录 (自动生成)
+- `docs/superpowers/plans/2026-06-26-erp-cost-ttpos-alignment.md` — ERP 价格对齐实现计划
+- `docs/bom-pipeline.md` — ② 生产管线完整说明 (含 §1.5 数据源谱系)
+- `docs/bq-schema-reference.md` — BQ 表结构
+- `docs/ttpos-bq-field-pitfalls.md` — BQ 字段陷阱
+- `docs/ttpos-algorithms-mirror.md` — ttpos 算法 BQ 镜像
+- `docs/audit/2026-06-cross-ledger-baseline.md` — 跨账本基线
+- `docs/pnl-statement-design.md` — P&L 设计
+- `docs/profit-report-takeout-semantics.md` — 外卖口径归档
+- `semantic/metrics/registry/*.yaml` — 指标真源 (改口径只改这里)

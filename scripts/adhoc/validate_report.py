@@ -1,3 +1,7 @@
+# ⚠️ 一次性校验脚本 (2026-04)。硬编码了 3 个店 ID + 3 个商品名 + 本地 Excel 文件路径。
+# 正式校验用 semantic/validators/ 体系: identities(恒等式闸门) + checks(对账锚) + gate(导出闸门)。
+# 本脚本保留作为一次 BOM 跨店一致性 + ERP价格覆盖率 + 毛利率分布 的手工验证记录。
+#
 #!/usr/bin/env python3
 """
 利润报表交叉验证脚本

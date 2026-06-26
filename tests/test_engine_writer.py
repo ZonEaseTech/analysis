@@ -18,7 +18,7 @@ from openpyxl.utils.cell import range_boundaries
 
 from tests import _setup  # noqa: F401
 
-from utils.report_engine import (
+from bq_reports.shared.report_engine import (
     ColumnConfig,
     SheetConfig,
     write_configured_sheet,

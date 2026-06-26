@@ -24,7 +24,7 @@ from bq_reports.profit_margin_report import (
     _build_rows,
     aggregate_with_bom,
 )
-from utils.report_engine import load_sheet_config, write_configured_sheet
+from bq_reports.shared.report_engine import load_sheet_config, write_configured_sheet
 
 
 YAML_PATH = REPO_ROOT / "resources/reports/profit_margin.yaml"
