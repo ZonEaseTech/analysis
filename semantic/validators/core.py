@@ -45,6 +45,9 @@ class Identity:
     rhs: Callable[[dict], float]
     classify: Callable[[float, float], Severity]
     description: str = ""
+    # 该恒等式读取的 row 字段清单 — 扰动测试 (tests/test_identity_perturbation)
+    # 据此逐字段扰动验证可证伪性. lambda 无法内省, 故显式声明.
+    fields: tuple[str, ...] = ()
 
 
 @dataclass

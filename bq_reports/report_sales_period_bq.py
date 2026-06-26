@@ -39,6 +39,7 @@ from google.cloud import bigquery
 from google.oauth2.credentials import Credentials
 import xlsxwriter
 
+from semantic.dimensions.time import assert_month_not_frozen
 from semantic.entities.sale_event import sale_event_cte
 from semantic.validators import check, print_result
 from semantic.validators.identities import DEFAULT_IDENTITIES
@@ -72,20 +73,37 @@ STORE_LIST = [
     ("67", "5752387276800000"), ("72", "3469788319744000"),
 ]
 
-# 13 个指标 + 中文 label (用户 Q3: 全展示用来对账)
+# 14 个指标 + 中文 label (用户 Q3: 全展示用来对账; gross_amount 供毛额守恒真校验)
 METRICS = [
-    "qty", "sales_price", "original_amount", "actual_amount",
+    "qty", "sales_price", "gross_amount", "original_amount", "actual_amount",
     "refund_qty", "refund_amount", "free_qty", "give_qty",
     "free_amount", "give_amount", "discount_amount",
     "cancelled_qty", "cancelled_amount",
 ]
 METRIC_LABELS = {
-    "qty": "销量", "sales_price": "营业额", "original_amount": "标准金额",
+    "qty": "销量", "sales_price": "营业额", "gross_amount": "毛额",
+    "original_amount": "标准金额",
     "actual_amount": "实收金额", "refund_qty": "退单数", "refund_amount": "退单金额",
     "free_qty": "免单数", "give_qty": "赠送数", "free_amount": "免单金额",
     "give_amount": "赠送金额", "discount_amount": "折扣金额",
     "cancelled_qty": "取消数", "cancelled_amount": "取消金额",
 }
+
+# 交易金额指标 (萨当整数, 写盘时 /100 还原成元; PR-B 7b).
+# qty 类 (qty/refund_qty/free_qty/give_qty/cancelled_qty) 不是金额, 不转.
+MONEY_METRICS = {
+    "sales_price", "gross_amount", "original_amount", "actual_amount",
+    "refund_amount", "free_amount", "give_amount", "discount_amount",
+    "cancelled_amount",
+}
+
+
+def _disp(metric: str, value):
+    """显示侧: 交易金额萨当 → 元 (唯一除法点). 非金额原样返回 (PR-B 7b)."""
+    if metric in MONEY_METRICS and isinstance(value, (int, float)):
+        return value / 100.0
+    return value
+
 
 # 渠道展示顺序 (堂食优先, 外卖按平台字母序, pos_takeout 兜底最后)
 SUBCH_PRIORITY = {"pos": 0, "pos_takeout": 99}
@@ -164,6 +182,8 @@ def parse_args():
     p.add_argument("--stores", help="逗号分隔的门店编号过滤, 如 001,002,003")
     p.add_argument("--workers", type=int, default=8, help="并发查询门店数")
     p.add_argument("--version", type=int, help="指定版本号；不传则自动递增")
+    p.add_argument("--force", action="store_true",
+                   help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     a = p.parse_args()
     if a.start and a.end:
         sd = datetime.strptime(a.start, "%Y-%m-%d").date()
@@ -173,7 +193,7 @@ def parse_args():
         sd = ed - timedelta(days=6)
     if sd > ed:
         sys.exit("start 不能晚于 end")
-    return sd, ed, a.stores, a.workers, a.version
+    return sd, ed, a.stores, a.workers, a.version, a.force
 
 
 def to_ts(d: date, end_of_day: bool = False) -> int:
@@ -294,9 +314,12 @@ def write_sheet_anchor(wb, anchor_by_store: dict, rows: list):
     for i, c in enumerate(cols):
         ws.write(3, i, c, hdr)
 
+    # 我方 actual_amount 是萨当 → 元 (对账锚 anchor_by_store 是 ttpos 口径元值)
     ours_by_store = {}
     for r in rows:
-        ours_by_store[r["store_num"]] = ours_by_store.get(r["store_num"], 0) + (r.get("actual_amount") or 0)
+        ours_by_store[r["store_num"]] = (
+            ours_by_store.get(r["store_num"], 0)
+            + (r.get("actual_amount") or 0) / 100.0)
 
     ri = 4
     tot_a = 0.0; tot_o = 0.0
@@ -419,7 +442,7 @@ def write_sheet1_period_long(wb, rows, store_names: dict):
         ws.write(target_row, 2, "", sub); ws.write(target_row, 3, "", sub)
         ws.write(target_row, 4, "", sub); ws.write(target_row, 5, "", sub)
         for ci, m in enumerate(METRICS, start=6):
-            ws.write(target_row, ci, store_agg[m], sub_i if m.endswith("_qty") else sub)
+            ws.write(target_row, ci, _disp(m, store_agg[m]), sub_i if m.endswith("_qty") else sub)
     for r in agg:
         if cur_store is not None and r["store_num"] != cur_store:
             _flush_store_subtotal(ri, cur_store)
@@ -435,7 +458,7 @@ def write_sheet1_period_long(wb, rows, store_names: dict):
         for ci, m in enumerate(METRICS, start=6):
             fmt = int_f if m.endswith("_qty") else money
             v = r.get(m, 0) or 0
-            ws.write(ri, ci, v, fmt)
+            ws.write(ri, ci, _disp(m, v), fmt)
             grand[m] += v; store_agg[m] += v
         ri += 1
     if cur_store is not None:
@@ -445,7 +468,7 @@ def write_sheet1_period_long(wb, rows, store_names: dict):
     ws.write(ri, 0, "总计", gtotal)
     for ci in range(1, 6): ws.write(ri, ci, "", gtotal)
     for ci, m in enumerate(METRICS, start=6):
-        ws.write(ri, ci, grand[m], gtotal_i if m.endswith("_qty") else gtotal)
+        ws.write(ri, ci, _disp(m, grand[m]), gtotal_i if m.endswith("_qty") else gtotal)
     ws.freeze_panes(1, 6)
     ws.set_column(0, 0, 8); ws.set_column(1, 1, 18); ws.set_column(2, 2, 30)
     ws.set_column(3, 3, 18); ws.set_column(4, 5, 11); ws.set_column(6, 5 + len(METRICS), 14)
@@ -486,10 +509,10 @@ def write_sheet2_store_pivot(wb, rows, store_names: dict):
                 v = r.get(m, 0) or 0
                 totals[m] += v; grand_pivot[sc][m] += v
                 fmt = int_f if m.endswith("_qty") else money
-                ws.write(ri, ci, v, fmt); ci += 1
+                ws.write(ri, ci, _disp(m, v), fmt); ci += 1
         for m in core_metrics:
             fmt = int_f if m.endswith("_qty") else money
-            ws.write(ri, ci, totals[m], fmt); ci += 1
+            ws.write(ri, ci, _disp(m, totals[m]), fmt); ci += 1
             grand_total[m] += totals[m]
     # 总计行
     ri = len(sorted_stores) + 1
@@ -497,9 +520,9 @@ def write_sheet2_store_pivot(wb, rows, store_names: dict):
     ci = 2
     for sc in subchs:
         for m in core_metrics:
-            ws.write(ri, ci, grand_pivot[sc][m], gtotal_i if m.endswith("_qty") else gtotal); ci += 1
+            ws.write(ri, ci, _disp(m, grand_pivot[sc][m]), gtotal_i if m.endswith("_qty") else gtotal); ci += 1
     for m in core_metrics:
-        ws.write(ri, ci, grand_total[m], gtotal_i if m.endswith("_qty") else gtotal); ci += 1
+        ws.write(ri, ci, _disp(m, grand_total[m]), gtotal_i if m.endswith("_qty") else gtotal); ci += 1
     ws.freeze_panes(1, 2)
     ws.set_column(0, 0, 10); ws.set_column(1, 1, 18); ws.set_column(2, len(cols)-1, 14)
     return len(by_store)
@@ -526,7 +549,7 @@ def write_sheet3_daily(wb, rows, store_names: dict):
         ws.write(ri, 6, fmt_subch(r["sub_channel"]))
         for ci, m in enumerate(METRICS, start=7):
             fmt = int_f if m.endswith("_qty") else money
-            ws.write(ri, ci, r.get(m, 0), fmt)
+            ws.write(ri, ci, _disp(m, r.get(m, 0)), fmt)
     ws.freeze_panes(1, 7)
     ws.set_column(0, 0, 12); ws.set_column(1, 1, 8); ws.set_column(2, 2, 18)
     ws.set_column(3, 3, 30); ws.set_column(4, 4, 18); ws.set_column(5, 6, 11)
@@ -568,7 +591,9 @@ def write_sheet4_variance(wb, curr_rows, prev_rows, curr_period, prev_period, st
         cur = curr_map.get(k, {}); prv = prev_map.get(k, {})
         item_name = cur.get("item_name") or prv.get("item_name") or ""
         cq = cur.get("qty", 0) or 0; pq = prv.get("qty", 0) or 0
-        cr = cur.get("sales_price", 0) or 0; pr = prv.get("sales_price", 0) or 0
+        # 营业额是萨当 → 元, 进入量差/价差估算 (PR-B 7b)
+        cr = (cur.get("sales_price", 0) or 0) / 100.0
+        pr = (prv.get("sales_price", 0) or 0) / 100.0
         # 行类型 + 整行底色
         if pq == 0 and cq > 0:
             row_type = "🆕 新品"; row_fmt = new_f
@@ -672,34 +697,43 @@ def write_meta_sheet(wb, version: int, start, end, prev_start, prev_end, totals:
         ws.set_row(row_i, 32)
 
 
-def run_validators(rows, label: str):
-    """跑销量+金额恒等式. 按 (store_num, item_uuid) 聚合再 check."""
-    log(f"\n=== 校验器: {label} ===")
-    # validator 要 net_qty / revenue 字段 — 用 actual_amount 当 revenue, qty - others 当 net_qty
+def build_validator_check_rows(rows) -> list:
+    """构建校验器 check_rows (按 store_num, item_uuid, channel 聚合)."""
     check_rows = []
     for r in aggregate(rows, ["store_num", "item_uuid", "channel"]):
         cq = r.get("cancelled_qty", 0) or 0
         rq = r.get("refund_qty", 0) or 0
         fq = r.get("free_qty", 0) or 0
         gq = r.get("give_qty", 0) or 0
+        sp = r.get("sales_price", 0) or 0
+        ca = r.get("cancelled_amount", 0) or 0
         check_rows.append({
             "store_num": r["store_num"],
             "item_uuid": r["item_uuid"],
             "qty": r.get("qty", 0),
             "net_qty": r.get("qty", 0) - rq - fq - gq - cq,
             "free_qty": fq, "give_qty": gq, "refund_qty": rq, "cancelled_qty": cq,
-            "sales_price": r.get("sales_price", 0),
+            "sales_price": sp,
             "revenue": r.get("actual_amount", 0),
             "refund_amount": r.get("refund_amount", 0),
             "free_amount": r.get("free_amount", 0),
             "give_amount": r.get("give_amount", 0),
             "discount_amount": r.get("discount_amount", 0),
-            "cancelled_amount": r.get("cancelled_amount", 0),
+            "cancelled_amount": ca,
+            # 真实列 (sale_event 已投影 gross_amount, 已加入 METRICS), 毛额守恒为真校验
+            "gross_amount": r.get("gross_amount", 0) or 0,
         })
+    return check_rows
+
+
+def run_validators(rows, label: str):
+    """跑销量+金额恒等式 (仅日志/预览用). 按 (store_num, item_uuid) 聚合再 check."""
+    log(f"\n=== 校验器: {label} ===")
+    check_rows = build_validator_check_rows(rows)
     result = check(check_rows, DEFAULT_IDENTITIES)
     print_result(result, row_label=lambda r: f"店 {r['store_num']} item {r['item_uuid']}")
     if result.has_must_fix:
-        log("⚠️  有 🔴 离谱违反, 但继续出表 (运营对账场景, 让用户自己看差异源).")
+        log("⚠️  有 🔴 离谱违反.")
     return result
 
 
@@ -712,7 +746,8 @@ def md5_file(p: Path) -> str:
 
 
 def main():
-    sd, ed, stores_filter, workers, ver_override = parse_args()
+    sd, ed, stores_filter, workers, ver_override, force = parse_args()
+    assert_month_not_frozen(sd.strftime("%Y-%m"))
     # 当期 & 上期
     span_days = (ed - sd).days + 1
     prev_ed = sd - timedelta(days=1)
@@ -773,6 +808,21 @@ def main():
         log(f"  ✅ 全 {len(anchor_by_store)} 店跟 ttpos 营业总览 byte-equal 一致 (差额 {diff_t:,.2f}, {rate_t*100:.4f}%)")
 
     write_meta_sheet(wb, version, sd, ed, prev_sd, prev_ed, totals)
+
+    # 零容差闸门 — 在 wb.close() 前执行, 有 MUST_FIX 且无 --force 则 exit(2), 不落盘
+    from semantic.validators.gate import (
+        add_watermark_sheet_xlsxwriter, validate_and_gate)
+    from semantic.validators.identities import FULL_IDENTITIES
+
+    gate_rows = build_validator_check_rows(curr_rows)
+    outcome = validate_and_gate(
+        gate_rows, FULL_IDENTITIES,
+        force=force, report_name="sales_period",
+        row_label=lambda r: f"店 {r['store_num']} item {r['item_uuid']}",
+    )
+    if outcome.needs_watermark:
+        add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
+
     wb.close()
 
     md5 = md5_file(out_path)

@@ -36,7 +36,7 @@ from semantic.cogs import (
     match_fallback_bom as _match_fallback_bom,
     resolve_unit_price as _resolve_unit_price_with_source,
 )
-from semantic.dimensions.time import month_to_ts_range as _month_to_ts_range
+from semantic.dimensions.time import month_to_ts_range as _month_to_ts_range, assert_month_not_frozen
 from semantic.entities import bom, combo, price_breakdown, sale_line, takeout_line, total_line
 from semantic.resolvers import (
     CallableProvider,
@@ -562,6 +562,8 @@ SELECT
   m.qty AS qty,
   m.revenue AS revenue,
   m.sales_price AS sales_price,
+  -- 毛额 (守恒闭环锚): 来自 merged CTE, 堂食=sales_price, 外卖 state-UNCONDITIONED
+  m.gross_amount AS gross_amount,
   m.original_amount AS original_amount,
   m.avg_member_discount AS avg_member_discount,
   m.free_qty AS free_qty,
@@ -969,21 +971,22 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         item_uuid = str(row.item_uuid)
         item_name = row.item_name
         qty = float(row.qty or 0)
-        revenue = float(row.revenue or 0)
-        sales_price = float(getattr(row, "sales_price", None) or 0)
-        original_amount = float(getattr(row, "original_amount", None) or 0)
+        # 交易金额: 萨当整数 (BQ INT64), 全程 int 加法精确 (PR-B 7b)
+        revenue = int(row.revenue or 0)
+        sales_price = int(getattr(row, "sales_price", None) or 0)
+        original_amount = int(getattr(row, "original_amount", None) or 0)
         avg_member_discount = float(getattr(row, "avg_member_discount", None) or 1.0)
         free_qty = float(getattr(row, "free_qty", None) or 0)
         give_qty = float(getattr(row, "give_qty", None) or 0)
         refund_qty = float(getattr(row, "refund_qty", None) or 0)
-        refund_amount = float(getattr(row, "refund_amount", None) or 0)
+        refund_amount = int(getattr(row, "refund_amount", None) or 0)
         cancelled_qty = float(getattr(row, "cancelled_qty", None) or 0)
-        cancelled_amount = float(getattr(row, "cancelled_amount", None) or 0)
-        # 金额恒等式分项（堂食才有非零值）
-        free_amount = float(getattr(row, "free_amount", None) or 0)
-        give_amount = float(getattr(row, "give_amount", None) or 0)
-        discount_amount = float(getattr(row, "discount_amount", None) or 0)
-        list_price = float(getattr(row, "list_price", None) or 0)
+        cancelled_amount = int(getattr(row, "cancelled_amount", None) or 0)
+        # 金额恒等式分项（堂食才有非零值; 萨当整数）
+        free_amount = int(getattr(row, "free_amount", None) or 0)
+        give_amount = int(getattr(row, "give_amount", None) or 0)
+        discount_amount = int(getattr(row, "discount_amount", None) or 0)
+        list_price = float(getattr(row, "list_price", None) or 0)  # 估算域: 标价是元 float
         price_1 = getattr(row, "price_1", None)
         qty_1 = getattr(row, "qty_1", None)
         price_2 = getattr(row, "price_2", None)
@@ -996,16 +999,18 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         if key not in data:
             data[key] = {
                 "qty": 0.0,
-                "revenue": 0.0,
-                "sales_price": 0.0,
-                "original_amount": 0.0,
+                # 交易金额桶: 萨当整数 (int 加法精确, PR-B 7b)
+                "revenue": 0,
+                "sales_price": 0,
+                "gross_amount": 0,
+                "original_amount": 0,
                 "refund_qty": 0.0,
-                "refund_amount": 0.0,
+                "refund_amount": 0,
                 "cancelled_qty": 0.0,
-                "cancelled_amount": 0.0,
-                "free_amount": 0.0,
-                "give_amount": 0.0,
-                "discount_amount": 0.0,
+                "cancelled_amount": 0,
+                "free_amount": 0,
+                "give_amount": 0,
+                "discount_amount": 0,
                 "avg_member_discount": 0.0,
                 "free_qty": 0.0,
                 "give_qty": 0.0,
@@ -1022,6 +1027,8 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
         data[key]["qty"] += qty
         data[key]["revenue"] += revenue
         data[key]["sales_price"] += sales_price
+        # 真实列 (sale_line/takeout_line 已投影 gross_amount), 毛额守恒为真校验 (萨当整数)
+        data[key]["gross_amount"] += int(getattr(row, "gross_amount", 0) or 0)
         data[key]["original_amount"] += original_amount
         data[key]["refund_qty"] += refund_qty
         data[key]["refund_amount"] += refund_amount
@@ -1100,6 +1107,8 @@ def aggregate_with_bom(order_rows, bom_data, combo_structure, uploaded_prices=No
             "net_qty": net_qty,
             "revenue": val["revenue"],
             "sales_price": val["sales_price"],
+            # 真实列透传 — sale_line/takeout_line/total_line 已投影 gross_amount
+            "gross_amount": val["gross_amount"],
             "original_amount": val["original_amount"],
             "refund_qty": val["refund_qty"],
             "refund_amount": val["refund_amount"],
@@ -1227,18 +1236,20 @@ def _build_rows(agg_data, mode, bom_layers=None, uploaded_prices=None, erp_price
 
         # row 末尾扩展槽位（field_index 26-29 = utility 公式列；30-31 = 标价应收/异常损失公式列；
         # 32 = 取消数量、33 = 取消金额、34 = BOM 来源；35 = 物料价来源）。
+        # cancelled_amount 是萨当整数, 列标 money_satang → 引擎 /100 写盘 (PR-B 7b)
         tail = [None, None, None, None, None, None,
-                round(cancelled_qty, 2), round(cancelled_amount, 2),
+                round(cancelled_qty, 2), cancelled_amount,
                 bom_source, price_source_str]
 
         if not bom_list:
             rows.append([
                 store_num, store_name, item_name,
                 round(list_price, 2), round(qty, 2),
-                round(sales_price, 2), round(original_amount, 2),
-                round(revenue, 2), round(avg_member_discount, 4),
+                # 萨当整数 (money_satang 列, 引擎 /100 写盘); original_amount 被 block_formula 覆盖
+                sales_price, original_amount,
+                revenue, round(avg_member_discount, 4),
                 round(free_qty, 2), round(give_qty, 2),
-                round(refund_qty, 2), round(refund_amount, 2),
+                round(refund_qty, 2), refund_amount,
                 price_1, qty_1, price_2, qty_2, price_3, qty_3, other_price_qty,
                 "-", "-", None, None, "-",
                 str(item_uuid),
@@ -1249,10 +1260,11 @@ def _build_rows(agg_data, mode, bom_layers=None, uploaded_prices=None, erp_price
             rows.append([
                 store_num, store_name, item_name,
                 round(list_price, 2), round(qty, 2),
-                round(sales_price, 2), round(original_amount, 2),
-                round(revenue, 2), round(avg_member_discount, 4),
+                # 萨当整数 (money_satang 列, 引擎 /100 写盘); original_amount 被 block_formula 覆盖
+                sales_price, original_amount,
+                revenue, round(avg_member_discount, 4),
                 round(free_qty, 2), round(give_qty, 2),
-                round(refund_qty, 2), round(refund_amount, 2),
+                round(refund_qty, 2), refund_amount,
                 price_1, qty_1, price_2, qty_2, price_3, qty_3, other_price_qty,
                 name, code, round(bom_num, 4), round(mat_price, 4), uom or "-",
                 str(item_uuid),
@@ -1325,21 +1337,23 @@ def _build_summary_rows(agg_data, mode, bom_layers=None, uploaded_prices=None, e
             bom_source = "无"
         price_source_str = " + ".join(sorted(price_sources_seen)) if price_sources_seen else "无"
 
-        # 单份总成本 = Σ (BOM 消耗 × 物料单价)
+        # 单份总成本 = Σ (BOM 消耗 × 物料单价) — 估算域 (物料单价是 4 位小数元)
         per_unit_cost = sum(bom_num * unit_price
                             for _, _, bom_num, unit_price, _ in bom_list)
         # 总成本 = 单份成本 × 销量（含赠/退/取，因为 BOM 实际消耗了）
         total_cost = per_unit_cost * qty
+        # 边界: revenue 是萨当整数 → 元, 进入估算域跟成本/利润算 (PR-B 7b)
+        revenue_thb = revenue / 100.0  # 萨当→元
         # 总利润 = 实收 - 总成本
-        total_profit = revenue - total_cost
-        margin = total_profit / revenue if revenue > 0 else 0
+        total_profit = revenue_thb - total_cost
+        margin = total_profit / revenue_thb if revenue_thb > 0 else 0
 
         rows.append([
             store_num, store_name, item_name,
             round(qty, 2),
             round(net_qty, 2),
-            round(sales_price, 2),
-            round(revenue, 2),
+            round(sales_price / 100.0, 2),    # 萨当→元
+            round(revenue_thb, 2),
             round(per_unit_cost, 4),
             round(total_cost, 2),
             round(total_profit, 2),
@@ -1429,6 +1443,8 @@ def main():
     parser.add_argument("--summary", action="store_true",
                         help="汇总视角：每 SKU 一行（不展开 BOM 物料），默认输出 sku_profit_summary.yaml 格式")
     parser.add_argument("--no-cache", action="store_true", help="禁用缓存")
+    parser.add_argument("--force", action="store_true",
+                        help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     args = parser.parse_args()
     # --summary 自动切换列配置（除非用户显式覆盖）
     if args.summary and args.column_config == "resources/reports/profit_margin.yaml":
@@ -1440,6 +1456,7 @@ def main():
         return 1
 
     if args.month:
+        assert_month_not_frozen(args.month)
         start_ts, end_ts = _month_to_ts_range(args.month)
         range_label = args.month.replace("-", "")
     elif args.start_date and args.end_date:
@@ -1545,6 +1562,11 @@ def main():
     if tb_stores:
         print(f"\n[Test Business] 排除测试营业时段, 影响 {len(tb_stores)} 店")
 
+    watermarked = False  # 多 mode 循环只打一次水印
+    from semantic.validators.gate import (
+        add_watermark_sheet_xlsxwriter, validate_and_gate)
+    from semantic.validators.identities import FULL_IDENTITIES
+
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = COMBO_ORDERS_SQL if mode == "combo" else SINGLE_ORDERS_SQL
@@ -1600,25 +1622,21 @@ def main():
         if not args.summary:
             print(f"[{item_label}] 此为中间表，利润指标请自行在 Excel 中定义")
 
-        # 校验恒等式 + 来源完整性 + 业务合理性 (P2 FULL_IDENTITIES 一次跑完)
+        # 零容差闸门: 校验恒等式 + 来源完整性 + 业务合理性 (FULL_IDENTITIES)
         # agg_data 已带 bom_source / price_source (P2 annotation)
-        from semantic.validators import check, print_result
-        from semantic.validators.identities import FULL_IDENTITIES
-
+        # 闸门在 wb.close() 前执行 — 有 MUST_FIX 且无 --force 则 exit(2), 不落盘
         check_rows = [
-            {
-                "store_num": store_num,
-                "item_name": item_name,
-                **data,
-            }
+            {"store_num": store_num, "item_name": item_name, **data}
             for (store_num, _store_name, _uuid, item_name), data
             in agg_data.items()
         ]
-        print(f"\n[{item_label}] 校验恒等式 + 来源 + sanity …")
-        result = check(check_rows, FULL_IDENTITIES)
-        print_result(result, row_label=lambda r: f"店 {r['store_num']:>3}  {r['item_name']:<30}")
-        if result.has_must_fix:
-            print(f"⚠️  [{item_label}] 有 🔴 离谱违反，请核实数据/口径。\n")
+        outcome = validate_and_gate(
+            check_rows, FULL_IDENTITIES,
+            force=args.force, report_name=f"profit_margin/{item_label}",
+            row_label=lambda r: f"店 {r['store_num']:>3}  {r['item_name']:<30}")
+        if outcome.needs_watermark and not watermarked:
+            add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
+            watermarked = True
 
     wb.close()
     print(f"\n输出文件: {output_path}")

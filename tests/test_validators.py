@@ -23,11 +23,12 @@ from semantic.validators.identities import (
 
 
 def clean_row(**overrides):
-    """A row that satisfies both built-in identities exactly."""
+    """A row that satisfies all built-in identities exactly."""
     row = dict(
         qty=10, net_qty=8, free_qty=1, give_qty=1, refund_qty=0, cancelled_qty=0,
         sales_price=100.0, revenue=80.0, refund_amount=0,
         free_amount=10, give_amount=10, cancelled_amount=0, discount_amount=0,
+        gross_amount=100.0,  # = sales_price(100) + cancelled_amount(0)
     )
     row.update(overrides)
     return row
@@ -48,30 +49,36 @@ class QtyClassifierTests(unittest.TestCase):
 
 
 class MoneyClassifierTests(unittest.TestCase):
-    """Two-axis: absolute OR relative threshold determines severity."""
+    """Two-axis: absolute OR relative threshold determines severity.
 
-    def test_sub_cent_negligible(self):
-        self.assertEqual(_money_classify(0.005, 1000), Severity.NEGLIGIBLE)
+    PR-B 7c: _money_classify 单位改萨当 (服务 CROSS_LEDGER 两本账残差 + 封顶勾稽,
+    不再服务 sum 型金额恒等式). 阈值: <1 萨当 / <100 萨当且<0.1% 无视;
+    >10000 萨当 (=100 元) 或 >5% 必查.
+    """
+
+    def test_sub_satang_negligible(self):
+        # < 1 萨当 → NEGLIGIBLE
+        self.assertEqual(_money_classify(0.5, 1000), Severity.NEGLIGIBLE)
 
     def test_rounding_accumulation_negligible(self):
-        # delta < 1 AND rel < 0.1% → NEGLIGIBLE
-        self.assertEqual(_money_classify(0.5, 10000), Severity.NEGLIGIBLE)
+        # delta < 100 萨当 (1 元) AND rel < 0.1% → NEGLIGIBLE
+        self.assertEqual(_money_classify(50, 1_000_000), Severity.NEGLIGIBLE)
 
     def test_small_but_not_rounding_needs_review(self):
-        # delta ~ 5 元, rel = 5% — boundary case; 5% is *not* > 5% so REVIEW
-        self.assertEqual(_money_classify(5.0, 100.0), Severity.NEEDS_REVIEW)
+        # delta 500 萨当, rel = 5% — boundary; 5% 不 > 5% 故 REVIEW
+        self.assertEqual(_money_classify(500, 10_000), Severity.NEEDS_REVIEW)
 
     def test_large_absolute_must_fix(self):
-        # 101 元 > 100 threshold
-        self.assertEqual(_money_classify(101, 100_000), Severity.MUST_FIX)
+        # 10100 萨当 (101 元) > 10000 萨当阈值
+        self.assertEqual(_money_classify(10_100, 100_000_00), Severity.MUST_FIX)
 
     def test_large_relative_must_fix(self):
-        # delta 10 元, lhs 100 → 10% > 5% threshold
-        self.assertEqual(_money_classify(10, 100), Severity.MUST_FIX)
+        # delta 1000 萨当, lhs 10000 → 10% > 5% threshold
+        self.assertEqual(_money_classify(1000, 10_000), Severity.MUST_FIX)
 
     def test_zero_lhs_does_not_explode(self):
-        # 比例除零必须用 lhs=0 安全分支
-        sev = _money_classify(50, 0)
+        # 比例除零必须用 lhs=0 安全分支; 5000 萨当落在 review 带
+        sev = _money_classify(5000, 0)
         self.assertEqual(sev, Severity.NEEDS_REVIEW)
 
 
@@ -89,17 +96,17 @@ class CheckFunctionTests(unittest.TestCase):
         self.assertEqual(qty_viols[0].severity, Severity.MUST_FIX)
         self.assertTrue(res.has_must_fix)
 
-    def test_money_drift_classified_as_review(self):
-        # 营业额 100 vs RHS 80+0+10+10+0+0 = 100. Inject 2 元 discount missing.
-        # Set sales_price=102, RHS still 100 → delta=2, rel=2% → NEEDS_REVIEW
-        res = check([clean_row(sales_price=102)], DEFAULT_IDENTITIES)
+    def test_money_one_satang_drift_must_fix(self):
+        # PR-B 7c: 金额恒等式零容差 (_exact_satang_classify). 营业额 +1 萨当 →
+        # RHS 仍 100 → delta=1 != 0 → MUST_FIX (不再有 NEEDS_REVIEW 容忍带).
+        res = check([clean_row(sales_price=101)], DEFAULT_IDENTITIES)
         money_viols = res.by_identity("金额恒等式")
         self.assertEqual(len(money_viols), 1)
-        self.assertEqual(money_viols[0].severity, Severity.NEEDS_REVIEW)
-        self.assertFalse(res.has_must_fix)
+        self.assertEqual(money_viols[0].severity, Severity.MUST_FIX)
+        self.assertTrue(res.has_must_fix)
 
     def test_money_huge_drift_must_fix(self):
-        # 营业额 500 vs RHS 100 → delta=400 (>100 AND >5%) → MUST_FIX
+        # 营业额 500 vs RHS 100 → delta=400 != 0 → MUST_FIX
         res = check([clean_row(sales_price=500)], DEFAULT_IDENTITIES)
         self.assertTrue(res.has_must_fix)
 
@@ -124,6 +131,7 @@ class CheckFunctionTests(unittest.TestCase):
             refund_amount=0,
             free_amount=0, give_amount=0, discount_amount=0,
             cancelled_amount=78,
+            gross_amount=78,         # = sales_price(0) + cancelled_amount(78)
         )
         res = check([row], DEFAULT_IDENTITIES)
         self.assertEqual(res.violations, [],
@@ -138,21 +146,37 @@ class CheckFunctionTests(unittest.TestCase):
             revenue=780,             # all active paid
             refund_amount=0, free_amount=0, give_amount=0, discount_amount=0,
             cancelled_amount=78,     # 2 × ¥39
+            gross_amount=858,        # = sales_price(780) + cancelled_amount(78)
         )
         res = check([row], DEFAULT_IDENTITIES)
         self.assertEqual(res.violations, [],
                          "active+cancelled mix in takeout must not fire amount identity")
 
     def test_filter_by_severity(self):
+        # PR-B 7c: DEFAULT_IDENTITIES 全零容差 (sum 型金额/销量 delta==0).
+        # 为同时演示 NEEDS_REVIEW + MUST_FIX 两桶过滤, 额外挂一条 banded
+        # 金额检查 (_money_classify, 仍有容忍带, 模拟 CROSS_LEDGER 类残差).
+        banded = Identity(
+            name="残差带宽检查",
+            description="banded 金额 (萨当) — 演示 NEEDS_REVIEW 桶",
+            lhs=lambda r: r["sales_price"],
+            rhs=lambda r: r["revenue"] + r["refund_amount"] + r["free_amount"]
+                          + r["give_amount"] + r["discount_amount"],
+            classify=_money_classify,
+            fields=("sales_price",),
+        )
+        # banded NEEDS_REVIEW: delta 500 萨当 (>100, <10000) 且 rel 0.5% (>0.1%, <5%)
+        review_row = clean_row(sales_price=100_000, revenue=99_500,
+                               free_amount=0, give_amount=0,
+                               gross_amount=100_000)
         rows = [
-            clean_row(),                              # clean
-            clean_row(sales_price=101.5),             # money NEEDS_REVIEW
-            clean_row(net_qty=7),                     # qty MUST_FIX
-            clean_row(sales_price=600),               # money MUST_FIX
+            clean_row(),                                  # clean
+            review_row,                                   # banded NEEDS_REVIEW
+            clean_row(net_qty=7),                         # qty MUST_FIX (SALES_QTY)
         ]
-        res = check(rows, DEFAULT_IDENTITIES)
+        res = check(rows, [SALES_QTY_IDENTITY, banded])
         self.assertEqual(len(res.by_severity(Severity.NEEDS_REVIEW)), 1)
-        self.assertEqual(len(res.by_severity(Severity.MUST_FIX)), 2)
+        self.assertEqual(len(res.by_severity(Severity.MUST_FIX)), 1)
 
 
 class IdentityIntegrityTests(unittest.TestCase):

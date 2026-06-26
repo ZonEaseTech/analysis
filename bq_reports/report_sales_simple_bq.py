@@ -19,6 +19,8 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from semantic.dimensions.time import assert_month_not_frozen
+
 from google.cloud import bigquery
 from google.oauth2.credentials import Credentials
 from openpyxl import Workbook
@@ -157,15 +159,31 @@ def process_one(args):
     }
 
 
+def _parse_force_flag():
+    """最小 argparse — 仅支持 --force, 其余 sys.argv 行为不变."""
+    import argparse
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--force", action="store_true",
+                   help="强制导出 (有 🔴 违反时打水印而非阻断)")
+    args, _ = p.parse_known_args()
+    return args.force
+
+
 def main():
+    # 技术债: 本脚本导出订单行明细, 行结构为 order_no×product_name, 缺少聚合销售桶字段,
+    # 无法跑 DEFAULT_IDENTITIES. 当前用基线恒等式 (必填+唯一) 替代.
+    # 升级路径: 若需对账, 改用 profit_margin_report 或在此加销售桶聚合.
+    force = _parse_force_flag()
+
     t0 = time.time()
     log("=" * 60)
     log("销售业绩明细表 (BigQuery 简化版)")
     log("=" * 60)
-    
+
     setup_proxy()
-    
+
     ym, start_ts, end_ts = get_time_range()
+    assert_month_not_frozen(ym)
     log(f"统计月份: {ym}")
     log(f"时间戳: {start_ts} ~ {end_ts}\n")
     
@@ -251,6 +269,28 @@ def main():
     for i, w in enumerate([12, 28, 18, 18, 45, 12, 10, 10, 12], 1):
         ws.column_dimensions[chr(64+i)].width = w
     ws.freeze_panes = 'A2'
+
+    from semantic.validators.gate import (
+        add_watermark_sheet_openpyxl, validate_and_gate)
+    from semantic.validators.identities import (
+        make_required_fields_identity, make_unique_key_identity)
+    uniq_ident, _prepare = make_unique_key_identity(
+        ("store_no", "order_no", "product_name"), name="店×订单×商品主键唯一")
+    _check_rows = _prepare([
+        {"store_no": str(r[0]), "order_no": str(r[2]), "product_name": r[4] or ""}
+        for r in all_data
+    ])
+    _outcome = validate_and_gate(
+        _check_rows,
+        [make_required_fields_identity(
+            ("store_no", "order_no", "product_name"), name="销售明细必填字段"),
+         uniq_ident],
+        force=force, report_name="report_sales_simple_bq",
+        row_label=lambda r: f"{r.get('store_no', '')} {r.get('order_no', '')} {r.get('product_name', '')}",
+    )
+    if _outcome.needs_watermark:
+        add_watermark_sheet_openpyxl(wb, _outcome.watermark_lines())
+
     wb.save(xlsx_path)
     
     elapsed = time.time() - t0

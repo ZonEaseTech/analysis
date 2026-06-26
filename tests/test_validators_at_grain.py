@@ -50,11 +50,13 @@ class IdentitiesAtPriceGrain(unittest.TestCase):
 
     def test_clean_per_price_row_passes_both_identities(self):
         events = [
-            # ¥10 tier: 100 sold cleanly, all收 collected, no losses
-            ev(price=10.0, qty=100, sales_price=1000, actual_amount=1000),
+            # ¥10 tier: 100 sold cleanly, all収 collected, no losses
+            ev(price=10.0, qty=100, sales_price=1000, actual_amount=1000,
+               gross_amount=1000),  # = sales_price(1000) + cancelled_amount(0)
             # ¥5 tier: 50 sold, ¥10 of refund (2 returned at ¥5 standard)
             ev(price=5.0, qty=50, sales_price=250, actual_amount=240,
-               refund_qty=2, refund_amount=10),
+               refund_qty=2, refund_amount=10,
+               gross_amount=250),   # = sales_price(250) + cancelled_amount(0)
         ]
         grouped = aggregate_by_grain(events, GRAIN, METRIC_COLUMNS)
         rows = derive_for_validation(grouped)
@@ -99,8 +101,10 @@ class IdentitiesAtChannelGrain(unittest.TestCase):
 
     def test_per_channel_row_passes(self):
         events = [
-            ev(price=10.0, channel="dine",    qty=60, sales_price=600, actual_amount=600),
-            ev(price=10.0, channel="takeout", qty=40, sales_price=400, actual_amount=400),
+            ev(price=10.0, channel="dine",    qty=60, sales_price=600, actual_amount=600,
+               gross_amount=600),   # = sales_price(600) + cancelled_amount(0)
+            ev(price=10.0, channel="takeout", qty=40, sales_price=400, actual_amount=400,
+               gross_amount=400),   # = sales_price(400) + cancelled_amount(0)
         ]
         grain = GRAIN + ["channel"]
         grouped = aggregate_by_grain(events, grain, METRIC_COLUMNS)

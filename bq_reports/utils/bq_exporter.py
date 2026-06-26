@@ -44,6 +44,7 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from .bq_client import get_bq_client, setup_proxy
 from .validators import DataValidator, ValidationChain, ValidationResult
 from .sql_templates import get_template
+from semantic.validators.gate import add_watermark_sheet_openpyxl, add_watermark_sheet_xlsxwriter
 
 
 @dataclass
@@ -108,6 +109,7 @@ class BaseExporter:
         self.client = client or get_bq_client()
         self.validators: List[DataValidator] = []
         self.excel_config = ExcelConfig()
+        self.gate_spec = None
     
     def set_validators(self, validators: Union[List[DataValidator], ValidationChain]):
         """设置校验器"""
@@ -116,6 +118,12 @@ class BaseExporter:
         else:
             self.validators = validators
     
+    def set_gate(self, gate_spec):
+        """零容差导出闸门 (semantic.validators.gate.GateSpec).
+        设置后写盘前强制过闸; 未设置 = 脚本必须以其他方式直调 validate_and_gate
+        (tests/test_validator_coverage.py 结构性强制)."""
+        self.gate_spec = gate_spec
+
     def set_excel_config(self, config: ExcelConfig):
         """设置 Excel 配置"""
         self.excel_config = config
@@ -217,7 +225,13 @@ class BaseExporter:
         # 冻结首行
         if cfg.freeze_header:
             ws.freeze_panes = 'A2'
-        
+
+        # 零容差闸门 (set_gate 设置后执行)
+        if self.gate_spec is not None:
+            outcome = self.gate_spec.run(data)
+            if outcome.needs_watermark:
+                add_watermark_sheet_openpyxl(wb, outcome.watermark_lines())
+
         wb.save(output_path)
         return output_path
 
@@ -351,8 +365,8 @@ class MultiShopExporter(BaseExporter):
         validation_result = None
         if self.validators and results:
             validation_result = self.validate(results)
-        
-        # 写入 Excel
+
+        # 写入 Excel (gate 在 write_excel 内部执行)
         output_file = self.write_excel(results)
         
         return ExportResult(
@@ -1029,6 +1043,14 @@ class ReportExporter(MultiShopExporter):
             key=lambda r: (_store_key(r), r.get("日期", ""), -float(r.get("净收金额", 0) or 0))
         )
 
+        # 零容差闸门 (set_gate 设置后执行; 主表 sales_results 为闸门输入).
+        # ⚠️ 必须在 xlsxwriter.Workbook() 构造之前: xlsxwriter 的落盘动作是
+        # close(), 若把 gate 放 try、close 放 finally, 则 gate 的 sys.exit(2)
+        # 触发后 finally 仍会 flush 一个无水印文件到盘 — 违反「🔴 且无 force →
+        # 不产文件」契约 (PR-A #24 review; 回归测试见 tests/test_bq_exporter_gate
+        # ::TestXlsxwriterGateNoFileLeak). 闸门只需 sales_results, 不依赖 workbook.
+        outcome = self.gate_spec.run(sales_results) if self.gate_spec is not None else None
+
         import xlsxwriter
         wb = xlsxwriter.Workbook(str(output_path))
         try:
@@ -1044,6 +1066,9 @@ class ReportExporter(MultiShopExporter):
                 ["门店编号", "门店名称", "支付方式", "渠道", "笔数", "收款总额", "退款金额", "净收金额"])
             self._write_data_sheet_xw(wb, "支付方式明细(按天)", payment_daily_results,
                 ["门店编号", "门店名称", "日期", "支付方式", "渠道", "笔数", "收款总额", "退款金额", "净收金额"])
+
+            if outcome is not None and outcome.needs_watermark:
+                add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
         finally:
             wb.close()
         
@@ -1260,9 +1285,16 @@ class ReportExporter(MultiShopExporter):
         
         ws2 = wb.create_sheet(title="未设置BOM")
         self._write_data_to_sheet(ws2, no_bom_data, ["账号", "商品名称", "分类", "销量"])
-        
+
+        # 零容差闸门 (set_gate 设置后执行; has_bom_data + no_bom_data 合并作为闸门输入)
+        if self.gate_spec is not None:
+            _all_bom_rows = has_bom_data + no_bom_data
+            outcome = self.gate_spec.run(_all_bom_rows)
+            if outcome.needs_watermark:
+                add_watermark_sheet_openpyxl(wb, outcome.watermark_lines())
+
         wb.save(output_path)
-        
+
         return ExportResult(
             total_count=len(self.merchants),
             success_count=len(self.merchants) - len(errors),
@@ -1368,11 +1400,17 @@ class ReportExporter(MultiShopExporter):
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        self._write_data_to_sheet(Workbook().active, results, ["账号", "BOM消耗量", "涉及销售金额", "采购入库量"])
         wb = Workbook()
         ws = wb.active
         ws.title = "原料经营明细"
         self._write_data_to_sheet(ws, results, ["账号", "BOM消耗量", "涉及销售金额", "采购入库量"])
+
+        # 零容差闸门 (set_gate 设置后执行)
+        if self.gate_spec is not None:
+            outcome = self.gate_spec.run(results)
+            if outcome.needs_watermark:
+                add_watermark_sheet_openpyxl(wb, outcome.watermark_lines())
+
         wb.save(output_path)
         
         return ExportResult(
@@ -1453,6 +1491,13 @@ class ReportExporter(MultiShopExporter):
         ws = wb.active
         ws.title = "单品日销量"
         self._write_data_to_sheet(ws, results, ["账号", "日期", "商品名称", "销量"])
+
+        # 零容差闸门 (set_gate 设置后执行)
+        if self.gate_spec is not None:
+            outcome = self.gate_spec.run(results)
+            if outcome.needs_watermark:
+                add_watermark_sheet_openpyxl(wb, outcome.watermark_lines())
+
         wb.save(output_path)
 
         return ExportResult(
@@ -1549,6 +1594,12 @@ class ReportExporter(MultiShopExporter):
 
         ws2 = wb.create_sheet(title="国籍汇总")
         self._write_data_to_sheet(ws2, summary, ["国籍", "总金额", "订单数"])
+
+        # 零容差闸门 (set_gate 设置后执行; orders 作为闸门输入)
+        if self.gate_spec is not None:
+            outcome = self.gate_spec.run(orders)
+            if outcome.needs_watermark:
+                add_watermark_sheet_openpyxl(wb, outcome.watermark_lines())
 
         wb.save(output_path)
 

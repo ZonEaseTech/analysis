@@ -32,6 +32,8 @@ from google.cloud import bigquery
 from google.oauth2.credentials import Credentials
 import xlsxwriter
 
+from semantic.dimensions.time import assert_month_not_frozen
+
 PROJECT_ID = "diyl-407103"
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "exports"
 
@@ -90,6 +92,8 @@ def parse_args():
     p.add_argument("--end", help="结束日期 YYYY-MM-DD (含)")
     p.add_argument("--workers", type=int, default=5, help="并发查询门店数")
     p.add_argument("--version", type=int, help="指定版本号；不传则自动递增")
+    p.add_argument("--force", action="store_true",
+                   help="强制导出 (有 🔴 违反时打水印而非阻断)")
     a = p.parse_args()
     if a.start and a.end:
         sd = datetime.strptime(a.start, "%Y-%m-%d").date()
@@ -101,7 +105,7 @@ def parse_args():
         sys.exit("start 不能晚于 end")
     st = int(datetime(sd.year, sd.month, sd.day, 0, 0, 0).timestamp())
     et = int(datetime(ed.year, ed.month, ed.day, 23, 59, 59).timestamp())
-    return sd, ed, st, et, a.workers, a.version
+    return sd, ed, st, et, a.workers, a.version, a.force
 
 
 def next_version(out_dir: Path, prefix: str) -> int:
@@ -475,8 +479,11 @@ def main():
     log("单品+套餐明细 销售统计 (BigQuery 版本)")
     log("=" * 60)
 
+    # 技术债: 本脚本行结构无 net_qty/refund_qty 等销售桶字段, 无法跑 DEFAULT_IDENTITIES.
+    # 当前用基线恒等式 (必填+唯一) 替代. 升级路径: 改 query_shop 输出完整桶字段.
     setup_proxy()
-    sd, ed, start_ts, end_ts, workers, version = parse_args()
+    sd, ed, start_ts, end_ts, workers, version, force = parse_args()
+    assert_month_not_frozen(sd.strftime("%Y-%m"))
     log(f"统计区间: {sd} ~ {ed}")
     log(f"时间戳:   {start_ts} ~ {end_ts}")
     log(f"门店数:   {len(STORE_LIST)}, 并发: {workers}\n")
@@ -568,6 +575,29 @@ def main():
     write_sheet(wb, ws_zh, "zh", rows_zh, fmt_header, fmt_text, fmt_qty, fmt_money)
     ws_en = wb.add_worksheet("English")
     write_sheet(wb, ws_en, "en", rows_en, fmt_header, fmt_text, fmt_qty, fmt_money)
+
+    from semantic.validators.gate import (
+        add_watermark_sheet_xlsxwriter, validate_and_gate)
+    from semantic.validators.identities import (
+        make_required_fields_identity, make_unique_key_identity)
+    uniq_ident, _prepare = make_unique_key_identity(
+        ("store_no", "sale_date", "row_type", "product_name"), name="店×日×类型×商品主键唯一")
+    _check_rows = _prepare([
+        {"store_no": str(r[0]), "sale_date": str(r[2]),
+         "row_type": r[3] or "", "product_name": r[5] or ""}
+        for r in rows_zh
+    ])
+    _outcome = validate_and_gate(
+        _check_rows,
+        [make_required_fields_identity(
+            ("store_no", "product_name"), name="周报必填字段"),
+         uniq_ident],
+        force=force, report_name="report_item_sales_weekly_bq",
+        row_label=lambda r: f"{r.get('store_no', '')} {r.get('sale_date', '')} {r.get('product_name', '')}",
+    )
+    if _outcome.needs_watermark:
+        add_watermark_sheet_xlsxwriter(wb, _outcome.watermark_lines())
+
     wb.close()
     log(f"Excel: {xlsx_path}")
 

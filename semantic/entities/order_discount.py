@@ -56,7 +56,8 @@ ot AS (
 )
 SELECT
   l.item_uuid AS item_uuid,
-  SUM(od.disc * SAFE_DIVIDE(l.rev, NULLIF(ot.tot, 0))) AS order_discount
+  -- 萨当整数化 (与 sale_event 一致, 唯一舍入点在输出层); net_received = actual_amount(萨当) − 本列
+  CAST(ROUND(SUM(od.disc * SAFE_DIVIDE(l.rev, NULLIF(ot.tot, 0))) * 100) AS INT64) AS order_discount
 FROM line l
 JOIN od ON od.so = l.so
 JOIN ot ON ot.so = l.so

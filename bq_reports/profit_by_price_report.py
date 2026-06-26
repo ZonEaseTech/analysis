@@ -47,7 +47,7 @@ from bq_reports.profit_margin_report import (
 )
 from bq_reports.utils.bq_client import setup_proxy
 from semantic.aggregations.by_grain import aggregate_by_grain
-from semantic.dimensions.time import month_to_ts_range
+from semantic.dimensions.time import month_to_ts_range, assert_month_not_frozen
 from semantic.entities import sale_event
 from semantic.entities.order_discount import order_discount_sql
 from semantic.entities.recursive_bom import (
@@ -327,9 +327,9 @@ def _load_order_discounts(engine, merchants, start_ts, end_ts):
     )
     disc = {}
     for row in raw_rows:
-        disc[(row.store_num, str(row.item_uuid))] = float(row.order_discount or 0)
+        disc[(row.store_num, str(row.item_uuid))] = int(row.order_discount or 0)  # 萨当整数
     total = sum(disc.values())
-    print(f"[Order Discount] 加载 {len(disc)} 个 (店,商品) 订单折扣分摊, 合计 ¥{total:,.2f} "
+    print(f"[Order Discount] 加载 {len(disc)} 个 (店,商品) 订单折扣分摊, 合计 ¥{total/100:,.2f} "
           f"(堂食 7 项: 券/会员/自定义/活动/赠送/积分/抹零)")
     if errors:
         print(f"[Order Discount] ⚠️ {len(errors)} 店查询失败: {errors[:3]}")
@@ -381,10 +381,10 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
 
         # #2 实收口径修正: 现有 actual_amount = 应收(成交价口径, 未减 7 项订单折扣)。
         # 真·实收 = 应收 − 订单级折扣分摊。订单折扣仅堂食 (外卖侧为 0)。
-        order_disc = float((order_discounts or {}).get(
-            (store_num, item_uuid_str), 0.0))
-        receivable = float(data["actual_amount"])     # 应收 (折前订单)
-        net_received = receivable - order_disc          # 真·实收
+        order_disc = int((order_discounts or {}).get(
+            (store_num, item_uuid_str), 0))             # 萨当整数
+        receivable = data["actual_amount"]             # 应收 (折前订单), 萨当整数
+        net_received = receivable - order_disc          # 真·实收 (萨当整数)
 
         # Top-N 价格档 + 其它销量
         price_tiers = data["price_tiers"]
@@ -394,15 +394,17 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             top_n.append((None, None))
 
         # SKU 级 prefix（merge: true，跨 BOM 行复制）
+        # 交易金额 (营业额/标准/实收/退款/取消) 是萨当整数, 列标 money_satang →
+        # 引擎写盘时 /100 还原成元 (PR-B 7b). 不在此 round (萨当整数已精确).
         prefix = [
             store_num,                              # 0  门店编号        A
             store_name,                             # 1  门店名称        B
             item_name,                              # 2  商品名称        C
             round(qty, 2),                          # 3  销量            D
             round(net_qty, 2),                      # 4  净销量          E
-            round(data["sales_price"], 2),          # 5  营业额          F
-            round(data["original_amount"], 2),      # 6  标准金额        G
-            round(net_received, 2),                 # 7  实收金额(真)    H  ★ = 应收 − 订单折扣
+            data["sales_price"],                    # 5  营业额(萨当)    F
+            data["original_amount"],                # 6  标准金额(萨当)  G
+            net_received,                           # 7  实收金额(真,萨当) H  ★ = 应收 − 订单折扣
             None, None, None,                       # 8-10 折损/客单实收/实收占比 (formula)
             # 价格档 5 对 + 其它销量
             (round(top_n[0][0], 2) if top_n[0][0] is not None else None),  # 11 售价1
@@ -419,9 +421,9 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             round(data["free_qty"], 2),             # 22 赠品数量        W
             round(data["give_qty"], 2),             # 23 赠送数量        X
             round(data["refund_qty"], 2),           # 24 退款数量        Y
-            round(data["refund_amount"], 2),        # 25 退款金额        Z
+            data["refund_amount"],                  # 25 退款金额(萨当)  Z
             round(data["cancelled_qty"], 2),        # 26 取消数量       AA
-            round(data["cancelled_amount"], 2),     # 27 取消金额       AB
+            data["cancelled_amount"],               # 27 取消金额(萨当) AB
         ]
         bom_list, bom_source, price_source = _bom_for_item(
             store_num, item_uuid_str, item_name,
@@ -433,9 +435,10 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
         )
 
         # 渠道分实收 — 用于算 3 项费用
+        # 边界: revenue_by_channel 是萨当 → 元, 进入估算域跟费率算 (PR-B 7b)
         rev_ch = revenue_by_channel.get((store_num, item_uuid_str), {})
-        revenue_dine = float(rev_ch.get("dine", 0))
-        revenue_takeout = float(rev_ch.get("takeout", 0))
+        revenue_dine = float(rev_ch.get("dine", 0)) / 100.0      # 萨当→元
+        revenue_takeout = float(rev_ch.get("takeout", 0)) / 100.0  # 萨当→元
         payment_fee = revenue_dine * dine_pay_rate
         service_fee_income = revenue_dine * dine_svc_rate
         # 平台抽佣: 优先用对账单事实费率 (该店真实综合费率)
@@ -460,8 +463,8 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             round(service_fee_income, 2),           # 42 服务费收入       AQ  (NEW)
             None,                                   # 43 净利润           AR  (formula)
             None,                                   # 44 净利率           AS  (formula)
-            round(receivable, 2),                   # 45 应收金额(折前)   AT  = 成交价口径, 未减订单折扣
-            round(order_disc, 2),                   # 46 订单级折扣       AU  = 7项营销减项分摊
+            receivable,                             # 45 应收金额(折前,萨当) AT  = 成交价口径, 未减订单折扣
+            order_disc,                             # 46 订单级折扣(萨当)    AU  = 7项营销减项分摊
         ]
 
         if not bom_list:
@@ -668,8 +671,11 @@ def main() -> int:
     parser.add_argument("--allow-bq-native-bom", action="store_true",
                         help="允许 fallback BQ 内置 BOM (默认禁用)。默认: BOM 只走 bom_sources, "
                              "缺失即标 BOM来源='无', 成本列空。")
+    parser.add_argument("--force", action="store_true",
+                        help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     args = parser.parse_args()
 
+    assert_month_not_frozen(args.month)
     setup_proxy()
     start_ts, end_ts = month_to_ts_range(args.month)
     # 自动版本号: 默认输出 exports/profit_by_price_{月}_v{N}.xlsx，每次升版。
@@ -797,6 +803,11 @@ def main() -> int:
               f"实收 {ext_rev_total:,.0f} 泰铢, "
               f"高置信 {ext_matched:,.0f} ({ext_matched/ext_rev_total*100:.1f}%)")
 
+    watermarked = False  # 多 mode 循环只打一次水印
+    from semantic.validators.gate import (
+        add_watermark_sheet_xlsxwriter, validate_and_gate)
+    from semantic.validators.identities import FULL_IDENTITIES
+
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = combo_sql_t if mode == "combo" else single_sql_t
@@ -872,7 +883,9 @@ def main() -> int:
         if not external_rows:
             print(f"[{item_label}] {len(flat_rows)} 行")
 
-        # Accounting-identity validation (per fine-grain key — finer = 更严)
+        # 零容差闸门: 校验恒等式 + sanity (FULL_IDENTITIES)
+        # fine-grain (店, SKU, price) 粒度检查 — 更严
+        # 闸门在 wb.close() 前执行 — 有 MUST_FIX 且无 --force 则 exit(2), 不落盘
         check_rows = [
             {
                 "store_num": k[0], "item_name": k[3], "price": k[4],
@@ -883,14 +896,14 @@ def main() -> int:
             }
             for k, v in grouped.items()
         ]
-        print(f"\n[{item_label}] 校验恒等式 + sanity …")
-        result = _timed("校验恒等式", lambda: check(check_rows, FULL_IDENTITIES))
-        print_result(
-            result,
+        outcome = _timed("校验恒等式", lambda: validate_and_gate(
+            check_rows, FULL_IDENTITIES,
+            force=args.force, report_name=f"profit_by_price/{item_label}",
             row_label=lambda r: f"店 {r['store_num']:>3}  {r['item_name']:<24}  @¥{r['price']}",
-        )
-        if result.has_must_fix:
-            print(f"⚠️  [{item_label}] 有 🔴 离谱违反，发出前请核实数据/口径。\n")
+        ))
+        if outcome.needs_watermark and not watermarked:
+            add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
+            watermarked = True
 
         # 业务合理性 sanity check（独立于会计恒等式）
         zero_cost = _timed("sanity check", lambda: _sanity_check_cost(
@@ -906,7 +919,8 @@ def main() -> int:
             print(f"   后果: 利润率显示为 100% (实际无意义)")
             for (k, q, actual) in sorted(zero_cost, key=lambda x: -x[2])[:10]:
                 # sku_key 现在是 (店编, 店名, item_uuid, SKU名)，已不含 price
-                print(f"   店 {k[0]:>3}  {k[3]:<28}  qty={q:>5.0f}  实收 ¥{actual:>10.0f}")
+                # actual 是萨当 → 元显示 (PR-B 7b)
+                print(f"   店 {k[0]:>3}  {k[3]:<28}  qty={q:>5.0f}  实收 ¥{actual/100.0:>10.0f}")
             if len(zero_cost) > 10:
                 print(f"   ⏬ 还有 {len(zero_cost)-10} 条略")
 

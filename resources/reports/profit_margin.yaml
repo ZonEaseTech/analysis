@@ -41,12 +41,12 @@ sheets:
          comment: "商品管理后台标价\nttpos_product_package.price，跟订单实际成交价无关"}
       - {name: "销量", field_index: 4, type: value, format: "0.00", merge: true, width: 10,
          comment: "总销量（堂食 + 外卖）\n堂食 = SUM(product_num)（含退款件、赠品、赠送）\n外卖 = SUM(quantity)（含 state=60 取消订单 — 跟 ttpos 后台口径一致）"}
-      - {name: "营业额", field_index: 5, type: value, format: "0.00", merge: true, width: 12, metric: gmv,
+      - {name: "营业额", field_index: 5, type: value, format: "0.00", merge: true, width: 12, metric: gmv, money_satang: true,
          comment: "营业额（标价口径）\n堂食 = SUM(product_sale_price × product_num)\n外卖 = SUM(IF state IN (10,20,30,40), price × qty, 0)\n→ 不含 state=60 取消订单，但含赠品/赠送/退款件"}
       - {name: "标准金额", field_index: 6, type: block_formula, format: "0.00", merge: true, width: 12,
          formula: "=D{row}*E{row}",
          comment: "标准金额 = 当前标价 × 销量\n当 ≠ 营业额 时说明商品改过价（实际录入价 ≠ 商品管理标价）"}
-      - {name: "实收金额", field_index: 7, type: value, format: "0.00", merge: true, width: 12, metric: net_sales,
+      - {name: "实收金额", field_index: 7, type: value, format: "0.00", merge: true, width: 12, metric: net_sales, money_satang: true,
          comment: "真实收入（SQL 直算）\n堂食 = SUM(IF 赠品/赠送>0, 0, 成交价 × (销量−退款数))\n外卖 = SUM(IF state IN (10,20,30,40), price × qty, 0)\n口径对齐 ttpos CountProductSale.actual_sale_amount"}
       - {name: "赠品数量", field_index: 9, type: value, format: "0.00", merge: true, width: 10,
          comment: "赠品件数\nstatistics_product.free_num；金额计 0"}
@@ -56,11 +56,11 @@ sheets:
       # === C. 退款 / 取消 ===
       - {name: "退款数量", field_index: 11, type: value, format: "0.00", merge: true, width: 10,
          comment: "退款件数（仅堂食）\nstatistics_product.refund_num"}
-      - {name: "退款金额", field_index: 12, type: value, format: "0.00", merge: true, width: 12, metric: refund_amount,
+      - {name: "退款金额", field_index: 12, type: value, format: "0.00", merge: true, width: 12, metric: refund_amount, money_satang: true,
          comment: "退款标价金额（仅堂食）\nSUM(product_sale_price × refund_num)；按标价计，不按成交价"}
       - {name: "取消数量", field_index: 32, type: value, format: "0.00", merge: true, width: 10,
          comment: "外卖取消订单件数\nIF(takeout_order.state = 60, quantity, 0) 累加；ttpos 销量含取消件，单独列出方便审计"}
-      - {name: "取消金额", field_index: 33, type: value, format: "0.00", merge: true, width: 12, metric: cancelled_amount,
+      - {name: "取消金额", field_index: 33, type: value, format: "0.00", merge: true, width: 12, metric: cancelled_amount, money_satang: true,
          comment: "外卖取消订单标价金额\nSUM(IF state=60, price × quantity, 0)\n这部分客户下单后取消，没产生营业额，是潜在损失"}
 
       # === C2. 审计列（标价口径 vs 真实收的差异，调价/赠送/折扣会显形）===
@@ -131,12 +131,12 @@ sheets:
          comment: "商品管理后台标价 ttpos_product_package.price"}
       - {name: "销量", field_index: 4, type: value, format: "0.00", merge: true, width: 10,
          comment: "总销量（堂食 + 外卖，含取消订单 + 退款件 + 赠品/赠送，跟 ttpos 后台一致）"}
-      - {name: "营业额", field_index: 5, type: value, format: "0.00", merge: true, width: 12, metric: gmv,
+      - {name: "营业额", field_index: 5, type: value, format: "0.00", merge: true, width: 12, metric: gmv, money_satang: true,
          comment: "营业额（标价口径）\n堂食 = sale_price × num；外卖 = state IN (10,20,30,40) 才算\n不含 state=60 取消"}
       - {name: "标准金额", field_index: 6, type: block_formula, format: "0.00", merge: true, width: 12,
          formula: "=D{row}*E{row}",
          comment: "标准金额 = 当前标价 × 销量\n≠ 营业额 时说明商品改过价"}
-      - {name: "实收金额", field_index: 7, type: value, format: "0.00", merge: true, width: 12, metric: net_sales,
+      - {name: "实收金额", field_index: 7, type: value, format: "0.00", merge: true, width: 12, metric: net_sales, money_satang: true,
          comment: "真实收入：堂食 IF(赠/送, 0, 成交价×(num−refund))；外卖 state IN (10,20,30,40) 才算\n口径对齐 ttpos CountProductSale.actual_sale_amount"}
       - {name: "赠品数量", field_index: 9, type: value, format: "0.00", merge: true, width: 10,
          comment: "赠品件数 free_num；金额计 0"}
@@ -145,11 +145,11 @@ sheets:
 
       - {name: "退款数量", field_index: 11, type: value, format: "0.00", merge: true, width: 10,
          comment: "退款件数（仅堂食 sp.refund_num）"}
-      - {name: "退款金额", field_index: 12, type: value, format: "0.00", merge: true, width: 12, metric: refund_amount,
+      - {name: "退款金额", field_index: 12, type: value, format: "0.00", merge: true, width: 12, metric: refund_amount, money_satang: true,
          comment: "退款标价金额 = SUM(sale_price × refund_num)，按标价计"}
       - {name: "取消数量", field_index: 32, type: value, format: "0.00", merge: true, width: 10,
          comment: "外卖取消订单件数 (state=60)；销量含此件数，单独列出方便审计"}
-      - {name: "取消金额", field_index: 33, type: value, format: "0.00", merge: true, width: 12, metric: cancelled_amount,
+      - {name: "取消金额", field_index: 33, type: value, format: "0.00", merge: true, width: 12, metric: cancelled_amount, money_satang: true,
          comment: "外卖取消订单标价金额 (state=60)；潜在收入损失（客户下单后取消）"}
 
       - {name: "标价应收", field_index: 30, type: block_formula, format: "0.00", merge: true, width: 12,

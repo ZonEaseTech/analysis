@@ -58,12 +58,12 @@ sheets:
       - {name: "净销量",     field_index: 4,  type: value, format: "0.00", merge: true, width: 9,
          comment: "= 销量 − 赠品 − 赠送 − 退款 − 取消（真正贡献了实收的件数）"}
 
-      - {name: "营业额",     field_index: 5,  type: value, format: "0.00", merge: true, width: 12,
+      - {name: "营业额",     field_index: 5,  type: value, format: "0.00", merge: true, width: 12, money_satang: true,
          comment: "= Σ(价格档 × 净销量)；所有价格档加权", hidden: true}
-      - {name: "标准金额",   field_index: 6,  type: value, format: "0.00", merge: true, width: 12,
+      - {name: "标准金额",   field_index: 6,  type: value, format: "0.00", merge: true, width: 12, money_satang: true,
          comment: "= 商品管理后台标价 × 销量；≠ 营业额 = 改价了", hidden: true}
-      - {name: "实收金额",   field_index: 7,  type: value, format: "0.00", merge: true, width: 14,
-         comment: "★ 真·实收 = 应收(AT,成交价) − 订单折扣(AU)。原口径把应收当实收, 已修正(#2)"}
+      - {name: "实收金额",   field_index: 7,  type: value, format: "0.00", merge: true, width: 14, money_satang: true,
+         comment: "★ 真·实收 = 应收(AT,成交价) − 订单折扣(AU)。原口径把应收当实收, 已修正(#2)；萨当整数"}
 
       - {name: "折损金额",   field_index: 8,  type: block_formula, format: "0.00", merge: true, width: 11,
          formula: "=F{block_start}-H{block_start}",
@@ -97,11 +97,11 @@ sheets:
          comment: "give_num: 营销赠送", hidden: true}
       - {name: "退款数量",   field_index: 24, type: value, format: "0.00", merge: true, width: 9,
          comment: "refund_num: 实卖后退款", hidden: true}
-      - {name: "退款金额",   field_index: 25, type: value, format: "0.00", merge: true, width: 11,
+      - {name: "退款金额",   field_index: 25, type: value, format: "0.00", merge: true, width: 11, money_satang: true,
          comment: "= 标价 × 退款数量", hidden: true}
       - {name: "取消数量",   field_index: 26, type: value, format: "0.00", merge: true, width: 9,
          comment: "仅外卖 state=60", hidden: true}
-      - {name: "取消金额",   field_index: 27, type: value, format: "0.00", merge: true, width: 11, hidden: true}
+      - {name: "取消金额",   field_index: 27, type: value, format: "0.00", merge: true, width: 11, hidden: true, money_satang: true}
 
       # BOM 5 列 — 每物料一行
       - {name: "BOM物品名称", field_index: 28, width: 22,
@@ -134,9 +134,9 @@ sheets:
          comment: "物料单价 来源 (priority 栈, 跟 BOM 数量解耦)\n  外挂层名 / uploaded_price_list / ERPNext / bq_native / 无 (strict)\n  多源用 ' + ' 拼接", hidden: true}
 
       # 实收口径修正 (#2): 应收 − 订单折扣 = 实收(H)
-      - {name: "应收金额",   field_index: 45, type: value, format: "0.00", merge: true, width: 13,
+      - {name: "应收金额",   field_index: 45, type: value, format: "0.00", merge: true, width: 13, money_satang: true,
          comment: "成交价口径 (= 原误标的'实收'), 未减 7 项订单折扣。应收 − 订单折扣 = 实收(H)"}
-      - {name: "订单级折扣", field_index: 46, type: value, format: "0.00", merge: true, width: 12,
+      - {name: "订单级折扣", field_index: 46, type: value, format: "0.00", merge: true, width: 12, money_satang: true,
          comment: "整单 7 项营销减项(券/会员/自定义/活动/赠送/积分/抹零)\n按订单内实收占比摊到本商品 (堂食)"}
 
       # 净利润口径 (支付手续费/平台抽佣/服务费/净利润/净利率) — 暂不交付
@@ -155,12 +155,12 @@ sheets:
          comment: "总销量（含赠/退/取，所有价格档累加）", hidden: true}
       - {name: "净销量",     field_index: 4,  type: value, format: "0.00", merge: true, width: 9,
          comment: "= 销量 − 赠品 − 赠送 − 退款 − 取消"}
-      - {name: "营业额",     field_index: 5,  type: value, format: "0.00", merge: true, width: 12,
+      - {name: "营业额",     field_index: 5,  type: value, format: "0.00", merge: true, width: 12, money_satang: true,
          comment: "= Σ(价格档 × 净销量)", hidden: true}
-      - {name: "标准金额",   field_index: 6,  type: value, format: "0.00", merge: true, width: 12,
+      - {name: "标准金额",   field_index: 6,  type: value, format: "0.00", merge: true, width: 12, money_satang: true,
          comment: "= 商品管理标价 × 销量", hidden: true}
-      - {name: "实收金额",   field_index: 7,  type: value, format: "0.00", merge: true, width: 14,
-         comment: "★ 真·实收 = 应收(AT,成交价) − 订单折扣(AU)。原口径把应收当实收, 已修正(#2)"}
+      - {name: "实收金额",   field_index: 7,  type: value, format: "0.00", merge: true, width: 14, money_satang: true,
+         comment: "★ 真·实收 = 应收(AT,成交价) − 订单折扣(AU)。原口径把应收当实收, 已修正(#2)；萨当整数"}
       - {name: "折损金额",   field_index: 8,  type: block_formula, format: "0.00", merge: true, width: 11,
          formula: "=F{block_start}-H{block_start}",
          comment: "= 营业额 − 实收", hidden: true}
@@ -189,11 +189,11 @@ sheets:
          comment: "give_num: 营销赠送", hidden: true}
       - {name: "退款数量",   field_index: 24, type: value, format: "0.00", merge: true, width: 9,
          comment: "refund_num: 实卖后退款", hidden: true}
-      - {name: "退款金额",   field_index: 25, type: value, format: "0.00", merge: true, width: 11,
+      - {name: "退款金额",   field_index: 25, type: value, format: "0.00", merge: true, width: 11, money_satang: true,
          comment: "= 标价 × 退款数量", hidden: true}
       - {name: "取消数量",   field_index: 26, type: value, format: "0.00", merge: true, width: 9,
          comment: "仅外卖 state=60", hidden: true}
-      - {name: "取消金额",   field_index: 27, type: value, format: "0.00", merge: true, width: 11, hidden: true}
+      - {name: "取消金额",   field_index: 27, type: value, format: "0.00", merge: true, width: 11, hidden: true, money_satang: true}
       - {name: "BOM物品名称", field_index: 28, width: 22,
          comment: "原材料中文名 (ttpos_material.name $.zh)"}
       - {name: "BOM物品编码", field_index: 29, width: 13,
@@ -221,8 +221,8 @@ sheets:
       - {name: "价来源",     field_index: 39, merge: true, width: 24,
          comment: "物料单价 来源 (priority 栈, 跟 BOM 数量解耦)", hidden: true}
       # 实收口径修正 (#2): 应收 − 订单折扣 = 实收(H)
-      - {name: "应收金额",   field_index: 45, type: value, format: "0.00", merge: true, width: 13,
+      - {name: "应收金额",   field_index: 45, type: value, format: "0.00", merge: true, width: 13, money_satang: true,
          comment: "成交价口径 (= 原误标的'实收'), 未减 7 项订单折扣。应收 − 订单折扣 = 实收(H)"}
-      - {name: "订单级折扣", field_index: 46, type: value, format: "0.00", merge: true, width: 12,
+      - {name: "订单级折扣", field_index: 46, type: value, format: "0.00", merge: true, width: 12, money_satang: true,
          comment: "整单 7 项营销减项(券/会员/自定义/活动/赠送/积分/抹零)\n按订单内实收占比摊到本商品 (堂食)"}
       # 净利润口径 — 暂不交付 (同套餐 sheet, 见上方注释)

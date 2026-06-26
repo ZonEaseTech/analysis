@@ -33,24 +33,25 @@ from semantic.resolvers import DictProvider, Resolver
 
 class AggregateByChannelTests(unittest.TestCase):
     def test_dine_and_takeout_summed(self):
+        # 金额是萨当 (×100); aggregate 在边界 /100 转元
         rows = [
-            {"channel": "dine", "qty": 10, "sales_price": 100,
-             "actual_amount": 90, "refund_amount": 5, "free_amount": 3,
-             "give_amount": 2, "discount_amount": 0, "cancelled_amount": 0},
-            {"channel": "takeout", "qty": 5, "sales_price": 60,
-             "actual_amount": 60, "refund_amount": 0, "free_amount": 0,
-             "give_amount": 0, "discount_amount": 0, "cancelled_amount": 10},
+            {"channel": "dine", "qty": 10, "sales_price": 10000,
+             "actual_amount": 9000, "refund_amount": 500, "free_amount": 300,
+             "give_amount": 200, "discount_amount": 0, "cancelled_amount": 0},
+            {"channel": "takeout", "qty": 5, "sales_price": 6000,
+             "actual_amount": 6000, "refund_amount": 0, "free_amount": 0,
+             "give_amount": 0, "discount_amount": 0, "cancelled_amount": 1000},
         ]
         out = aggregate_sales_by_channel(rows)
 
-        # 总数 = 两 channel 之和
+        # 总数 = 两 channel 之和 (元)
         self.assertEqual(out["qty"], 15)
         self.assertEqual(out["sales_price"], 160)
         self.assertEqual(out["actual_amount"], 150)
         self.assertEqual(out["refund_amount"], 5)
         self.assertEqual(out["cancelled_amount"], 10)
 
-        # 渠道拆分
+        # 渠道拆分 (元)
         self.assertEqual(out["dine_qty"], 10)
         self.assertEqual(out["dine_sales_price"], 100)
         self.assertEqual(out["takeout_qty"], 5)
@@ -66,8 +67,8 @@ class AggregateByChannelTests(unittest.TestCase):
     def test_unknown_channel_only_contributes_to_totals(self):
         """channel 不是 dine/takeout 的 row 只算总数, 不拆渠道."""
         rows = [
-            {"channel": "unknown", "qty": 100, "sales_price": 1000,
-             "actual_amount": 1000},
+            {"channel": "unknown", "qty": 100, "sales_price": 100000,
+             "actual_amount": 100000},   # 萨当 → 1000 元
         ]
         out = aggregate_sales_by_channel(rows)
         self.assertEqual(out["qty"], 100)
@@ -82,14 +83,18 @@ class AggregateByChannelTests(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════
 
 def _make_realistic_rows():
-    """模拟一份真实月度 sale_event 数据 (跨 channel)."""
+    """模拟一份真实月度 sale_event 数据 (跨 channel).
+
+    交易金额是萨当整数 (PR-B 7b): aggregate_sales_by_channel 在边界 /100 转元,
+    故 fixture 值 = 期望元值 × 100 (e.g. 50000 元 → 5_000_000 萨当).
+    """
     return [
-        {"channel": "dine", "qty": 1000, "sales_price": 50000,
-         "actual_amount": 45000, "refund_amount": 1500, "cancelled_amount": 0,
-         "free_amount": 800, "give_amount": 500, "discount_amount": 2200,
+        {"channel": "dine", "qty": 1000, "sales_price": 5_000_000,
+         "actual_amount": 4_500_000, "refund_amount": 150_000, "cancelled_amount": 0,
+         "free_amount": 80_000, "give_amount": 50_000, "discount_amount": 220_000,
          "order_count": 600},
-        {"channel": "takeout", "qty": 400, "sales_price": 24000,
-         "actual_amount": 24000, "refund_amount": 0, "cancelled_amount": 1000,
+        {"channel": "takeout", "qty": 400, "sales_price": 2_400_000,
+         "actual_amount": 2_400_000, "refund_amount": 0, "cancelled_amount": 100_000,
          "free_amount": 0, "give_amount": 0, "discount_amount": 0,
          "order_count": 200},
     ]
@@ -149,8 +154,8 @@ class BuildPnlArtifactTests(unittest.TestCase):
     def test_mom_with_previous_pnl(self):
         previous = build_pnl_artifact(
             period="2026-03", scope="Test", sales_rows=[
-                {"channel": "dine", "qty": 800, "sales_price": 40000,
-                 "actual_amount": 36000},
+                {"channel": "dine", "qty": 800, "sales_price": 4_000_000,
+                 "actual_amount": 3_600_000},   # 萨当 → 40000/36000 元
             ],
         )["pnl"]
         current = build_pnl_artifact(
@@ -188,8 +193,8 @@ class WritePnlExcelTests(unittest.TestCase):
         previous = build_pnl_artifact(
             period="2026-03", scope="Test",
             sales_rows=[{"channel": "dine", "qty": 800,
-                         "sales_price": 40000, "actual_amount": 36000}],
-        )["pnl"]
+                         "sales_price": 4_000_000, "actual_amount": 3_600_000}],
+        )["pnl"]   # 萨当 → 40000/36000 元
         return build_pnl_artifact(
             period="2026-04", scope="全集团",
             sales_rows=_make_realistic_rows(),
@@ -295,19 +300,20 @@ class WritePnlExcelTests(unittest.TestCase):
 
         # Mock per_store_artifacts (用 store_num attribute 兼容 BQ Row 形式)
         from types import SimpleNamespace
+        # 交易金额萨当 (×100); _per_store_artifacts → aggregate 在边界 /100 转元
         store_rows = [
             SimpleNamespace(
                 store_num="001", store_name="Test Store A",
-                channel="dine", qty=100, sales_price=5000,
-                actual_amount=4500, refund_amount=200, free_amount=50,
-                give_amount=30, discount_amount=220, cancelled_amount=0,
+                channel="dine", qty=100, sales_price=500000,
+                actual_amount=450000, refund_amount=20000, free_amount=5000,
+                give_amount=3000, discount_amount=22000, cancelled_amount=0,
                 order_count=80,
             ),
             SimpleNamespace(
                 store_num="001", store_name="Test Store A",
-                channel="takeout", qty=40, sales_price=2400,
-                actual_amount=2400, refund_amount=0, free_amount=0,
-                give_amount=0, discount_amount=0, cancelled_amount=100,
+                channel="takeout", qty=40, sales_price=240000,
+                actual_amount=240000, refund_amount=0, free_amount=0,
+                give_amount=0, discount_amount=0, cancelled_amount=10000,
                 order_count=20,
             ),
         ]

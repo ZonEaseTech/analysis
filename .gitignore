@@ -48,6 +48,8 @@ env/
 # Exports directory (generated reports)
 exports/*
 !exports/.gitkeep
+# 双跑快照 (整数化验收用, 仅本地保留)
+exports/.dual_run/
 
 # Resources directory (input data files)
 # 数据文件 ignore，但配置 YAML / reports 子目录跟着代码一起走

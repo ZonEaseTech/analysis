@@ -18,6 +18,8 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from semantic.dimensions.time import assert_month_not_frozen
+
 from google.cloud import bigquery
 from google.oauth2.credentials import Credentials
 from openpyxl import Workbook
@@ -226,20 +228,36 @@ def process_one(args):
     }
 
 
+def _parse_force_flag():
+    """最小 argparse — 仅支持 --force, 其余 sys.argv 行为不变."""
+    import argparse
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--force", action="store_true",
+                   help="强制导出 (有 🔴 违反时打水印而非阻断)")
+    args, _ = p.parse_known_args()
+    return args.force
+
+
 def main():
+    # 技术债: 本脚本行结构为 (store_no, store_name, date, product_name, qty),
+    # 缺少 net_qty/refund_qty 等销售桶字段, 无法跑 DEFAULT_IDENTITIES.
+    # 当前用基线恒等式 (必填+唯一) 替代. 升级路径: 改 query_daily_sales 加桶字段.
+    force = _parse_force_flag()
+
     t0 = time.time()
     log("=" * 60)
     log("华莱士门店单品销量按日明细 (BigQuery 版本)")
     log("=" * 60)
-    
+
     setup_proxy()
-    
+
     ym, start_ts, end_ts = get_time_range()
+    assert_month_not_frozen(ym)
     log(f"统计月份: {ym}")
     log(f"时间戳: {start_ts} ~ {end_ts}\n")
-    
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     # 获取所有门店数据集
     client = bigquery.Client(project=PROJECT_ID, credentials=get_creds())
     all_datasets = [d.dataset_id for d in client.list_datasets() if d.dataset_id.startswith("shop")]
@@ -325,6 +343,28 @@ def main():
     for i, w in enumerate([12, 28, 12, 40, 14], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = 'A2'
+
+    from semantic.validators.gate import (
+        add_watermark_sheet_openpyxl, validate_and_gate)
+    from semantic.validators.identities import (
+        make_required_fields_identity, make_unique_key_identity)
+    uniq_ident, _prepare = make_unique_key_identity(
+        ("store_no", "sale_date", "product_name"), name="店×日×商品主键唯一")
+    _check_rows = _prepare([
+        {"store_no": str(r[0]), "sale_date": str(r[2]), "product_name": r[3] or ""}
+        for r in all_data
+    ])
+    _outcome = validate_and_gate(
+        _check_rows,
+        [make_required_fields_identity(
+            ("store_no", "product_name"), name="按日销量必填字段"),
+         uniq_ident],
+        force=force, report_name="report_daily_item_sales_bq",
+        row_label=lambda r: f"{r.get('store_no', '')} {r.get('sale_date', '')} {r.get('product_name', '')}",
+    )
+    if _outcome.needs_watermark:
+        add_watermark_sheet_openpyxl(wb, _outcome.watermark_lines())
+
     wb.save(xlsx_path)
     xlsx_elapsed = time.time() - xlsx_start
     log(f"Excel 生成耗时: {xlsx_elapsed:.2f} 秒")

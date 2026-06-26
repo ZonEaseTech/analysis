@@ -110,25 +110,26 @@ analysis/
 
 ### 3. 导出必须接校验器（无例外）
 
-**任何把数据写到 Excel/CSV 的报表脚本，导出阶段必须跑 `semantic/validators/`，
-console 至少打印 ✅/🟡/🔴 三级摘要。** 这是为了：
+**任何把数据写到 Excel/CSV 的报表脚本，导出阶段必须跑 `semantic/validators/`。**
+这是为了：
 
 - **可审计**：数据出问题时一眼看出"是源 / 聚合 / 落盘哪一层错了"
 - **对账闭环**：中间表 (`profit_margin`) 跟交付物 (`profit_by_price` 等) 共享同一份
   identities，任一边违反恒等式立即在 console 里冒出来
 - **拒绝胡编乱造**：客户/老板拿到的每个数字背后都有数学保证，不是"看起来差不多"
 
-#### 最小集成（4 行 + 一个字典构造）
+#### 最小集成（闸门语义，非建议性）
 
 ```python
-from semantic.validators import check, print_result
-from semantic.validators.identities import DEFAULT_IDENTITIES
+from semantic.validators.gate import validate_and_gate, add_watermark_sheet_xlsxwriter
+from semantic.validators.identities import FULL_IDENTITIES
 
-check_rows = [{"store_num": ..., "item_name": ..., **agg_metrics} for ...]
-result = check(check_rows, DEFAULT_IDENTITIES)
-print_result(result, row_label=lambda r: f"店 {r['store_num']}  {r['item_name']}")
-if result.has_must_fix:
-    print("⚠️  有 🔴 离谱违反，请核实数据/口径。")
+outcome = validate_and_gate(check_rows, FULL_IDENTITIES,
+                            force=args.force, report_name="my_report",
+                            row_label=lambda r: f"店 {r['store_num']}")
+# 有 🔴 且无 --force → 已在函数内 exit 2, 不产出文件
+if outcome.needs_watermark:   # --force 强制导出
+    add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
 ```
 
 `check_rows` 里 row 必须包含 identities 用到的字段：
@@ -138,6 +139,15 @@ if result.has_must_fix:
 
 新报表如果有新维度/新指标，**新加 identity** 到 `semantic/validators/identities.py`，
 不要写"特殊容忍"在报表脚本里——所有口径只在 identities 文件里收口。
+
+**"无例外"是机制不是口号**:`tests/test_validator_coverage.py` AST 扫描
+`bq_reports/*.py`,不接闸门(直调 `validate_and_gate` 或经 `GateSpec` 走
+bq_exporter 集中式钩子)的脚本直接挂测试。
+校验失败默认 exit 2 不产出文件;`--force` 强制导出的文件首页带红色水印
+"⚠️校验未通过",不得对外交付。
+非销售类导出(BOM/菜单)用 `make_required_fields_identity` /
+`make_unique_key_identity` 基线,不许裸奔;空表语义按 sheet 判定
+(`min_rows=0` 仅用于"空=好状态/空=合法"的诊断类数据集,代码内注释说明)。
 
 #### 现成可复用的报表模式
 
@@ -176,3 +186,32 @@ BQ_PROXY=http://127.0.0.1:7897 venv/bin/python -m bq_reports.profit_margin_repor
 ```
 
 `bq_client.setup_proxy()` 和各报表脚本里的同名函数都会读 `BQ_PROXY`，未设置时为 no-op。
+
+### 5.5 历史封存(零容差口径切换线)
+
+**封存线 = 2026-06**。2026-05 及之前的月份为旧浮点口径交付物,**永不重算**
+(`semantic/dimensions/time.py: assert_month_not_frozen`,报表入口拒跑 exit 3)。
+新旧口径数字不可逐分比较;只读对账/审计查询不受限。
+依据:spec 决策 2/3(`docs/superpowers/specs/2026-06-12-zero-tolerance-design.md`)。
+
+### 6. 技术债清单(零容差改造)
+
+spec: `docs/superpowers/specs/2026-06-12-zero-tolerance-design.md`
+基线: `docs/audit/2026-06-cross-ledger-baseline.md`
+
+**整数化边界声明**:零容差的数学保证(sum 型金额恒等式 `delta==0`)覆盖**语义层管线**
+(semantic/entities CTE + profit_margin/profit_by_price/report_sales_period/pnl_statement);
+交易金额在 CTE 输出层 `CAST(ROUND(x*100) AS INT64)` 转萨当 INT64,唯一舍入点,加法精确,
+Excel 写盘 `money_satang` 列 `/100` 还原。估算域(物料单价 4dp / 套餐权重 / 费率 / COGS /
+利润 / 比率)保持 float,不参与零容差恒等式。手写 SQL 报表(bq_exporter 系 / standalone 系)
+不在整数化边界内,走基线恒等式(必填/主键唯一),金额仍 float。
+
+| # | 债 | 还债条件 |
+|---|---|---|
+| ① | ~~2026-05 前旧口径封存待机制化~~ | ✅ 已还: month guard (semantic/dimensions/time.py), 2026-06-13 |
+| ② | 支付勾稽封顶 🟡;根因已查明: `bill.payment_amount` 仅含堂食 POS 收款, 外卖在平台侧支付不经 sale_bill, 故 `payment_amount ≈ stat_actual_dine`(实测 shop001/005/010 缺口 ±0.2~2.5%) | 接外卖平台对账单(子项目 D)后补外卖支付侧, 方可对账全渠道实收 |
+| ③ | 外卖平台侧退款不在恒等式内 | 对账桥范围, 子项目 D 接平台对账单后 |
+| ④ | sale_event / sale_line 双轨并存(gross_amount 投影已还前半) | ✅ 前半已还: sale_line/takeout_line/total_line 投影 gross_amount, profit_margin/sales_period 毛额守恒转真校验 (PR-B Task 4); 后半双轨合并待 CROSS_LEDGER 达零容差 |
+| ⑤ | ~~pnl_statement 只接非空闸门~~ | ✅ 已还: pnl_statement 店粒度接 DEFAULT_IDENTITIES, 60 店真数据全绿 (PR-B Task 5) |
+| ⑥ | CROSS_LEDGER 维持观察模式(分支 c): 凭证账已补外卖路径(PR-C), qty 31.5%→45.5%→**89.5%**; 残余 ~10.5% 为结构天花板 = ttpos 后端 sp/sop 写入路径不对称(凭证记录了统计漏记的销售, 方向 voucher>stat; PR-B "月界时间语义"假设已被 PR-C 实测推翻——shop018 月界 0 跨窗行)+ 未映射外卖商品(is_mapped=0)+ 促销码单账本路径(PEPSIMCK 类) | ≥99% 不可达且后端问题 BQ 层不可解; 完全闭合需 ttpos 后端 sp 写入可靠性调查(本仓库范围外)。CROSS_LEDGER 不进闸门: 避免 ~10% 不可控残差天天误报 / 稀释闸门可信度(零容差核心=响警报即真错) |
+| ⑦ | ~~外卖勾稽 2 单偏差未归因~~ | ✅ 已归因: shop006/3733164293885953 = 未映射商品 item_sum 不全(+99); shop059/3728170758965263 = 配送费在 platform_total 不在 subtotal(+89)。takeout_tieout 口径待补配送费项 |

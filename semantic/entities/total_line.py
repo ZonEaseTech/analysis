@@ -12,6 +12,10 @@ choices that are surprisingly easy to get wrong:
 Depends on (as upstream CTEs in the same WITH clause):
   - shop_sales      (semantic/entities/sale_line.shop_sales_cte)
   - takeout_sales   (semantic/entities/takeout_line.takeout_sales_cte)
+
+金额单位: 萨当 (上游 sale_line/takeout_line 已整数化 INT64). 本 CTE 只做
+IFNULL 加法, 不再 ×100、不再舍入 — 萨当整数加法精确零误差 (spec §6 B).
+唯一例外 avg_member_discount 是 qty 加权比率, 仍 float (估算域).
 """
 
 
@@ -25,6 +29,8 @@ def merged_cte() -> str:
     IFNULL(s.actual_amount, 0) + IFNULL(t.actual_amount, 0) AS revenue,
     -- 营业额：标价×销量
     IFNULL(s.sales_price, 0) + IFNULL(t.sales_price, 0) AS sales_price,
+    -- 毛额 (守恒闭环锚): shop 端无 state + takeout 端 state-UNCONDITIONED 全量
+    IFNULL(s.gross_amount, 0) + IFNULL(t.gross_amount, 0) AS gross_amount,
     IFNULL(s.original_amount, 0) + IFNULL(t.original_amount, 0) AS original_amount,
     IFNULL(s.refund_qty, 0) + IFNULL(t.refund_qty, 0) AS refund_qty,
     IFNULL(s.refund_amount, 0) + IFNULL(t.refund_amount, 0) AS refund_amount,

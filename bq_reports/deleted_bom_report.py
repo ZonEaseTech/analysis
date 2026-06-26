@@ -289,7 +289,45 @@ def _write_single_sheet(ws, rows, store_name: str):
     ws.freeze_panes = "A2"
 
 
-def write_excel(combo_rows, single_rows, store_name: str, output_path: str):
+def write_excel(combo_rows, single_rows, store_name: str, output_path: str,
+                force: bool = False):
+    from semantic.validators.gate import (
+        add_watermark_sheet_openpyxl, validate_and_gate)
+    from semantic.validators.identities import (
+        make_required_fields_identity, make_unique_key_identity)
+
+    outcomes = []
+
+    # Sheet 1「已删除套餐组成」: 已删除套餐的组成明细 — 空=可能合法(当月无已删除套餐), min_rows=0
+    combo_check_rows = [
+        {"combo_name": r.combo_name or "", "child_name": r.child_name or ""}
+        for r in combo_rows
+    ]
+    outcomes.append(validate_and_gate(
+        combo_check_rows,
+        [make_required_fields_identity(("combo_name", "child_name"), name="已删除套餐组成必填")],
+        force=force, report_name="deleted_bom/combo",
+        row_label=lambda r: f"{r.get('combo_name', '')} / {r.get('child_name', '')}",
+        min_rows=0,  # 空=可能合法(当月无已删除套餐)
+    ))
+
+    # Sheet 2「已删除单品BOM」: 已删除单品及其 BOM 明细 — 空=可能合法(当月无已删除单品), min_rows=0
+    uniq_ident, prepare = make_unique_key_identity(
+        ("product_name", "material_name"), name="商品+物料主键唯一")
+    check_rows = prepare([
+        {"product_name": r.product_name or "", "material_name": r.material_name or ""}
+        for r in single_rows
+    ])
+    outcomes.append(validate_and_gate(
+        check_rows,
+        [make_required_fields_identity(
+            ("product_name",), name="已删除BOM必填字段"),
+         uniq_ident],
+        force=force, report_name="deleted_bom/single",
+        row_label=lambda r: f"{r.get('product_name', '')} / {r.get('material_name', '')}",
+        min_rows=0,  # 空=可能合法(当月无已删除单品)
+    ))
+
     wb = Workbook()
 
     ws_combo = wb.active
@@ -298,6 +336,10 @@ def write_excel(combo_rows, single_rows, store_name: str, output_path: str):
 
     ws_single = wb.create_sheet("已删除单品BOM")
     _write_single_sheet(ws_single, single_rows, store_name)
+
+    if any(o.needs_watermark for o in outcomes):
+        first_wm = next(o for o in outcomes if o.needs_watermark)
+        add_watermark_sheet_openpyxl(wb, first_wm.watermark_lines())
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -322,6 +364,8 @@ def parse_args():
                    help=f"删除时间截止 Unix 时间戳(默认 {DEFAULT_END_TS}=2026-04-01)")
     p.add_argument("--output", required=True,
                    help=f"输出 Excel 文件路径(自动追加版本号 _{REPORT_VERSION})")
+    p.add_argument("--force", action="store_true",
+                   help="强制导出 (有 🔴 违反时打水印而非阻断)")
     return p.parse_args()
 
 
@@ -361,7 +405,7 @@ def main():
             seen.add(r.product_uuid)
     print(f"[BQ] 单品: {len(single_rows)} 行 (有BOM {len(with_bom)} 行, 无BOM {len(no_bom)} 个)")
 
-    write_excel(combo_rows, single_rows, store_name, output_path)
+    write_excel(combo_rows, single_rows, store_name, output_path, force=args.force)
 
     print(f"[完成] 输出 {output_path}")
     print(f"  Sheet 1「已删除套餐组成」: {len(combo_rows)} 行, {len(unique_combos)} 个套餐")
