@@ -11,6 +11,37 @@
 
 参见决策稿：`docs/superpowers/specs/2026-06-26-bom-pipeline-refactor-design.md`。
 
+## 1.5 数据源谱系 — `clean_bom.csv` 从哪来
+
+`clean_bom.csv` 是本流程的 BOM 单源，但它本身是一条**多轮迭代**的产物，不是一次成型：
+
+```
+ERP（ERPNext）──直接 load──▶ 初版全量 BOM（配方 + 物料 + 单价，按商品×物料展开）
+                                  │
+                                  ▼  反复人工纠正、改来改去（缺配方补、错物料删、渠道拆、单价对）
+        历代 xlsx（按时间，均已归档 exports/_archive/）：
+          Wallace_全量BOM_..._v26_脚本真源2.xlsx        (06-23, ~4493 行)
+            └─ _已修正.xlsx
+          clean_bom 1.xlsx                              (06-24, ~4470)
+          bom表.xlsx / bom表1.xlsx                       (06-24, ~4465/4467)
+          bom纠正.xlsx                                   (06-22, 3 行人工补丁)
+          bom_with_erp_price.xlsx                        (06-25 10:02, 加 ERP 价格列)
+          bom_with_erp_price_v4.xlsx                     (06-25 10:17, 价格定版)
+                                  │
+                                  ▼  落规范单源
+                       resources/wallace.20260626/clean_bom.csv  (4466 行 / 14 列)
+```
+
+要点：
+
+- **配方初始来自 ERP 直接 load**（ERPNext）：物料、配方结构、采购单价都从 ERP 拉出来铺成全量 BOM。
+- **之后反复人工改**：补缺配方、删错物料、按堂食/外卖拆渠道、对单价。过程**非线性**，
+  每一版 xlsx 是一次手工迭代的快照，具体改动散落在这些文件里（已全部归档 `exports/_archive/`，未删，可回溯）。
+- **价格列**是其中 ERP 拉取 + 复刻算法（见 §4）那条支线的产物：`基价(原始)→×(1+margin)→×(1+税率)→ERPNext新单价`，
+  最终写进 `clean_bom.csv` 的「物料单价」列。`clean_bom.csv` 已完整承接 `bom_with_erp_price_v4`（0 差异）。
+- **往后这一段才是本文档 §3 起讲的可复跑流程**；本节这段上游是人工迭代史，靠归档 xlsx + git 回溯，
+  不进自动管线。新月份要重建 BOM 时，应从 ERP 重新 load 起、而非手改这些历史 xlsx。
+
 ## 2. 目录结构
 
 ```
