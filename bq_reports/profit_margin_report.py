@@ -220,8 +220,8 @@ def _load_uploaded_prices(excel_path: str) -> tuple[dict, dict]:
 
 
 def _try_load_erp_prices(price_list: str = None, cache_ttl: int = 3600):
-    from bq_reports.utils.erpnext_api import load_erpnext_prices
-    key = cache_key("erpnext_prices", {"price_list": price_list or "Standard Buying"})
+    from bq_reports.utils.erpnext_api import load_erpnext_prices, COST_PROFIT_PRICE_LIST
+    key = cache_key("erpnext_prices", {"price_list": price_list or COST_PROFIT_PRICE_LIST})
     
     # 1) 先尝试缓存（正常 TTL）
     cached = get_cache(key, ttl_seconds=cache_ttl)
@@ -1425,7 +1425,7 @@ def main():
     parser.add_argument("--project", default="diyl-407103", help="GCP 项目 ID")
     parser.add_argument("--use-erp-price", action="store_true", default=True, help="启用 ERPNext Item Price 替换 BQ 成本（默认开启）")
     parser.add_argument("--no-erp-price", action="store_true", help="禁用 ERPNext 价格，使用 BQ 内置价格")
-    parser.add_argument("--erp-price-list", default=None, help="ERPNext 价格表名称，默认 Standard Buying")
+    parser.add_argument("--erp-price-list", default=None, help="ERPNext 价格表名称，默认 Buying - Internal (对齐 ttpos 成本毛利口径)")
     parser.add_argument("--config", default=None, help="资源配置 YAML 路径")
     parser.add_argument("--column-config", default="resources/reports/profit_margin.yaml", help="列配置 YAML 路径")
     parser.add_argument("--price-list", default=None, help="上传的物料价格清单 Excel 路径（最高优先级）")

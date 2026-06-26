@@ -43,7 +43,8 @@ class ErpPriceFallbackTests(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_fresh_cache_short_circuits_api(self):
-        key = cache_mod.cache_key("erpnext_prices", {"price_list": "Standard Buying"})
+        # cache key 需与 _try_load_erp_prices 默认使用的 COST_PROFIT_PRICE_LIST 一致
+        key = cache_mod.cache_key("erpnext_prices", {"price_list": "Buying - Internal"})
         cache_mod.set_cache(key, {"M1": (1.5, "kg")})
 
         with mock.patch("bq_reports.utils.erpnext_api.load_erpnext_prices") as mock_api:
@@ -68,7 +69,8 @@ class ErpPriceFallbackTests(unittest.TestCase):
     def test_api_failure_falls_back_to_stale_cache(self):
         """Headline behaviour of the recent change — keep customer reports
         generating during ERPNext outages."""
-        key = cache_mod.cache_key("erpnext_prices", {"price_list": "Standard Buying"})
+        # cache key 需与 _try_load_erp_prices 默认使用的 COST_PROFIT_PRICE_LIST 一致
+        key = cache_mod.cache_key("erpnext_prices", {"price_list": "Buying - Internal"})
         cache_mod.set_cache(key, {"M3": (9.9, "kg")})
 
         # cache_ttl=0 forces the "fresh cache" lookup at the top to miss,

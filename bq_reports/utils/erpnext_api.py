@@ -18,6 +18,11 @@ from typing import Dict, Optional, List
 
 import requests
 
+# 对齐 ttpos main/app/service/business_cost_profit_erp_cost.go:103 priceList='Buying - Internal'
+# 对齐 ttpos-bmp .../stock/item.go:107 GetItemUnitCost
+COST_PROFIT_PRICE_LIST = "Buying - Internal"
+ALLOW_LAST_PURCHASE_FALLBACK_DEFAULT = False
+
 # AES 解密配置（与 ttpos-bmp 一致）
 _AES_KEY = "IesahquufojahCaiceet7Pha".encode("utf-8")  # 24 字节 = AES-192
 
@@ -161,29 +166,49 @@ def load_erpnext_prices(
     price_list: Optional[str] = None,
     item_codes: Optional[List[str]] = None,
     sid: Optional[str] = None,
+    allow_last_purchase: bool = ALLOW_LAST_PURCHASE_FALLBACK_DEFAULT,
 ) -> Dict[str, tuple[float, str]]:
     """
     从 ERPNext 获取 Item Price，返回 {item_code: (price, uom)} 字典。
 
+    对齐 ttpos main/app/service/business_cost_profit_erp_cost.go:103
+    priceList='Buying - Internal' / ttpos-bmp .../stock/item.go:107 GetItemUnitCost
+
     Args:
-        price_list: 价格表名称，默认从 .env 的 ERPNEXT_PRICE_LIST 读取，缺省 "Standard Buying"
+        price_list: 价格表名称，默认从 .env 的 ERPNEXT_PRICE_LIST 读取，
+                    缺省 COST_PROFIT_PRICE_LIST ("Buying - Internal")
         item_codes: 可选，只加载指定物料编码
         sid: 可选，Frappe session ID（cookie 认证，最靠谱）
+        allow_last_purchase: 显式允许 last_purchase_rate 降级口径（默认 False）。
+                             ERPNEXT_PRICE_SOURCE=last_purchase_rate 时，
+                             若此参数为 False 则抛 RuntimeError，不再静默切换。
 
     Returns:
         item_code -> (price_list_rate, uom) 的字典
-
-    口径开关：环境变量 ERPNEXT_PRICE_SOURCE=last_purchase_rate 时，改从 `Item`
-    主数据取 last_purchase_rate（用于账号无 Item Price 读权限的实例，如 wallace-th）。
     """
     if os.environ.get("ERPNEXT_PRICE_SOURCE", "").strip().lower() == "last_purchase_rate":
+        if not allow_last_purchase:
+            raise RuntimeError(
+                "ERPNEXT_PRICE_SOURCE=last_purchase_rate 会把'最近采购价'冒充 Item Price，"
+                "口径偏离 ttpos GetItemUnitCost (business_cost_profit_erp_cost.go:103)。"
+                "如确需降级请显式传 allow_last_purchase=True。"
+            )
+        import warnings
+        warnings.warn(
+            "[ERPNext API] 口径降级: 用 Item.last_purchase_rate 代替 Item Price"
+            "(非 ttpos 成本毛利口径 Buying - Internal)",
+            stacklevel=2,
+        )
+        print("[ERPNext API] ⚠️ 口径降级: 用 Item.last_purchase_rate 代替 Item Price"
+              "(非 ttpos 口径)")
         return load_erpnext_item_last_purchase(item_codes=item_codes, sid=sid)
 
     from dotenv import load_dotenv
     load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
     base_url, auth = _get_auth(sid=sid)
-    price_list = (price_list or os.environ.get("ERPNEXT_PRICE_LIST", "Standard Buying")).strip()
+    # 对齐 ttpos business_cost_profit_erp_cost.go:103: 默认读 "Buying - Internal"
+    price_list = (price_list or os.environ.get("ERPNEXT_PRICE_LIST") or COST_PROFIT_PRICE_LIST).strip()
 
     # 只按 price_list + docstatus 过滤，不依赖 selling 字段
     filters = [
