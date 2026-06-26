@@ -30,7 +30,8 @@ class CogsPublicApi(unittest.TestCase):
             resolve_unit_price,
         ):
             self.assertTrue(callable(fn))
-        self.assertIn("MK01018", BOM_UNIT_CORRECTIONS)
+        # BOM_UNIT_CORRECTIONS 硬编码已退役 (Task 3.1); 仍作为空 dict 导出以维持向后兼容
+        self.assertIsInstance(BOM_UNIT_CORRECTIONS, dict)
 
 
 class BomMatch(unittest.TestCase):
@@ -100,15 +101,31 @@ class MaterialPrice(unittest.TestCase):
         self.assertEqual(price, 0.0)
         self.assertEqual(src, "无 (strict)")
 
-    def test_erp_unit_correction_applied(self):
-        # MK01018 在 BOM_UNIT_CORRECTIONS = {"MK01018": 50} → ERP 价 / 50
+    def test_erp_unit_correction_retired(self):
+        # MK01018 的硬编码 ÷50 已退役 (BOM_UNIT_CORRECTIONS = {})。
+        # 新口径: ERP 层直接返回原价; 单位不一致应在 ERP 侧维护 Item Price,
+        # 或通过 desired_uoms 校验触发缺口报警 (见 Task 4.1 anchor)。
         price, src = resolve_unit_price(
             "MK01018", 0,
             uploaded_prices={},
             erp_prices={"MK01018": (250.0, "kg")},
         )
-        self.assertEqual(price, 5.0)
+        self.assertEqual(price, 250.0)   # 不再 ÷50
         self.assertEqual(src, "ERPNext")
+
+    def test_erp_layer_rejects_uom_mismatch(self):
+        # ERP 行单位 'ctn', BOM 消耗单位 'g' → 不得静默用, 应返回 None (缺口)
+        erp = {"X": (300.0, "ctn")}
+        r = build_material_price_resolver({}, erp, [], desired_uoms={"X": "g"})
+        self.assertIsNone(r.resolve(("X", None)))  # UOM 不匹配 → 不命中, 交由上层判缺口
+
+    def test_erp_layer_accepts_uom_match(self):
+        # ERP 行单位 'g' == desired 'g' → 命中
+        erp = {"X": (0.3, "g")}
+        r = build_material_price_resolver({}, erp, [], desired_uoms={"X": "g"})
+        res = r.resolve(("X", None))
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res.value, 0.3)
 
 
 class ExpandItemBom(unittest.TestCase):

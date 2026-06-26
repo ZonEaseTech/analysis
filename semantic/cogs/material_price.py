@@ -8,7 +8,7 @@ semantic 层 public API。
   1. price_layers     — 客户外挂物料价 (priority 来自 layer.priority, 100+)
                         支持 layer.index_by ∈ {'code', 'name'}
   2. uploaded_prices  — --price-list 上传清单 (priority 80, 按编码)
-  3. erp_prices       — ERPNext Item Price (priority 50, 带单位修正)
+  3. erp_prices       — ERPNext Item Price (priority 50, 按 desired-UOM 校验)
   4. bq_price         — BQ ttpos_material 内置 (per-row, 不进 Resolver,
                         由 resolve_unit_price 兜底)
 
@@ -19,11 +19,10 @@ from __future__ import annotations
 from semantic.resolvers import CallableProvider, Resolved, Resolver
 
 
-# 历史遗留: ERPNext 里部分物料的"单价/单位"跟我们 BOM 单位不一致, 这里给硬修正。
-# Key = material_code (大小写不敏感), Value = 除数。
-BOM_UNIT_CORRECTIONS = {
-    "MK01018": 50,
-}
+# 历史遗留硬编码已退役。正确做法是 ERP 在物料消耗 UOM 上维护 Item Price;
+# 若 ERP 行单位与 BOM desired_uom 不匹配, 则视为缺口进缺口报警 (见 Task 4.1 anchor)。
+# 保留空 dict 以维持向后兼容: 外部代码 import BOM_UNIT_CORRECTIONS 不会 NameError。
+BOM_UNIT_CORRECTIONS: dict = {}
 
 
 class MaterialPriceLayerProvider:
@@ -91,6 +90,7 @@ def build_material_price_resolver(
     *,
     strict=False,
     unit_corrections=None,
+    desired_uoms=None,
 ):
     """构造物料单价 Resolver.
 
@@ -99,8 +99,13 @@ def build_material_price_resolver(
         erp_prices: dict {material_code: (price, uom)} 或 None
         price_layers: List[Layer] (utils.layered_resource) 或 None
         strict: True 时只加客户外挂层 providers (uploaded / ERPNext 不加)
-        unit_corrections: ERPNext 单位修正 dict; None 用模块默认
-                          BOM_UNIT_CORRECTIONS
+        unit_corrections: 已废弃, 保留参数签名以维持向后兼容, 不再使用。
+                          正确方式: 在 ERP 的消耗 UOM 上维护 Item Price。
+        desired_uoms: dict {material_code: str} — BOM 该物料的消耗单位。
+                      传入后 ERPNext 层按 desired-UOM 校验: 单位不匹配则视为缺口
+                      (返回 None), 匹配或无 desired 时正常返回价格。
+                      对齐 ttpos 按 desired-UOM 选行:
+                      ttpos-bmp/.../stock/item.go:385 preferItemUnitCost
 
     Returns:
         Resolver。key = (material_code, material_name) tuple, value = float price.
@@ -108,8 +113,8 @@ def build_material_price_resolver(
 
     注意: bq_native (per-row bq_price) 不进 Resolver, 因为它是行级而非全局。
     """
-    if unit_corrections is None:
-        unit_corrections = BOM_UNIT_CORRECTIONS
+    # unit_corrections 参数已废弃(原硬编码 {"MK01018": 50} 已退役);
+    # 接受参数但不使用, 以维持向后兼容。
 
     providers = []
 
@@ -139,19 +144,20 @@ def build_material_price_resolver(
                 fetch=_fetch_uploaded,
             ))
 
-        # 3) ERPNext (priority 50) — 带单位修正
+        # 3) ERPNext (priority 50) — 按 desired-UOM 校验。
+        #    对齐 ttpos 按 desired-UOM 选行: ttpos-bmp/.../stock/item.go:385 preferItemUnitCost
         if erp_prices:
-            def _fetch_erp(key):
+            def _fetch_erp(key, _desired_uoms=desired_uoms):
                 code, _name = key
                 if not code:
                     return None
                 for k in (code, str(code).upper(), str(code).lower()):
                     if k in erp_prices:
-                        price, _uom = erp_prices[k]
-                        for corr_key in (code, str(code).upper(), str(code).lower()):
-                            if corr_key in unit_corrections:
-                                price = price / unit_corrections[corr_key]
-                                break
+                        price, uom = erp_prices[k]
+                        # UOM 校验: 若 desired_uoms 传入且该物料有 desired, 单位不匹配则缺口
+                        want = (_desired_uoms or {}).get(code) or (_desired_uoms or {}).get(k)
+                        if want and (uom or "").strip().lower() != want.strip().lower():
+                            return None  # UOM 不匹配 = 缺口, 不充数; 见 Task 4.1 anchor
                         return price
                 return None
             providers.append(CallableProvider(
@@ -173,6 +179,7 @@ def resolve_unit_price(
     strict=False,
     material_name=None,
     unit_corrections=None,
+    desired_uoms=None,
     resolver=None,
 ):
     """返回 (单价, 来源名)。把"哪份数据给出单价"暴露给上层做审计.
@@ -180,10 +187,13 @@ def resolve_unit_price(
     优先级 (高 → 低):
         1. price_layers   — 物料价 priority 栈 (支持按编码 / 按归一化名字索引)
         2. uploaded_prices — --price-list 上传清单 (按编码)
-        3. erp_prices     — ERPNext Item Price (含单位换算)
+        3. erp_prices     — ERPNext Item Price (按 desired-UOM 校验)
         4. bq_price       — BQ ttpos_material 内置 (per-row, 不进 Resolver)
 
     strict=True 时只走 price_layers, 全栈未命中 → (0, '无 (strict)') 不再 fallback。
+
+    unit_corrections: 已废弃参数, 保留以维持向后兼容, 不再使用。
+    desired_uoms: dict {material_code: str} — BOM 该物料的消耗单位; 传给 build_material_price_resolver。
 
     性能: 调用方在 per-BOM-row 循环里调用时, 应在循环外用
     build_material_price_resolver 构造一次 resolver 传进来 — 否则每行都重建
@@ -192,7 +202,7 @@ def resolve_unit_price(
     if resolver is None:
         resolver = build_material_price_resolver(
             uploaded_prices, erp_prices, price_layers,
-            strict=strict, unit_corrections=unit_corrections,
+            strict=strict, desired_uoms=desired_uoms,
         )
     result = resolver.resolve((material_code, material_name))
 
