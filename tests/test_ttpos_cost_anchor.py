@@ -205,6 +205,7 @@ class TestFetchTtposTruthsFromErp(unittest.TestCase):
         disabled: int = 0,
         valid_from: str = "",
         valid_upto: str = "",
+        price_or_product_discount: str = "Price",
     ) -> dict:
         return {
             "name": name,
@@ -215,6 +216,7 @@ class TestFetchTtposTruthsFromErp(unittest.TestCase):
             "disabled": disabled,
             "valid_from": valid_from,
             "valid_upto": valid_upto,
+            "price_or_product_discount": price_or_product_discount,
         }
 
     def _make_item_tax(self, item_code: str, tax_rate: float) -> dict:
@@ -351,6 +353,57 @@ class TestFetchTtposTruthsFromErp(unittest.TestCase):
         result = fetch_ttpos_truths_from_erp(["MAT-008"], erp_get=erp_get)
         # Name 不是 PRLE-0003 → 不套 margin，tax=0 → base=30
         self.assertAlmostEqual(result["MAT-008"], 30.0, places=4)
+
+    def test_price_or_discount_non_price_not_applied(self):
+        """price_or_product_discount='Discount' → 非 Price 型规则跳过，不套 margin。
+
+        对齐 Go item.go:286: PriceOrDiscount != "" && !EqualFold("Price") → false。
+        这是 Task 4.1 该补全的 fidelity 条件（Task 2.1 故意留到这里）。
+        """
+        discount_rule = self._make_rule(price_or_product_discount="Discount")
+        erp_get = self._make_erp_get(
+            item_prices=[self._make_item_price("MAT-009", 40.0)],
+            rules=[discount_rule],
+            item_taxes=[self._make_item_tax("MAT-009", 0.0)],
+        )
+        result = fetch_ttpos_truths_from_erp(["MAT-009"], erp_get=erp_get)
+        # 非 Price 型规则 → 不套 margin，tax=0 → base=40
+        self.assertAlmostEqual(result["MAT-009"], 40.0, places=4)
+
+    def test_price_or_discount_empty_string_applies(self):
+        """price_or_product_discount='' (空) → 规则照常套用（对齐 Go: 空字符串不拦）。
+
+        Go: r.PriceOrDiscount != "" 为假 → 不进入 return false 分支。
+        """
+        empty_pod_rule = self._make_rule(price_or_product_discount="")
+        erp_get = self._make_erp_get(
+            item_prices=[self._make_item_price("MAT-010", 100.0)],
+            rules=[empty_pod_rule],
+            item_taxes=[self._make_item_tax("MAT-010", 0.0)],
+        )
+        result = fetch_ttpos_truths_from_erp(["MAT-010"], erp_get=erp_get)
+        # 空 PriceOrDiscount → 不拦 → 套 5% margin，tax=0 → 100×1.05=105
+        self.assertAlmostEqual(result["MAT-010"], 105.0, places=4)
+
+    def test_price_or_discount_price_case_insensitive_applies(self):
+        """price_or_product_discount='price' (小写) → 大小写不敏感匹配 'Price'，照常套用。"""
+        lower_price_rule = self._make_rule(price_or_product_discount="price")
+        erp_get = self._make_erp_get(
+            item_prices=[self._make_item_price("MAT-011", 100.0)],
+            rules=[lower_price_rule],
+            item_taxes=[self._make_item_tax("MAT-011", 0.0)],
+        )
+        result = fetch_ttpos_truths_from_erp(["MAT-011"], erp_get=erp_get)
+        # 'price' EqualFold 'Price' → 不拦 → 套 margin → 100×1.05=105
+        self.assertAlmostEqual(result["MAT-011"], 105.0, places=4)
+
+    def test_live_path_raises_not_implemented(self):
+        """erp_get=None (不注入) → 抛 NotImplementedError，不是 ImportError。
+
+        诚实性机制自检：docstring 承诺 live 路径抛 NotImplementedError（需 sid 未接入）。
+        """
+        with self.assertRaises(NotImplementedError):
+            fetch_ttpos_truths_from_erp(["X"])
 
 
 if __name__ == "__main__":

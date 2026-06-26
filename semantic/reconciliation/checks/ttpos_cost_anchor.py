@@ -36,7 +36,8 @@ from bom_pipeline.erpnext_price import (
 _BUYING_PRICE_LIST = "Buying - Internal"
 
 # PRLE-0003 是 ttpos 后端 loadItemUnitCostPricingRules 固定取的规则 Name
-# 完整 PRLE-0003 条件（Task 4.1 补全）：Name==PRLE-0003、buying、!disabled、
+# 完整 PRLE-0003 条件（Task 4.1 补全，对齐 item.go:279-296 的 5 条 guard）：
+# Name==PRLE-0003、buying && !disabled、PriceOrDiscount 空或"Price"、
 # for_price_list 匹配、valid_from/valid_upto 日期有效性
 _PRLE_0003_NAME = "PRLE-0003"
 
@@ -172,43 +173,48 @@ def fetch_ttpos_truths_from_erp(
 ) -> dict[str, float]:
     """从 ERP 读取 Item Price + Pricing Rule + Item Tax，按 ttpos 算法复算各物料真值。
 
-    完整 PRLE-0003 条件（Task 4.1 补全，ttpos 后端 item.go:279-296）：
-      1. Name == "PRLE-0003"        （固定 Name，后端 loadItemUnitCostPricingRules 取法）
-      2. buying == True / 1
-      3. !disabled
-      4. for_price_list 匹配 "Buying - Internal"（空字符串 = 匹配任意）
-      5. valid_from 空或 <= 今天    （日期尚未生效的规则不套用）
-      6. valid_upto 空或 >= 今天    （日期已过期的规则不套用）
+    完整 PRLE-0003 条件（Task 4.1 忠实复刻 Go appliesToItemUnitCost，item.go:279-296）：
+      Go 的 5 条 guard 全部覆盖：
+      1. Name == "PRLE-0003"                          （item.go:280）
+      2. buying == True/1  且  !disabled              （item.go:283，委托 rule_applies）
+      3. PriceOrDiscount 空 或 == "Price"（大小写不敏感）（item.go:286）
+      4. for_price_list 空 或 匹配 "Buying - Internal"  （item.go:289，委托 rule_applies）
+      5. valid_from 空或 <= 今天 且 valid_upto 空或 >= 今天（item.go:292/298-307）
 
-    Task 2.1 的 rule_applies 只做了子集（条件 2-4），缺 Name 过滤和日期有效性。
-    本函数补全条件 1、5、6（条件 2-4 仍委托 bom_pipeline.erpnext_price.rule_applies）。
+    Task 2.1 的 rule_applies 只做了子集（guard 2、4），明确把 Name / PriceOrDiscount /
+    日期有效性留到本层（Task 4.1）补全。本函数：guard 1/3/5 在此实现，guard 2/4 委托
+    bom_pipeline.erpnext_price.rule_applies。至此 Go 的 5 条 guard 真全。
 
     ⚠️ 诚实性声明（live 路径）：
-      erp_get=None 时使用真实 erpnext_api，需要有效的 ERP sid。
-      当前 sid 失效未验证；接通 sid 后才能产出真对账数据。
-      本轮测试不跑 live 路径，见 test_ttpos_cost_anchor.py Layer 4。
+      erp_get=None 时需要有效的 ERP sid 才能从 erpnext_api 真实读取；当前 sid 失效未接入，
+      本函数对 erp_get=None 直接抛 NotImplementedError（不留坏 import），接通 sid 后才能
+      产出真对账数据。本轮测试不跑 live 路径，见 test_ttpos_cost_anchor.py Layer 4。
 
     Args:
         item_codes: 要查的物料编码列表
         sid:        ERP session ID（live 路径用，注入假 erp_get 时可忽略）
         erp_get:    可注入的 ERP 查询 callable (doctype, **kwargs) -> list[dict]。
-                    None → 使用 bq_reports.utils.erpnext_api 真实读取（需 sid）。
-                    测试时注入假实现（见 tests/test_ttpos_cost_anchor.py）。
+                    None → live 路径，当前抛 NotImplementedError（需 sid，未接入）。
+                    测试/离线时注入假实现（见 tests/test_ttpos_cost_anchor.py）。
+                    读 Pricing Rule 时返回的 row 需含 price_or_product_discount 字段
+                    （live 实现接入时从 ERPNext Pricing Rule doctype 取该列）。
 
     Returns:
         dict[str, float]: {item_code: ttpos_unit_cost}
         ERP 里没有 Item Price 的物料不出现在结果里（调用方可按需处理缺失）。
     """
     if erp_get is None:
-        # ⚠️ live 路径：需要有效 ERP sid，当前未验证，本轮不在测试里跑。
-        # 接通 sid 后取消注释并传入 sid 到 erpnext_api。
-        from bq_reports.utils.erpnext_api import get_list as _erp_get_list  # noqa: F401
-        def erp_get(doctype, **kwargs):  # type: ignore[misc]
-            # TODO: 接通 sid 后启用真实调用：return _erp_get_list(doctype, sid=sid, **kwargs)
-            raise NotImplementedError(
-                "fetch_ttpos_truths_from_erp: live ERP 路径需要有效 sid，当前 sid 失效未验证。"
-                "请传入 erp_get= 注入假数据（测试），或接通 sid 后启用真实 erpnext_api 调用。"
-            )
+        # ⚠️ live 路径：需要有效 ERP sid，当前未接入，本轮不在测试里跑。
+        # 将来接通 sid 后，从 bq_reports.utils.erpnext_api 用 load_erpnext_prices /
+        # load_erpnext_item_last_purchase 读 Buying-Internal Item Price，并补 Pricing Rule
+        # (PRLE-0003) + Item Tax 的拉取，包成 erp_get(doctype, **kwargs) 形态注入。
+        # 不留坏 import：erpnext_api 当前没有通用 get_list，直接据实抛 NotImplementedError。
+        raise NotImplementedError(
+            "fetch_ttpos_truths_from_erp 的 live ERP 读取需 sid;"
+            "当前 sid 失效未接入,接 sid 后实现真实读取 Buying-Internal Item Price + "
+            "PRLE-0003 + Item Tax(见 bq_reports.utils.erpnext_api.load_erpnext_prices)。"
+            "测试/离线请传入 erp_get= 注入假数据。"
+        )
 
     today = datetime.date.today()
 
@@ -226,10 +232,16 @@ def fetch_ttpos_truths_from_erp(
     rule_rows: list[dict] = erp_get("Pricing Rule")
     applicable_rules: list[PricingRule] = []
     for row in rule_rows:
-        # 条件 1: Name == "PRLE-0003"（完整 PRLE-0003 条件，Task 4.1 补全）
+        # 条件 1: Name == "PRLE-0003"（item.go:280）
         if row.get("name") != _PRLE_0003_NAME:
             continue
-        # 条件 2-4: buying、!disabled、for_price_list（委托 rule_applies）
+        # 条件 2: PriceOrDiscount 空 或 == "Price"（大小写不敏感）。
+        # 对齐 item.go:286: r.PriceOrDiscount != "" && !EqualFold("Price") → false。
+        # Task 4.1 补全的 fidelity 条件（Task 2.1 故意留到本层）。
+        pod = (row.get("price_or_product_discount") or "").strip()
+        if pod and pod.lower() != "price":
+            continue  # 非 Price 型规则（如 Discount）→ 不套
+        # 条件 3-5: buying、!disabled、for_price_list（委托 rule_applies）
         rule = PricingRule(
             margin_type=row.get("margin_type", ""),
             margin_rate_or_amount=float(row.get("margin_rate_or_amount", 0.0)),
@@ -239,7 +251,7 @@ def fetch_ttpos_truths_from_erp(
         )
         if not rule_applies(rule, _BUYING_PRICE_LIST):
             continue
-        # 条件 5: valid_from 空或 <= 今天
+        # 条件 5a: valid_from 空或 <= 今天（item.go:300）
         valid_from_str = (row.get("valid_from") or "").strip()
         if valid_from_str:
             try:
@@ -248,7 +260,7 @@ def fetch_ttpos_truths_from_erp(
                     continue  # 规则尚未生效
             except ValueError:
                 pass  # 无法解析则忽略日期限制（宽松）
-        # 条件 6: valid_upto 空或 >= 今天
+        # 条件 5b: valid_upto 空或 >= 今天（item.go:303）
         valid_upto_str = (row.get("valid_upto") or "").strip()
         if valid_upto_str:
             try:
