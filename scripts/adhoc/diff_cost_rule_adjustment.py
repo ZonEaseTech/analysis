@@ -47,7 +47,6 @@ import sys
 # 复用 bom_pipeline 模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "bom_pipeline"))
 
-from bom_rules import DINEIN_DEL, TAKEOUT_SINGLE_DEL, PRODUCT_DEL
 from erpnext_price import PricingRule, final_unit_cost_with_rule
 
 # ---------------------------------------------------------------------------
