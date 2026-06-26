@@ -72,9 +72,6 @@ class TestDefaultPriceListUsedInApi(unittest.TestCase):
         # 最终传给 _api_get 的 price_list 应为 COST_PROFIT_PRICE_LIST
         captured = {}
 
-        def fake_get_auth(**_):
-            return "http://fake", "fake_sid"
-
         def fake_api_get(_base, _auth, doctype, fields, filters=None, limit=0):
             # 从 filters 里抓 price_list 值
             for f in (filters or []):
@@ -92,6 +89,100 @@ class TestDefaultPriceListUsedInApi(unittest.TestCase):
             captured.get("price_list"), E.COST_PROFIT_PRICE_LIST,
             f"期望 {E.COST_PROFIT_PRICE_LIST!r}，实际传给 API 的是 {captured.get('price_list')!r}",
         )
+
+
+class TestPickItemPriceRow(unittest.TestCase):
+    """
+    Task 1.2: 测试 _pick_item_price_row 对齐 ttpos preferItemUnitCost 选行逻辑。
+    ttpos-bmp: .../logic/stock/item.go:385-398
+    """
+
+    def test_pick_row_matching_desired_uom(self):
+        # 同一物料有 g 与 ctn 两行价,desired='g' 必须取 g 行(对齐 ttpos preferItemUnitCost)
+        rows = [
+            {"item_code": "X", "uom": "ctn", "price_list_rate": 300, "modified": "2026-06-02"},
+            {"item_code": "X", "uom": "g", "price_list_rate": 0.3, "modified": "2026-06-01"},
+        ]
+        picked = E._pick_item_price_row(rows, desired_uom="g")
+        self.assertEqual(picked["uom"], "g")
+        self.assertAlmostEqual(picked["price_list_rate"], 0.3)
+
+    def test_no_desired_uom_match_returns_flagged_none(self):
+        # desired_uom 指定了但无对应行 → 返回 None,显式暴露缺口
+        rows = [{"item_code": "X", "uom": "ctn", "price_list_rate": 300, "modified": "2026-06-02"}]
+        self.assertIsNone(E._pick_item_price_row(rows, desired_uom="g"))
+
+    def test_pick_row_desired_uom_case_insensitive(self):
+        # UOM 大小写不敏感（ERP 数据可能有 "G"、"Nos" 等混写）
+        rows = [{"item_code": "Y", "uom": "G", "price_list_rate": 0.5, "modified": "2026-06-01"}]
+        picked = E._pick_item_price_row(rows, desired_uom="g")
+        self.assertIsNotNone(picked)
+        self.assertAlmostEqual(picked["price_list_rate"], 0.5)
+
+    def test_pick_row_desired_uom_multiple_matches_takes_latest_modified(self):
+        # 同 UOM 多行 → 取 modified 最新的一行
+        rows = [
+            {"item_code": "Z", "uom": "g", "price_list_rate": 1.0, "modified": "2026-05-01"},
+            {"item_code": "Z", "uom": "g", "price_list_rate": 1.5, "modified": "2026-06-10"},
+        ]
+        picked = E._pick_item_price_row(rows, desired_uom="g")
+        self.assertAlmostEqual(picked["price_list_rate"], 1.5)
+
+    def test_pick_row_no_desired_falls_back_to_uom_priority(self):
+        # 无 desired_uom → 回退 UOM_PRIORITY（g 优先于 ctn）
+        rows = [
+            {"item_code": "A", "uom": "ctn", "price_list_rate": 300, "modified": "2026-06-02"},
+            {"item_code": "A", "uom": "g", "price_list_rate": 0.3, "modified": "2026-06-01"},
+        ]
+        picked = E._pick_item_price_row(rows, desired_uom=None)
+        self.assertEqual(picked["uom"], "g")
+
+    def test_pick_row_empty_rows_returns_none(self):
+        # 空 rows → 返回 None
+        self.assertIsNone(E._pick_item_price_row([]))
+
+
+class TestLoadErpnextPricesDesiredUoms(unittest.TestCase):
+    """
+    Task 1.2: load_erpnext_prices 的 desired_uoms 参数测试。
+    """
+
+    def _make_api_rows(self):
+        return [
+            {"item_code": "MAT_A", "uom": "g", "price_list_rate": 0.3, "modified": "2026-06-01"},
+            {"item_code": "MAT_A", "uom": "ctn", "price_list_rate": 300, "modified": "2026-06-02"},
+            {"item_code": "MAT_B", "uom": "pc", "price_list_rate": 5.0, "modified": "2026-06-01"},
+        ]
+
+    def test_desired_uoms_selects_correct_row(self):
+        # desired_uoms 指定了 MAT_A->g，结果应取 g 行
+        with mock.patch.object(E, "_get_auth", return_value=("http://fake", "sid")), \
+             mock.patch.object(E, "_api_get", return_value=self._make_api_rows()), \
+             mock.patch("dotenv.load_dotenv"):
+            result = E.load_erpnext_prices(desired_uoms={"MAT_A": "g", "MAT_B": "pc"})
+        self.assertIn("MAT_A", result)
+        rate, uom = result["MAT_A"]
+        self.assertEqual(uom, "g")
+        self.assertAlmostEqual(rate, 0.3)
+
+    def test_desired_uoms_missing_uom_excludes_item(self):
+        # desired_uoms 指定 MAT_A->kg，但无 kg 行 → MAT_A 不进结果（显式暴露缺口）
+        with mock.patch.object(E, "_get_auth", return_value=("http://fake", "sid")), \
+             mock.patch.object(E, "_api_get", return_value=self._make_api_rows()), \
+             mock.patch("dotenv.load_dotenv"):
+            result = E.load_erpnext_prices(desired_uoms={"MAT_A": "kg"})
+        self.assertNotIn("MAT_A", result)
+
+    def test_no_desired_uoms_uses_legacy_priority(self):
+        # 不传 desired_uoms → 行为与 Task 1.1 前相同（g 优先于 ctn）
+        with mock.patch.object(E, "_get_auth", return_value=("http://fake", "sid")), \
+             mock.patch.object(E, "_api_get", return_value=self._make_api_rows()), \
+             mock.patch("dotenv.load_dotenv"):
+            result = E.load_erpnext_prices()
+        # MAT_A 有 g 和 ctn，应选 g（优先级更高）
+        self.assertIn("MAT_A", result)
+        _, uom = result["MAT_A"]
+        self.assertEqual(uom, "g")
 
 
 if __name__ == "__main__":

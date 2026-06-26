@@ -162,11 +162,52 @@ def load_erpnext_item_last_purchase(
     return prices
 
 
+def _pick_item_price_row(rows: List[dict], desired_uom: Optional[str] = None) -> Optional[dict]:
+    """
+    从同一物料的多条 Item Price 行中选出最佳一行。
+
+    对齐 ttpos preferItemUnitCost:
+        ttpos-bmp/app/ttpos-erp/internal/logic/stock/item.go:385
+
+    选行策略:
+    - 有 desired_uom: 只接受 uom 精确匹配(大小写不敏感)的行,多行取 modified 最新。
+                     匹配不到返回 None(数据缺口,显式暴露,不拿错 UOM 的价充数)。
+    - 无 desired_uom: 回退现有 UOM_PRIORITY(g>pc>nos>pkt>ctn) + modified 逻辑,
+                      兼容旧调用方不传 desired_uoms 时的行为。
+    """
+    if not rows:
+        return None
+
+    UOM_PRIORITY = {"g": 0, "gm": 0, "pc": 1, "nos": 2, "pkt": 3, "ctn": 4}
+
+    if desired_uom:
+        target = desired_uom.strip().lower()
+        cands = [r for r in rows if (r.get("uom") or "").strip().lower() == target]
+        if not cands:
+            return None  # 无对应 UOM 价行 = 数据缺口,显式暴露
+        return max(cands, key=lambda r: r.get("modified", ""))
+
+    # 无 desired_uom: 沿用 UOM_PRIORITY + modified(兼容旧调用)
+    best = None
+    best_priority = 99
+    best_modified = ""
+    for row in rows:
+        uom = (row.get("uom") or "").lower()
+        p = UOM_PRIORITY.get(uom, 99)
+        m = row.get("modified", "")
+        if p < best_priority or (p == best_priority and m > best_modified):
+            best = row
+            best_priority = p
+            best_modified = m
+    return best
+
+
 def load_erpnext_prices(
     price_list: Optional[str] = None,
     item_codes: Optional[List[str]] = None,
     sid: Optional[str] = None,
     allow_last_purchase: bool = ALLOW_LAST_PURCHASE_FALLBACK_DEFAULT,
+    desired_uoms: Optional[Dict[str, str]] = None,
 ) -> Dict[str, tuple[float, str]]:
     """
     从 ERPNext 获取 Item Price，返回 {item_code: (price, uom)} 字典。
@@ -182,6 +223,10 @@ def load_erpnext_prices(
         allow_last_purchase: 显式允许 last_purchase_rate 降级口径（默认 False）。
                              ERPNEXT_PRICE_SOURCE=last_purchase_rate 时，
                              若此参数为 False 则抛 RuntimeError，不再静默切换。
+        desired_uoms: 可选，{item_code: uom} 映射，指定各物料期望的消耗单位。
+                      有 desired_uom 时按精确匹配选行（对齐 ttpos preferItemUnitCost）；
+                      匹配不到的物料不进结果 dict（显式暴露缺口）。
+                      不传时回退 UOM_PRIORITY（g>pc>nos>pkt>ctn），行为与旧版一致。
 
     Returns:
         item_code -> (price_list_rate, uom) 的字典
@@ -194,6 +239,7 @@ def load_erpnext_prices(
                 "如确需降级请显式传 allow_last_purchase=True。"
             )
         import warnings
+        # warn 供程序化捕获/-W error 升级; print 供 ad-hoc 脚本 stdout 人眼可见
         warnings.warn(
             "[ERPNext API] 口径降级: 用 Item.last_purchase_rate 代替 Item Price"
             "(非 ttpos 成本毛利口径 Buying - Internal)",
@@ -228,16 +274,9 @@ def load_erpnext_prices(
         limit=0,  # 0 = 全部
     )
 
-    # UOM 优先级：越小单位越优先（g > pc > Nos > pkt > ctn）
-    UOM_PRIORITY = {"g": 0, "gm": 0, "pc": 1, "nos": 2, "pkt": 3, "ctn": 4}
-
-    def _uom_priority(row):
-        uom = (row.get("uom") or "").lower()
-        return UOM_PRIORITY.get(uom, 99)
-
-    # 按 item_code 分组，每组内按 UOM 优先级 + modified 排序
+    # 按 item_code 分组，每组内通过 _pick_item_price_row 选行
     from collections import defaultdict
-    grouped = defaultdict(list)
+    grouped: Dict[str, list] = defaultdict(list)
     for row in rows:
         code = row.get("item_code")
         if code:
@@ -245,22 +284,17 @@ def load_erpnext_prices(
 
     prices: Dict[str, tuple[float, str]] = {}
     for code, group in grouped.items():
-        group_sorted = sorted(group, key=lambda r: (_uom_priority(r), r.get("modified", "")), reverse=False)
-        best = None
-        best_priority = 99
-        best_modified = ""
-        for row in group_sorted:
-            p = _uom_priority(row)
-            m = row.get("modified", "")
-            if p < best_priority or (p == best_priority and m > best_modified):
-                best = row
-                best_priority = p
-                best_modified = m
-        if best:
-            prices[code] = (
-                float(best.get("price_list_rate") or 0),
-                best.get("uom", "") or "",
-            )
+        # 有 desired_uoms 时按 BOM 消耗单位精确匹配（对齐 ttpos preferItemUnitCost）；
+        # 无 desired_uoms 时回退 UOM_PRIORITY，兼容旧调用方不传此参数的行为。
+        uom_hint = desired_uoms.get(code) if desired_uoms else None
+        best = _pick_item_price_row(group, desired_uom=uom_hint)
+        if best is None:
+            # desired_uom 指定但无对应行 → 不进结果，上层感知缺口
+            continue
+        prices[code] = (
+            float(best.get("price_list_rate") or 0),
+            best.get("uom", "") or "",
+        )
 
     print(f"[ERPNext API] 加载 {len(prices)} 条 Item Price (price_list={price_list})")
     return prices
