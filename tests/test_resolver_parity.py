@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import unittest
 
-from utils.layered_resource import Layer
+from semantic.resolvers.layered_resource import Layer
 from bq_reports.profit_margin_report import (
     BOM_UNIT_CORRECTIONS,
     _build_bom_resolver,

@@ -700,7 +700,7 @@ def _load_material_price_layers(config: dict = None):
     Returns: List[Layer], Layer.data 是 dict, 但里面 value 是 {price, unit, source_tag, ...} 结构 (新)
              或 float (老兼容).
     """
-    from utils.layered_resource import load_layers
+    from semantic.resolvers.layered_resource import load_layers
 
     cfg = config or {}
     cache_ttl = cfg.get("cache", {}).get("material_price_ttl",

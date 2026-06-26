@@ -103,7 +103,7 @@ def build_material_price_resolver(
     Args:
         uploaded_prices: dict {material_code: float} 或 None
         erp_prices: dict {material_code: (price, uom)} 或 None
-        price_layers: List[Layer] (utils.layered_resource) 或 None
+        price_layers: List[Layer] (semantic.resolvers.layered_resource) 或 None
         strict: True 时只加客户外挂层 providers (uploaded / ERPNext 不加)
         unit_corrections: ERPNext 过渡期单位修正 dict; None 用模块默认
                           BOM_UNIT_CORRECTIONS。仅在 UOM 校验通过后才应用。

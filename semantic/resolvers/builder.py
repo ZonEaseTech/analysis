@@ -6,7 +6,7 @@
      (P3 fact_overrides 通用入口会大量用，每种事实在 resolvers.yaml 注册一段)
 
   2. `from_layers(name, layers)` / `from_layers_with_matcher(name, layers, matcher)`
-     — 从 `utils/layered_resource.Layer` 列表桥接
+     — 从 `semantic/resolvers.layered_resource.Layer` 列表桥接
      (P1 重构期 legacy 代码迁移到 Resolver 用)
 """
 from __future__ import annotations
@@ -86,7 +86,7 @@ def build_resolver(
 
 
 def from_layers(name: str, layers) -> Resolver:
-    """Legacy bridge: 从 utils/layered_resource.Layer 列表构造 Resolver。
+    """Legacy bridge: 从 semantic/resolvers.layered_resource.Layer 列表构造 Resolver。
 
     用于 P1 迁移期 — 现有代码用 load_layers + lookup_layered 的，先桥接到 Resolver
     再逐步把 source 元数据吃透。
