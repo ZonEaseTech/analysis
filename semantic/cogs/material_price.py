@@ -108,8 +108,12 @@ def build_material_price_resolver(
         unit_corrections: ERPNext 过渡期单位修正 dict; None 用模块默认
                           BOM_UNIT_CORRECTIONS。仅在 UOM 校验通过后才应用。
         desired_uoms: dict {material_code: str} — BOM 该物料的消耗单位。
-                      传入后 ERPNext 层按 desired-UOM 校验: 单位不匹配则视为缺口
-                      (返回 None), 匹配或无 desired 时再应用 legacy 修正并返回价。
+                      传入后 ERPNext 层做 desired-UOM 校验 (defense-in-depth):
+                      单位不匹配时本 ERP provider 返回 None — 这不是硬缺口/告警,
+                      只表示"本层不匹配, 交回 Resolver 续走低优先级 / bq_native 兜底"
+                      (见 resolve_unit_price 末尾)。匹配或无 desired 时再应用 legacy
+                      修正并返回价。真正的 UOM 主防线在加载层 erpnext_api.py
+                      (_pick_item_price_row), 本层只在调用方绕过 loader 时才生效。
                       对齐 ttpos 按 desired-UOM 选行:
                       ttpos-bmp/.../stock/item.go:385 preferItemUnitCost
 
@@ -150,8 +154,13 @@ def build_material_price_resolver(
                 fetch=_fetch_uploaded,
             ))
 
-        # 3) ERPNext (priority 50) — 按 desired-UOM 校验 + 过渡期 legacy 修正共存。
+        # 3) ERPNext (priority 50) — desired-UOM 校验 (defense-in-depth) + 过渡期 legacy 修正。
         #    对齐 ttpos 按 desired-UOM 选行: ttpos-bmp/.../stock/item.go:385 preferItemUnitCost
+        #
+        #    ⚠️ 本层校验是 defense-in-depth, 不是主防线: 数据加载层 erpnext_api.py
+        #    (_pick_item_price_row, Task 1.2) 已在 load 时就把 UOM 不匹配的物料过滤掉
+        #    (不进 erp_prices)。本层只在"调用方绕过 loader、手工塞未过滤的 erp_prices"
+        #    时才会触发, 属兜底冗余校验。
         if erp_prices:
             def _fetch_erp(key, _desired_uoms=desired_uoms,
                            _unit_corrections=unit_corrections):
@@ -161,10 +170,23 @@ def build_material_price_resolver(
                 for k in (code, str(code).upper(), str(code).lower()):
                     if k in erp_prices:
                         price, uom = erp_prices[k]
-                        # 新机制: 若 desired_uoms 指定该物料的消耗单位且不匹配 → 缺口
-                        want = (_desired_uoms or {}).get(code) or (_desired_uoms or {}).get(k)
+                        # desired-UOM 校验: 三 key 规范 (与 erp_prices 命中键一致),
+                        # 避免 desired_uoms 与 erp_prices 大小写不同导致校验被静默跳过。
+                        want = None
+                        for wk in (code, str(code).upper(), str(code).lower()):
+                            if _desired_uoms and wk in _desired_uoms:
+                                want = _desired_uoms[wk]
+                                break
+                        # M-1: 此 UOM 比较逻辑与 erpnext_api.py:_pick_item_price_row 重复,
+                        #      待 Phase 5 退役 legacy 修正时抽 _uom_matches 收口。
                         if want and (uom or "").strip().lower() != want.strip().lower():
-                            return None  # UOM 不匹配 = 缺口, 不充数; 见 Task 4.1 anchor
+                            # ⚠️ 返回 None ≠ 硬缺口/告警。在 Resolver 框架里 (base.py
+                            # resolve), provider 返回 None 仅表示"本 ERP provider 不匹配该
+                            # desired-UOM, 交回 Resolver 续走低优先级 provider / 最终
+                            # bq_native 兜底" (见 resolve_unit_price 末尾)。
+                            # 目前并不存在真正的"UOM 缺口告警": 不匹配会被 bq_native 吸收。
+                            # 真告警待 Phase 5 在调用层基于 source=="bq_native" 统计实现。
+                            return None
                         # 过渡期 legacy 修正: UOM 校验通过 (或无 desired) 后再 ÷ 除数。
                         # 待 desired-UOM 校验接进生产 (Phase 5/Task #6) 后退役此分支。
                         for corr_key in (code, str(code).upper(), str(code).lower()):
@@ -208,6 +230,9 @@ def resolve_unit_price(
     unit_corrections: ERPNext 过渡期单位修正 dict; None 用模块默认 BOM_UNIT_CORRECTIONS;
                       仅在 desired-UOM 校验通过后应用 (透传给 build_material_price_resolver)。
     desired_uoms: dict {material_code: str} — BOM 该物料的消耗单位; 传给 build_material_price_resolver。
+                  ERP 层 UOM 不匹配时该 provider 返回 None, 不命中 ERPNext, 最终落
+                  bq_native 兜底 (UOM 不匹配被 bq 静默吸收, 暂无独立告警; 见
+                  build_material_price_resolver 的 desired_uoms 说明)。
 
     性能: 调用方在 per-BOM-row 循环里调用时, 应在循环外用
     build_material_price_resolver 构造一次 resolver 传进来 — 否则每行都重建
