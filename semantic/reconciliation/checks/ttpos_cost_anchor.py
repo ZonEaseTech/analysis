@@ -26,7 +26,6 @@ from typing import Callable, Optional
 
 from bom_pipeline.erpnext_price import (
     PricingRule,
-    apply_pricing_rules,
     calculate_final_item_unit_cost,
     resolve_tax_rate,
     rule_applies,
@@ -183,9 +182,19 @@ def fetch_ttpos_truths_from_erp(
 
     Task 2.1 的 rule_applies 只做了子集（guard 2、4），明确把 Name / PriceOrDiscount /
     日期有效性留到本层（Task 4.1）补全。本函数：guard 1/3/5 在此实现，guard 2/4 委托
-    bom_pipeline.erpnext_price.rule_applies。至此 Go 的 5 条 guard 真全。
+    bom_pipeline.erpnext_price.rule_applies。至此 Go 的 5 条**规则适用 guard** 真全
+    （注意：这"真全"只覆盖规则适用性 appliesToItemUnitCost，不含税率侧，见下方落差声明）。
 
-    ⚠️ 诚实性声明（live 路径）：
+    ⚠️ 诚实性声明 1（税率侧为简化模型，非忠实复刻）：
+      税率取数直读 Item Tax 的 `tax_rate` 字段，**未**复刻 Go resolveItemUnitCostTaxRate
+      （item.go:332-348）的两点：
+        ① 按 post-margin netCost 落在 tax.MinimumNetRate / MaximumNetRate 区间筛选；
+        ② Item Tax Template 间接层（item_tax_template → Item Tax Template doctype →
+           sum(taxes[].tax_rate)，见 loadItemUnitCostTaxTemplateRates item.go:241-266）。
+      华莱士单一 7% VAT 场景下两者数值等价（"碰巧相等"），但接其他税制 / 分档税率前
+      必须补全上述逻辑，否则税率会算错。
+
+    ⚠️ 诚实性声明 2（live 路径）：
       erp_get=None 时需要有效的 ERP sid 才能从 erpnext_api 真实读取；当前 sid 失效未接入，
       本函数对 erp_get=None 直接抛 NotImplementedError（不留坏 import），接通 sid 后才能
       产出真对账数据。本轮测试不跑 live 路径，见 test_ttpos_cost_anchor.py Layer 4。
@@ -242,12 +251,16 @@ def fetch_ttpos_truths_from_erp(
         if pod and pod.lower() != "price":
             continue  # 非 Price 型规则（如 Discount）→ 不套
         # 条件 3-5: buying、!disabled、for_price_list（委托 rule_applies）
+        # 停用标志：ERPNext Pricing Rule doctype 真实字段名为 `disable`（无 d 结尾，
+        # item.go:229 data.Get("disable")）。优先读 disable，回退内部 fixture 的 disabled，
+        # 避免接 sid 后真实行的 disable=1 被漏读、把已停用规则当启用错套 margin。
+        disabled_flag = row.get("disable", row.get("disabled", False))
         rule = PricingRule(
             margin_type=row.get("margin_type", ""),
             margin_rate_or_amount=float(row.get("margin_rate_or_amount", 0.0)),
             for_price_list=row.get("for_price_list", ""),
             buying=bool(row.get("buying", True)),
-            disabled=bool(row.get("disabled", False)),
+            disabled=bool(disabled_flag),
         )
         if not rule_applies(rule, _BUYING_PRICE_LIST):
             continue
@@ -289,11 +302,8 @@ def fetch_ttpos_truths_from_erp(
         # tax_rate: 有 Item Tax → 用配置税率；无 → 兜底 7%（resolve_tax_rate(None) = 7）
         raw_tax = item_taxes.get(code)
         tax_rate = resolve_tax_rate(None if raw_tax is None else raw_tax)
-        # 按 ttpos 算法：套用所有 applicable_rules（可能是空列表）
-        net_cost = apply_pricing_rules(base, applicable_rules)
-        if net_cost == 0 or tax_rate == 0:
-            results[code] = net_cost
-        else:
-            results[code] = net_cost * (1 + tax_rate / 100)
+        # 按 ttpos 算法套用 applicable_rules（可能空列表）再上浮税：直接走
+        # calculate_final_item_unit_cost（item.go:309），避免内联展开与之口径漂移。
+        results[code] = calculate_final_item_unit_cost(base, applicable_rules, tax_rate)
 
     return results

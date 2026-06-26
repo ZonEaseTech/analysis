@@ -261,6 +261,57 @@ class TestFetchTtposTruthsFromErp(unittest.TestCase):
         result = fetch_ttpos_truths_from_erp(["MAT-002"], erp_get=erp_get)
         self.assertAlmostEqual(result["MAT-002"], 18.0 * 1.07, places=4)
 
+    def test_erpnext_real_disable_field_honored(self):
+        """ERPNext Pricing Rule 真实停用字段名是 'disable'(无 d 结尾，item.go:229)。
+
+        模拟接通 sid、erp_get 返回 ERPNext 原始行的场景：行用 'disable': 1。
+        修前 fetch 读 'disabled'(取不到→默认 False)→ 把已停用规则当启用错套 margin。
+        修后兼容 'disable' → 规则被正确跳过，不套 margin。
+        base=18, tax=7%, disable=1 → 18×1.07=19.26（不套 5% margin）。
+        """
+        # 直接构造 ERPNext 原始行（用 disable，不是内部 fixture 的 disabled）
+        erpnext_raw_rule = {
+            "name": "PRLE-0003",
+            "margin_type": "Percentage",
+            "margin_rate_or_amount": 5.0,
+            "for_price_list": "Buying - Internal",
+            "buying": 1,
+            "disable": 1,  # ← ERPNext 真实字段名
+            "valid_from": "",
+            "valid_upto": "",
+            "price_or_product_discount": "Price",
+        }
+        erp_get = self._make_erp_get(
+            item_prices=[self._make_item_price("MAT-DIS", 18.0)],
+            rules=[erpnext_raw_rule],
+            item_taxes=[self._make_item_tax("MAT-DIS", 7.0)],
+        )
+        result = fetch_ttpos_truths_from_erp(["MAT-DIS"], erp_get=erp_get)
+        # disable=1 被识别 → 规则跳过 → 不套 margin → 18×1.07=19.26
+        self.assertAlmostEqual(result["MAT-DIS"], 18.0 * 1.07, places=4)
+
+    def test_erpnext_real_disable_field_zero_applies(self):
+        """ERPNext 行 'disable': 0 → 规则启用，照常套 margin（钉死字段读取方向）。"""
+        erpnext_raw_rule = {
+            "name": "PRLE-0003",
+            "margin_type": "Percentage",
+            "margin_rate_or_amount": 5.0,
+            "for_price_list": "Buying - Internal",
+            "buying": 1,
+            "disable": 0,  # ← ERPNext 真实字段名，未停用
+            "valid_from": "",
+            "valid_upto": "",
+            "price_or_product_discount": "Price",
+        }
+        erp_get = self._make_erp_get(
+            item_prices=[self._make_item_price("MAT-EN", 100.0)],
+            rules=[erpnext_raw_rule],
+            item_taxes=[self._make_item_tax("MAT-EN", 0.0)],
+        )
+        result = fetch_ttpos_truths_from_erp(["MAT-EN"], erp_get=erp_get)
+        # disable=0 → 套 5% margin，tax=0 → 100×1.05=105
+        self.assertAlmostEqual(result["MAT-EN"], 105.0, places=4)
+
     def test_date_expired_rule_no_margin(self):
         """valid_upto=过去日期 → 规则失效，不套 margin，只上浮税。"""
         expired_rule = self._make_rule(valid_upto="2020-01-01")
