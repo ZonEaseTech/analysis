@@ -63,7 +63,7 @@ flowchart TB
     subgraph COST["成本解析 — 两条路, 按 priority"]
         direction TB
         BOMRES["配方 BOM: config.yaml bom_sources<br/>外挂人工源(高): 最终BOM=100 / huku=90 / 同事套餐=10<br/>原生兜底(低): 未命中 → BQ ttpos_product_bom"]
-        PRICERES["物料单价: material_price.py 四层栈<br/>客户外挂(100+) > 上传清单(80) > ERPNext(50) > 无"]
+        PRICERES["物料单价: material_price.py 四层栈<br/>客户外挂(100+) > 上传清单(80) > ERPNext(50) > BQ ttpos_material 兜底<br/>(strict=True 时只走外挂层, 未命中=无)"]
     end
 
     AGG["semantic/aggregations/ — by_grain / kpi_ratios / pnl_layers"]
