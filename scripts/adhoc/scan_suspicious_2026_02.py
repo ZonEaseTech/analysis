@@ -1,3 +1,8 @@
+# ⚠️ 一次性排查脚本 (2026-02 profit_by_price 可疑标记扫描)。
+# 硬编码了 2026-02 月份 + STORE_UUIDS + order_excludes.csv。
+# 通用离群检测见 semantic/analytics/variance_decomposition.py。
+# 本脚本保留作该月特定数据缺口排查的审计证据。
+#
 """扫描 v10 (2026-02 profit_by_price) 已计入的行里, 哪些带'可疑'标记 —— 用来反向定位
 跟客户那边 2733 万实收的差额来源 (我们 v10 实收 27,343,837, 差 ~13,837)。"""
 import sys, csv

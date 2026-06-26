@@ -6,6 +6,7 @@ Phase 1 落地 (本):
 Phase 2 待接入数据后:
   - ttpos_anchor:      BQ vs ttpos CountSale.TotalReceivedAmount (口径对账锚)
   - ttpos_cost_anchor: 物料单价对账锚 — 我们管线 vs ERP 按 ttpos 算法复算真值
+  - payment_bridge:    支付桥对账 — 成本表(turnover) vs 汇总表(payment_collected)
   - erpnext_consumption: BQ 物料消耗 vs ERPNext 出库 (BOM 准确性)
   - platform_payout:   BQ 外卖营收 vs 平台对账单 (Grab/LINE MAN)
 """
@@ -24,6 +25,11 @@ from .ttpos_cost_anchor import (
     fetch_ttpos_truths_from_erp,
     run_cost_anchor,
 )
+from .payment_bridge import (
+    PaymentBridgeCheck,
+    PaymentBridgeResult,
+    PaymentBridgeTotals,
+)
 
 __all__ = [
     "InternalConsistencyCheck",
@@ -35,6 +41,9 @@ __all__ = [
     "compute_ttpos_unit_cost",
     "fetch_ttpos_truths_from_erp",
     "run_cost_anchor",
+    "PaymentBridgeCheck",
+    "PaymentBridgeResult",
+    "PaymentBridgeTotals",
     "load_grab_statement",
     "load_lineman_statement",
     "load_shopee_statement",
