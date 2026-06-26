@@ -5,6 +5,7 @@ stdlib unittest（仓库约定，无需 pip install）。
 import os
 import sys
 import unittest
+import warnings
 
 from tests import _setup  # noqa: F401  sys.path bootstrap
 
@@ -72,6 +73,69 @@ class TestV4Baseline(unittest.TestCase):
                 bad += 1
         self.assertEqual(bad, 0)
         self.assertGreater(ok, 4000)  # 基准约 4465 行
+
+
+class TestRuleApplies(unittest.TestCase):
+    """对齐 ttpos appliesToItemUnitCost 的条件判定逻辑。"""
+
+    def test_rule_skipped_when_price_list_mismatch(self):
+        from erpnext_price import final_unit_cost_with_rule, PricingRule
+        rule = PricingRule(margin_type="Percentage", margin_rate_or_amount=5.0,
+                           for_price_list="Buying - Internal", buying=True, disabled=False)
+        # 当前价表 = Standard Buying → 规则不适用 → 仅税
+        self.assertAlmostEqual(
+            final_unit_cost_with_rule(100.0, tax_rate=7, rule=rule,
+                                      price_list="Standard Buying"),
+            107.0)
+        # 当前价表 = Buying - Internal → 规则适用 → ×1.05 再 ×1.07
+        self.assertAlmostEqual(
+            final_unit_cost_with_rule(100.0, tax_rate=7, rule=rule,
+                                      price_list="Buying - Internal"),
+            100 * 1.05 * 1.07)
+
+    def test_rule_skipped_when_disabled(self):
+        from erpnext_price import final_unit_cost_with_rule, PricingRule
+        rule = PricingRule("Percentage", 5.0, for_price_list="", buying=True, disabled=True)
+        self.assertAlmostEqual(
+            final_unit_cost_with_rule(100.0, 7, rule, "Buying - Internal"), 107.0)
+
+    def test_rule_applies_empty_for_price_list_matches_any(self):
+        """for_price_list 为空字符串时，任意价表都适用。"""
+        from erpnext_price import final_unit_cost_with_rule, rule_applies, PricingRule
+        rule = PricingRule("Percentage", 5.0, for_price_list="", buying=True, disabled=False)
+        self.assertTrue(rule_applies(rule, "Standard Buying"))
+        self.assertTrue(rule_applies(rule, "Buying - Internal"))
+        self.assertAlmostEqual(
+            final_unit_cost_with_rule(100.0, 7, rule, "Standard Buying"),
+            100 * 1.05 * 1.07)
+
+    def test_rule_price_list_case_insensitive(self):
+        """价表名匹配大小写不敏感。"""
+        from erpnext_price import rule_applies, PricingRule
+        rule = PricingRule("Percentage", 5.0, for_price_list="buying - internal",
+                           buying=True, disabled=False)
+        self.assertTrue(rule_applies(rule, "Buying - Internal"))
+        self.assertTrue(rule_applies(rule, "BUYING - INTERNAL"))
+
+    def test_old_final_unit_cost_emits_deprecation(self):
+        """旧入口 final_unit_cost 应发出 DeprecationWarning，行为不变（v4 兼容）。"""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = final_unit_cost(100.0)
+            self.assertAlmostEqual(result, 100 * 1.05 * 1.07)
+            dep_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
+            self.assertEqual(len(dep_warnings), 1)
+            self.assertIn("final_unit_cost_with_rule", str(dep_warnings[0].message))
+
+    def test_pricing_rule_backward_compatible_positional(self):
+        """PricingRule(*DEFAULT_BUYING_RULE) 仍能构造（新字段有默认值）。"""
+        from erpnext_price import DEFAULT_BUYING_RULE
+        r = PricingRule(*DEFAULT_BUYING_RULE)
+        self.assertEqual(r.margin_type, "Percentage")
+        self.assertAlmostEqual(r.margin_rate_or_amount, 5.0)
+        self.assertEqual(r.for_price_list, "")
+        self.assertTrue(r.buying)
+        self.assertFalse(r.disabled)
 
 
 if __name__ == "__main__":
