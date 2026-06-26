@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  metrics:
+    name: metrics registry (catalog sync + contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      # The metric registry is the single source of truth; fail if the
+      # generated catalog drifted, if any report binding points at an unknown
+      # metric, or if a registry/schema invariant breaks.
+      - run: python -m semantic.metrics.render_catalog --check
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+      - run: python -m unittest tests.test_metrics_registry
+        env:
+          PYTHONPATH: ${{ github.workspace }}

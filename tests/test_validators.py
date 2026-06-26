@@ -198,5 +198,34 @@ class IdentityIntegrityTests(unittest.TestCase):
                          f"clean_row() missing keys used by identities: {missing}")
 
 
+class SummaryAndMarkerTests(unittest.TestCase):
+    """Result.summary() + the hub-capture marker emitted by print_result."""
+
+    def test_summary_counts(self):
+        bad = clean_row(revenue=0.0)  # AMOUNT_IDENTITY off by 80 → MUST_FIX
+        result = check([clean_row(), bad], DEFAULT_IDENTITIES)
+        s = result.summary()
+        self.assertEqual(s["total_rows"], 2)
+        self.assertEqual(s["must_fix"], 1)
+        self.assertEqual(s["needs_review"], 0)
+
+    def test_print_result_emits_capture_marker(self):
+        import contextlib
+        import io
+        import json
+
+        from semantic.validators.core import print_result
+
+        result = check([clean_row()], DEFAULT_IDENTITIES)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_result(result)
+        markers = [ln for ln in buf.getvalue().splitlines()
+                   if ln.startswith("[[hub:validation]]")]
+        self.assertEqual(len(markers), 1, "exactly one capture marker expected")
+        payload = json.loads(markers[0].split(" ", 1)[1])
+        self.assertEqual(payload, result.summary())
+
+
 if __name__ == "__main__":
     unittest.main()

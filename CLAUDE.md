@@ -18,6 +18,26 @@
 
 skill 强制 4 步审现状(查当前 config / 看 ground truth / 对照 / 确认报表类型), 跳过任一步就会踩历史踩过的坑 — 用错 config / 用错报表 / 用错事实表 / 误信 audit. 不要凭直觉.
 
+### 0.5. 出利润/成本 → 套餐必须"订单→商品→物料"逐层拆,禁止摊销,禁止猜
+
+⚠️ 算任何利润/成本(profit_by_price / profit_margin / 成本毛利)时,套餐(combo, product_type=1)成本**只准这一条路**:
+
+```
+订单 → 该单实际选中的子品(商品) → 每个子品的定义配方(BOM) → 物料 → × 单价
+```
+
+- **单品**(product_type=0):定义配方 × 销量,直接取,整数。
+- **套餐**:用订单事实表拿"每单实际选了哪些子品"(堂食 `ttpos_sale_order_product` product_type=2 子品行 / 外卖 `ttpos_takeout_order_item` + `ttpos_takeout_order_material`),再展开子品的定义配方。**按真实选择,不按概率。**
+- **两渠道都卖的套餐**:堂食(订单子品×配方)+ 外卖(真实扣料)**按各自销量加权混合**,不准只取一个渠道。
+- 口径 = **标准配方成本**(按 ttpos 官方配方该消耗多少 × 销量)。配方真源 = `ttpos_product_bom`/`ttpos_related_material`(验过 = ttpos BOM 卡导出,如薯条 150g 一字不差)。
+
+**死规矩(踩了 v6~v15 十几版的坑总结):**
+- ❌ **禁止任何摊销/均匀分配**:`weight = optional_count/candidate_count` 这种期望成本法**绝对不准用** —— 它把可选套餐摊成 1.333 个打包袋这种反常识分数,是历史最大的坑。
+- ❌ **禁止猜**:套餐没有"固定配方"就老老实实从订单拆;ttpos 套餐是可选结构(选1/N),配方靠订单真实选择还原,不许拍脑袋摊。
+- ⚠️ **小数 ≠ bug**:单份成本是"总料÷份数"的真实平均,出小数(0.75=4单3根吸管、有人不点饮料)是数学必然,**不是摊销、不是错**。要整数只能给固定配方表。
+- ⚠️ **两本账别混**:"标准配方成本"(配方×销量)vs"实际扣料"(`*_order_material` 真实扣减)是两个口径,差异正常(油反复用/损耗/部分订单没扣记录),别拿一个去否定另一个。利润表默认用**标准配方成本**。
+- 实现真源:`semantic/entities/recursive_bom.py`(订单拆分 + 渠道加权,**已删所有摊销代码**)。改这块前先读它,别再加回 weight。
+
 ### 1. 虚拟环境
 
 **所有 Python 脚本必须通过虚拟环境运行。**
@@ -35,10 +55,14 @@ python3 scripts/report_bom_sales_bq.py
 
 ### 2. 项目结构（最新）
 
+> ⚠️ 工作区**并存两套管线**，别混淆（全景图 + 指标谱系见 `docs/pipelines-overview.md`）：
+> - **① semantic / bq_reports** —— live 读 BQ + 多层 priority 解析 + 校验对账，平台方向。
+> - **② bom_pipeline** —— 离线读 `clean_bom.csv` 单源、payment 锚定实收，**当前《商品成本毛利分析》生产口径**（文档 `docs/bom-pipeline.md`）。
+
 ```
 analysis/
 ├── venv/                              # Python 虚拟环境（必须使用）
-├── bq_reports/
+├── bq_reports/                        # ① 平台报表入口（live BQ）
 │   ├── profit_margin_report.py        # 中间表（对账锚，BOM 物料展开 32 列）
 │   ├── profit_by_price_report.py      # 客户交付物（按价展开 18 列）
 │   └── utils/
@@ -59,18 +83,22 @@ analysis/
 │   └── validators/                    # 会计恒等式校验器（导出必跑）
 │       ├── core.py                    # Identity / Severity / check / print_result
 │       └── identities.py              # 销量恒等式、金额恒等式 + 三级阈值
+├── bom_pipeline/                      # ② 同事脚本生产线（成本毛利分析生产口径）
+│   ├── wallace_bom_margin.py          # 离线读 clean_bom.csv 算成本毛利（payment 锚定实收，四 sheet）
+│   ├── bom_rules.py                   # 渠道/物料删除规则（口径收口）
+│   └── erpnext_price.py               # 复刻 ttpos 后端 calculateFinalItemUnitCost（物料采购价）
 ├── utils/                             # 通用工具（跨业务）
 │   ├── cache.py                       # 文件缓存层
 │   ├── resource_adapter.py            # 外部资源适配器
 │   └── report_engine.py               # 报表引擎（并发查询 + 配置驱动 Excel）
 ├── resources/
-│   ├── wallace.20260422/
-│   │   ├── config.yaml                # 资源映射配置（门店名、fallback BOM）
-│   │   └── 物品消耗计算结果_*.xlsx
+│   ├── config.yaml                    # 唯一活配置（bom_sources priority 栈、门店名）
+│   ├── wallace.20260626/              # ② 当月数据（按 wallace.<YYYYMMDD>/ 归档）
+│   │   └── clean_bom.csv              # ② BOM 单源（仅 *.csv 入库，xlsx/json 本地保留）
 │   └── reports/
 │       ├── profit_margin.yaml         # 中间表列定义
 │       └── profit_by_price.yaml       # 客户交付物列定义
-├── tests/                             # 单元 + 端到端测试（>150）
+├── tests/                             # 单元 + 端到端测试（400+）
 ├── exports/                           # 报表输出目录
 └── .cache/bq_reports/                 # 缓存文件（自动创建）
 ```
