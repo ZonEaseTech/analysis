@@ -98,8 +98,8 @@ UOM 换算复用 `bq_reports/utils/erpnext_api.py` / `semantic/cogs/material_pri
 
 ## 7. 已知遗留
 
-- `wallace_bom_margin.py` 内 `resolve_recon_path` 引用未定义的 `BASE`（自动查找 recon 时报错）；
-  当前都显式传 `--recon` 规避。后续应改为相对 sales 路径或脚本目录。
-- `drop_wrong_sauce` / `drop_dinein_packaging` / `drop_takeout_single` / `drop_product_bom`
-  是 clean_bom 时代前的死代码（从不调用），规则已迁入 `bom_rules.py` + `load_clean_bom`；待清理。
-- 根目录散落的历史 xlsx 尚未清理（需逐个确认，多为同事/客户原件）。
+- ~~`resolve_recon_path` 引用未定义 `BASE`~~ → 已修（2026-06-26）：改为相对 sales 同目录查找，
+  兼容 `Wallace门店实收明细_<月>.json` 与 `recon.json`，不再依赖 sales 文件名含月份。
+  回归测试 `tests/test_recon_resolve.py`。
+- ~~`drop_*` 四个死函数~~ → 已删（2026-06-26）：clean_bom 时代前的过滤死代码，规则在 `bom_rules.py`。
+- 根目录散落的历史 xlsx 已移入 `exports/_archive/` 归档保留（未删，多为同事/客户原件）。
