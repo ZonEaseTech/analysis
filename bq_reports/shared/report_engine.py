@@ -18,7 +18,7 @@
   4. 调用引擎执行
 
 Usage:
-    from utils.report_engine import ReportEngine, ColumnConfig, SheetConfig, query_all_shops
+    from bq_reports.shared.report_engine import ReportEngine, ColumnConfig, SheetConfig, query_all_shops
 
     # 1. 初始化
     engine = ReportEngine(project_id="diyl-407103")
@@ -52,7 +52,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 # 写出口用 xlsxwriter（流式、比 openpyxl 写快 5-10×）；读输入仍走 openpyxl。
 import xlsxwriter
 
-from utils.cache import get_cache, set_cache, cache_key
+from bq_reports.shared.cache import get_cache, set_cache, cache_key
 from utils.resource_adapter import get_adapter
 
 # BQ 相关 import 延迟到 ReportEngine 初始化时，避免无 google-cloud-bigquery 环境报错

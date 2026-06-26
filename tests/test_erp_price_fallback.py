@@ -19,7 +19,7 @@ from unittest import mock
 from tests import _setup  # noqa: F401
 
 from bq_reports import profit_margin_report as pmr
-from utils import cache as cache_mod
+from bq_reports.shared import cache as cache_mod
 
 
 class ErpPriceFallbackTests(unittest.TestCase):

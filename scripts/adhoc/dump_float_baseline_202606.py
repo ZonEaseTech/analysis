@@ -59,7 +59,7 @@ from bq_reports.profit_by_price_report import (
 from semantic.aggregations.by_grain import aggregate_by_grain
 from semantic.dimensions.time import month_to_ts_range
 from semantic.entities.sale_event import METRIC_COLUMNS as SALE_EVENT_METRICS
-from utils.report_engine import ReportEngine
+from bq_reports.shared.report_engine import ReportEngine
 
 MONTH = "2026-06"
 OUTPUT_PATH = Path("exports/.dual_run/float_baseline_202606.json")

@@ -54,7 +54,7 @@ from semantic.entities.recursive_bom import (
     group_item_sql, bom_material_sql, build_store_recursive_bom)
 from semantic.validators import check, print_result
 from semantic.validators.identities import FULL_IDENTITIES
-from utils.report_engine import ReportEngine, load_sheet_config
+from bq_reports.shared.report_engine import ReportEngine, load_sheet_config
 
 
 # ============================================================================

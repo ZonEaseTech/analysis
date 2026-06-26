@@ -44,8 +44,8 @@ from semantic.resolvers import (
     Resolver,
     YamlMatchProvider,
 )
-from utils.cache import get_cache, set_cache, cache_key
-from utils.report_engine import ReportEngine, load_sheet_config
+from bq_reports.shared.cache import get_cache, set_cache, cache_key
+from bq_reports.shared.report_engine import ReportEngine, load_sheet_config
 from utils.resource_adapter import get_adapter
 
 
