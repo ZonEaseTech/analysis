@@ -30,8 +30,8 @@ class CogsPublicApi(unittest.TestCase):
             resolve_unit_price,
         ):
             self.assertTrue(callable(fn))
-        # BOM_UNIT_CORRECTIONS 硬编码已退役 (Task 3.1); 仍作为空 dict 导出以维持向后兼容
-        self.assertIsInstance(BOM_UNIT_CORRECTIONS, dict)
+        # BOM_UNIT_CORRECTIONS 过渡期 legacy 修正仍在用 (待 desired-UOM 接进生产后退役)
+        self.assertIn("MK01018", BOM_UNIT_CORRECTIONS)
 
 
 class BomMatch(unittest.TestCase):
@@ -101,16 +101,15 @@ class MaterialPrice(unittest.TestCase):
         self.assertEqual(price, 0.0)
         self.assertEqual(src, "无 (strict)")
 
-    def test_erp_unit_correction_retired(self):
-        # MK01018 的硬编码 ÷50 已退役 (BOM_UNIT_CORRECTIONS = {})。
-        # 新口径: ERP 层直接返回原价; 单位不一致应在 ERP 侧维护 Item Price,
-        # 或通过 desired_uoms 校验触发缺口报警 (见 Task 4.1 anchor)。
+    def test_erp_unit_correction_applied(self):
+        # 过渡期 legacy 修正: MK01018 在 BOM_UNIT_CORRECTIONS = {"MK01018": 50}。
+        # 不传 desired_uoms → 仅走 legacy 修正 → ERP 价 / 50。
         price, src = resolve_unit_price(
             "MK01018", 0,
             uploaded_prices={},
             erp_prices={"MK01018": (250.0, "kg")},
         )
-        self.assertEqual(price, 250.0)   # 不再 ÷50
+        self.assertEqual(price, 5.0)   # 250 / 50
         self.assertEqual(src, "ERPNext")
 
     def test_erp_layer_rejects_uom_mismatch(self):
@@ -126,6 +125,24 @@ class MaterialPrice(unittest.TestCase):
         res = r.resolve(("X", None))
         self.assertIsNotNone(res)
         self.assertAlmostEqual(res.value, 0.3)
+
+    def test_erp_uom_match_still_applies_legacy_correction(self):
+        # 共存: MK01018 传 desired_uoms 且 UOM 匹配 (ERP 也是 'pack') → UOM 校验
+        # 通过后仍走 legacy ÷50, 证明新机制与过渡期修正共存不打架。
+        erp = {"MK01018": (250.0, "pack")}
+        r = build_material_price_resolver(
+            {}, erp, [], desired_uoms={"MK01018": "pack"})
+        res = r.resolve(("MK01018", None))
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res.value, 5.0)  # 250 / 50, UOM 匹配后仍修正
+
+    def test_erp_uom_mismatch_short_circuits_before_correction(self):
+        # 共存边界: MK01018 desired='g' 而 ERP 是 'pack' → UOM 不匹配先判缺口,
+        # legacy ÷50 不应执行 (返回 None, 不是 5.0)。
+        erp = {"MK01018": (250.0, "pack")}
+        r = build_material_price_resolver(
+            {}, erp, [], desired_uoms={"MK01018": "g"})
+        self.assertIsNone(r.resolve(("MK01018", None)))
 
 
 class ExpandItemBom(unittest.TestCase):

@@ -53,38 +53,34 @@ class PriorityChainTests(unittest.TestCase):
 
 
 class UnitCorrectionTests(unittest.TestCase):
-    """BOM_UNIT_CORRECTIONS 硬编码已退役 (Task 3.1).
+    """BOM_UNIT_CORRECTIONS divides the ERP price — not the uploaded price.
 
-    原 ÷50 修正 (MK01018) 是针对 ERP 单位与 BOM 消耗单位不一致的临时 hack;
-    退役后正确做法是 ERP 在消耗 UOM 上维护 Item Price,
-    或通过 desired_uoms 校验触发缺口报警 (见 Task 4.1 anchor)。
-    BOM_UNIT_CORRECTIONS 保留为空 dict 以维持向后兼容。
+    Rationale (locked here): uploaded sheet is already in the recipe unit (we
+    divided by 销售换算系数 at load time), but ERP price is per inventory unit.
+
+    过渡期 hack (Task 3.1): 此修正在 UOM 校验通过后才应用, 待 desired-UOM 校验
+    接进生产路径 (Phase 5 / Task #6) 后退役 (见 Task 4.1 anchor)。
     """
 
-    def test_bom_unit_corrections_is_empty(self):
-        # 硬编码已退役; 空 dict 保持 backward-compat (import 不 NameError)
-        self.assertIsInstance(BOM_UNIT_CORRECTIONS, dict)
-        self.assertEqual(len(BOM_UNIT_CORRECTIONS), 0)
-
-    def test_erp_price_returned_without_correction(self):
-        # MK01018 ERP 价直接返回原值, 不再 ÷50
+    def test_correction_applied_only_to_erp(self):
+        self.assertIn("MK01018", BOM_UNIT_CORRECTIONS)
+        divisor = BOM_UNIT_CORRECTIONS["MK01018"]
         price = _resolve_base_unit_price(
             "MK01018", bq_price=0, uploaded_prices={},
-            erp_prices={"MK01018": (500, "pack")},
+            erp_prices={"MK01018": (divisor * 10, "pack")},
         )
-        self.assertEqual(price, 500, "ERP price should NOT be divided after correction retired")
+        self.assertEqual(price, 10.0, "ERP price should be divided by correction factor")
 
-    def test_uploaded_still_beats_erp(self):
-        # uploaded priority 80 > ERPNext priority 50, 与修正退役无关
+    def test_correction_not_applied_when_uploaded_wins(self):
+        # Uploaded price short-circuits the chain; correction must not run.
         price = _resolve_base_unit_price(
             "MK01018", bq_price=0,
             uploaded_prices={"MK01018": 7.0},
-            erp_prices={"MK01018": (500, "pack")},
+            erp_prices={"MK01018": (500, "pack")},  # would yield 10 if corrected
         )
         self.assertEqual(price, 7.0)
 
-    def test_no_correction_for_any_material(self):
-        # 所有物料均无硬编码修正
+    def test_no_correction_for_unlisted_material(self):
         price = _resolve_base_unit_price(
             "XYZ999", bq_price=0, uploaded_prices={},
             erp_prices={"XYZ999": (8.0, "kg")},
