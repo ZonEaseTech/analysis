@@ -8,7 +8,7 @@ semantic 层 public API。
   1. price_layers     — 客户外挂物料价 (priority 来自 layer.priority, 100+)
                         支持 layer.index_by ∈ {'code', 'name'}
   2. uploaded_prices  — --price-list 上传清单 (priority 80, 按编码)
-  3. erp_prices       — ERPNext Item Price (priority 50, 带单位修正)
+  3. erp_prices       — ERPNext Item Price (priority 50, 按 desired-UOM 校验)
   4. bq_price         — BQ ttpos_material 内置 (per-row, 不进 Resolver,
                         由 resolve_unit_price 兜底)
 
@@ -19,8 +19,13 @@ from __future__ import annotations
 from semantic.resolvers import CallableProvider, Resolved, Resolver
 
 
-# 历史遗留: ERPNext 里部分物料的"单价/单位"跟我们 BOM 单位不一致, 这里给硬修正。
-# Key = material_code (大小写不敏感), Value = 除数。
+# 过渡期 legacy 单位修正: MK01018 的 ERP Item Price 以 pack-of-50 录入, 而 BOM
+# 按单件消耗, 故 ERP 价需 ÷50 才对齐 BOM 消耗单位。Key = material_code
+# (大小写不敏感), Value = 除数。
+# ⚠️ 这是过渡期 hack, 不是永久方案。正确做法是 ERP 在物料消耗 UOM 上维护
+#    Item Price, 由 desired-UOM 校验 (本文件 _fetch_erp) 触发缺口报警替代此修正。
+#    待 desired-UOM 校验接进生产路径 (Phase 5 / Task #6) 且核实 MK01018 的
+#    消耗-UOM Item Price 后退役 (见 Task 4.1 anchor)。
 BOM_UNIT_CORRECTIONS = {
     "MK01018": 50,
 }
@@ -91,16 +96,26 @@ def build_material_price_resolver(
     *,
     strict=False,
     unit_corrections=None,
+    desired_uoms=None,
 ):
     """构造物料单价 Resolver.
 
     Args:
         uploaded_prices: dict {material_code: float} 或 None
         erp_prices: dict {material_code: (price, uom)} 或 None
-        price_layers: List[Layer] (utils.layered_resource) 或 None
+        price_layers: List[Layer] (semantic.resolvers.layered_resource) 或 None
         strict: True 时只加客户外挂层 providers (uploaded / ERPNext 不加)
-        unit_corrections: ERPNext 单位修正 dict; None 用模块默认
-                          BOM_UNIT_CORRECTIONS
+        unit_corrections: ERPNext 过渡期单位修正 dict; None 用模块默认
+                          BOM_UNIT_CORRECTIONS。仅在 UOM 校验通过后才应用。
+        desired_uoms: dict {material_code: str} — BOM 该物料的消耗单位。
+                      传入后 ERPNext 层做 desired-UOM 校验 (defense-in-depth):
+                      单位不匹配时本 ERP provider 返回 None — 这不是硬缺口/告警,
+                      只表示"本层不匹配, 交回 Resolver 续走低优先级 / bq_native 兜底"
+                      (见 resolve_unit_price 末尾)。匹配或无 desired 时再应用 legacy
+                      修正并返回价。真正的 UOM 主防线在加载层 erpnext_api.py
+                      (_pick_item_price_row), 本层只在调用方绕过 loader 时才生效。
+                      对齐 ttpos 按 desired-UOM 选行:
+                      ttpos-bmp/.../stock/item.go:385 preferItemUnitCost
 
     Returns:
         Resolver。key = (material_code, material_name) tuple, value = float price.
@@ -139,18 +154,44 @@ def build_material_price_resolver(
                 fetch=_fetch_uploaded,
             ))
 
-        # 3) ERPNext (priority 50) — 带单位修正
+        # 3) ERPNext (priority 50) — desired-UOM 校验 (defense-in-depth) + 过渡期 legacy 修正。
+        #    对齐 ttpos 按 desired-UOM 选行: ttpos-bmp/.../stock/item.go:385 preferItemUnitCost
+        #
+        #    ⚠️ 本层校验是 defense-in-depth, 不是主防线: 数据加载层 erpnext_api.py
+        #    (_pick_item_price_row, Task 1.2) 已在 load 时就把 UOM 不匹配的物料过滤掉
+        #    (不进 erp_prices)。本层只在"调用方绕过 loader、手工塞未过滤的 erp_prices"
+        #    时才会触发, 属兜底冗余校验。
         if erp_prices:
-            def _fetch_erp(key):
+            def _fetch_erp(key, _desired_uoms=desired_uoms,
+                           _unit_corrections=unit_corrections):
                 code, _name = key
                 if not code:
                     return None
                 for k in (code, str(code).upper(), str(code).lower()):
                     if k in erp_prices:
-                        price, _uom = erp_prices[k]
+                        price, uom = erp_prices[k]
+                        # desired-UOM 校验: 三 key 规范 (与 erp_prices 命中键一致),
+                        # 避免 desired_uoms 与 erp_prices 大小写不同导致校验被静默跳过。
+                        want = None
+                        for wk in (code, str(code).upper(), str(code).lower()):
+                            if _desired_uoms and wk in _desired_uoms:
+                                want = _desired_uoms[wk]
+                                break
+                        # M-1: 此 UOM 比较逻辑与 erpnext_api.py:_pick_item_price_row 重复,
+                        #      待 Phase 5 退役 legacy 修正时抽 _uom_matches 收口。
+                        if want and (uom or "").strip().lower() != want.strip().lower():
+                            # ⚠️ 返回 None ≠ 硬缺口/告警。在 Resolver 框架里 (base.py
+                            # resolve), provider 返回 None 仅表示"本 ERP provider 不匹配该
+                            # desired-UOM, 交回 Resolver 续走低优先级 provider / 最终
+                            # bq_native 兜底" (见 resolve_unit_price 末尾)。
+                            # 目前并不存在真正的"UOM 缺口告警": 不匹配会被 bq_native 吸收。
+                            # 真告警待 Phase 5 在调用层基于 source=="bq_native" 统计实现。
+                            return None
+                        # 过渡期 legacy 修正: UOM 校验通过 (或无 desired) 后再 ÷ 除数。
+                        # 待 desired-UOM 校验接进生产 (Phase 5/Task #6) 后退役此分支。
                         for corr_key in (code, str(code).upper(), str(code).lower()):
-                            if corr_key in unit_corrections:
-                                price = price / unit_corrections[corr_key]
+                            if corr_key in _unit_corrections:
+                                price = price / _unit_corrections[corr_key]
                                 break
                         return price
                 return None
@@ -173,6 +214,7 @@ def resolve_unit_price(
     strict=False,
     material_name=None,
     unit_corrections=None,
+    desired_uoms=None,
     resolver=None,
 ):
     """返回 (单价, 来源名)。把"哪份数据给出单价"暴露给上层做审计.
@@ -180,10 +222,17 @@ def resolve_unit_price(
     优先级 (高 → 低):
         1. price_layers   — 物料价 priority 栈 (支持按编码 / 按归一化名字索引)
         2. uploaded_prices — --price-list 上传清单 (按编码)
-        3. erp_prices     — ERPNext Item Price (含单位换算)
+        3. erp_prices     — ERPNext Item Price (按 desired-UOM 校验)
         4. bq_price       — BQ ttpos_material 内置 (per-row, 不进 Resolver)
 
     strict=True 时只走 price_layers, 全栈未命中 → (0, '无 (strict)') 不再 fallback。
+
+    unit_corrections: ERPNext 过渡期单位修正 dict; None 用模块默认 BOM_UNIT_CORRECTIONS;
+                      仅在 desired-UOM 校验通过后应用 (透传给 build_material_price_resolver)。
+    desired_uoms: dict {material_code: str} — BOM 该物料的消耗单位; 传给 build_material_price_resolver。
+                  ERP 层 UOM 不匹配时该 provider 返回 None, 不命中 ERPNext, 最终落
+                  bq_native 兜底 (UOM 不匹配被 bq 静默吸收, 暂无独立告警; 见
+                  build_material_price_resolver 的 desired_uoms 说明)。
 
     性能: 调用方在 per-BOM-row 循环里调用时, 应在循环外用
     build_material_price_resolver 构造一次 resolver 传进来 — 否则每行都重建
@@ -193,6 +242,7 @@ def resolve_unit_price(
         resolver = build_material_price_resolver(
             uploaded_prices, erp_prices, price_layers,
             strict=strict, unit_corrections=unit_corrections,
+            desired_uoms=desired_uoms,
         )
     result = resolver.resolve((material_code, material_name))
 

@@ -47,25 +47,30 @@ from bq_reports.profit_margin_report import (
 )
 from bq_reports.utils.bq_client import setup_proxy
 from semantic.aggregations.by_grain import aggregate_by_grain
-from semantic.dimensions.time import month_to_ts_range
+from semantic.dimensions.time import month_to_ts_range, assert_month_not_frozen
 from semantic.entities import sale_event
+from semantic.entities.order_discount import order_discount_sql
+from semantic.entities.recursive_bom import (
+    group_item_sql, bom_material_sql, build_store_recursive_bom)
 from semantic.validators import check, print_result
 from semantic.validators.identities import FULL_IDENTITIES
-from utils.report_engine import ReportEngine, load_sheet_config
+from bq_reports.shared.report_engine import ReportEngine, load_sheet_config
 
 
 # ============================================================================
 # SQL: sale_event + JOIN to product_package for name; filter by product_type
 # ============================================================================
 
-def _build_sql_templates(dine_excludes=None, takeout_excludes=None):
+def _build_sql_templates(dine_excludes=None, takeout_excludes=None,
+                         exclude_test_business=False):
     """构造 (COMBO_SQL, SINGLE_SQL) — 把排除清单注入 sale_event CTE.
 
     清单为空 → 跟模块加载时的零行为版本完全一致.
+    exclude_test_business=True → 对齐 ttpos 后台 ExcludeTestBusinessByBillSQL 口径.
     """
     tpl = f"""
 WITH
-{sale_event.sale_event_cte(dine_excludes, takeout_excludes)}
+{sale_event.sale_event_cte(dine_excludes, takeout_excludes, exclude_test_business=exclude_test_business)}
 {_BY_PRICE_SELECT_BODY}"""
     return (tpl.replace("{product_type}", "1"),
             tpl.replace("{product_type}", "0"))
@@ -225,11 +230,118 @@ def _load_platform_fees(config: dict, year_month: str) -> dict:
     }
 
 
+def _load_package_consumption(engine, merchants, start_ts, end_ts):
+    """订单回溯版 单份物品消耗 (替代套餐定义表+期望法 / 单品全SKU累加)。
+
+    返回: {store_num: {item_uuid_str: [(code, name, bom_num, bom_unit, conv_rate, bq_price), ...]}}
+    口径见 semantic/entities/package_consumption.py。命中即覆盖定义法。
+    """
+    raw_rows, errors = engine.query(
+        sql_template=package_consumption_sql(),
+        merchants=merchants,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        workers=10,
+        row_proxy_factory=lambda row, acc, num, name: type("RowProxy", (), {
+            "__getattr__": lambda self, attr: getattr(row, attr),
+            "account": acc, "store_num": num, "store_name": name,
+        })(),
+        label="订单回溯消耗",
+    )
+    out = {}
+    for row in raw_rows:
+        store = out.setdefault(row.store_num, {})
+        item = store.setdefault(str(row.item_uuid), [])
+        item.append((
+            row.material_code,
+            row.material_name,
+            float(row.bom_num or 0),
+            row.bom_unit,
+            float(row.conversion_rate or 1) if row.conversion_rate is not None else 1.0,
+            row.material_bq_price,
+        ))
+    n_items = sum(len(v) for v in out.values())
+    print(f"[Order-Traced BOM] 回溯 {len(out)} 店 / {n_items} 个 (商品,物料) 单份消耗 "
+          f"(替代套餐期望法+单品全SKU累加)")
+    if errors:
+        print(f"[Order-Traced BOM] ⚠️ {len(errors)} 店查询失败: {errors[:3]}")
+    return out
+
+
+def _load_recursive_combo_bom(engine, merchants, start_ts, end_ts):
+    """套餐 BOM 递归展开 (对齐 ttpos expandBom, 不过滤软删 + 递归到叶子)。
+
+    替代 v6 订单回溯 (取错源, 丢主料)。口径见 semantic/entities/recursive_bom.py。
+    返回: {store_num: {combo_item_uuid_str: [(code,name,bom_num,unit,conv,price), ...]}}
+    只覆盖套餐 (有 group 的商品); 单品仍走 bq_native。
+    """
+    proxy = lambda row, acc, num, name: type("RowProxy", (), {
+        "__getattr__": lambda self, attr: getattr(row, attr),
+        "account": acc, "store_num": num, "store_name": name,
+    })()
+    gi_rows, e1 = engine.query(sql_template=group_item_sql(), merchants=merchants,
+                               start_ts=start_ts, end_ts=end_ts, workers=10,
+                               row_proxy_factory=proxy, label="套餐结构(递归)")
+    bom_rows, e2 = engine.query(sql_template=bom_material_sql(), merchants=merchants,
+                                start_ts=start_ts, end_ts=end_ts, workers=10,
+                                row_proxy_factory=proxy, label="BOM物料(递归)")
+    # 按店分组, 转 dict (解耦 RowProxy)
+    gi_by, bom_by = {}, {}
+    for r in gi_rows:
+        gi_by.setdefault(r.store_num, []).append({
+            "combo": r.combo, "group_uuid": r.group_uuid, "optional_count": r.optional_count,
+            "sub": r.sub, "pbom": r.pbom, "gi_num": r.gi_num})
+    for r in bom_rows:
+        bom_by.setdefault(r.store_num, []).append({
+            "pb_uuid": r.pb_uuid, "pkg": r.pkg, "material_code": r.material_code,
+            "material_name": r.material_name, "bom_num": r.bom_num, "bom_unit": r.bom_unit,
+            "conversion_rate": r.conversion_rate, "material_bq_price": r.material_bq_price})
+    out = {}
+    for store, rows in gi_by.items():
+        out[store] = build_store_recursive_bom(rows, bom_by.get(store, []))
+    n = sum(len(v) for v in out.values())
+    print(f"[Recursive Combo BOM] {len(out)} 店 / {n} 个套餐递归展开 "
+          f"(不过滤软删 + 递归到叶子, 对齐 ttpos expandBom)")
+    if e1 or e2:
+        print(f"[Recursive Combo BOM] ⚠️ 查询失败 group:{len(e1 or [])} bom:{len(e2 or [])}")
+    return out
+
+
+def _load_order_discounts(engine, merchants, start_ts, end_ts):
+    """每店每商品的订单级折扣分摊 (堂食 7 项营销减项, 按订单内实收占比摊到 item)。
+
+    返回: {(store_num, item_uuid_str): order_discount}
+    真·实收 = 应收(actual_amount) − order_discount。口径见 semantic/entities/order_discount.py。
+    """
+    raw_rows, errors = engine.query(
+        sql_template=order_discount_sql(),
+        merchants=merchants,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        workers=10,
+        row_proxy_factory=lambda row, acc, num, name: type("RowProxy", (), {
+            "__getattr__": lambda self, attr: getattr(row, attr),
+            "account": acc, "store_num": num, "store_name": name,
+        })(),
+        label="订单折扣分摊",
+    )
+    disc = {}
+    for row in raw_rows:
+        disc[(row.store_num, str(row.item_uuid))] = int(row.order_discount or 0)  # 萨当整数
+    total = sum(disc.values())
+    print(f"[Order Discount] 加载 {len(disc)} 个 (店,商品) 订单折扣分摊, 合计 ¥{total/100:,.2f} "
+          f"(堂食 7 项: 券/会员/自定义/活动/赠送/积分/抹零)")
+    if errors:
+        print(f"[Order Discount] ⚠️ {len(errors)} 店查询失败: {errors[:3]}")
+    return disc
+
+
 def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
                          bom_layers=None, uploaded_prices=None, erp_prices=None,
                          fallback_boms=None, price_layers=None, strict_price=False,
                          strict_bom=False, revenue_by_channel=None, channel_fees=None,
-                         platform_fees_by_store=None, store_takeout_total=None):
+                         platform_fees_by_store=None, store_takeout_total=None,
+                         order_discounts=None, order_traced_boms=None):
     """Per-SKU + 横向价格档 + BOM 物料展开。
 
     输入: fine-grain (店, SKU, price) 聚合。
@@ -267,6 +379,13 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
         net_qty = (qty - data["free_qty"] - data["give_qty"]
                    - data["refund_qty"] - data["cancelled_qty"])
 
+        # #2 实收口径修正: 现有 actual_amount = 应收(成交价口径, 未减 7 项订单折扣)。
+        # 真·实收 = 应收 − 订单级折扣分摊。订单折扣仅堂食 (外卖侧为 0)。
+        order_disc = int((order_discounts or {}).get(
+            (store_num, item_uuid_str), 0))             # 萨当整数
+        receivable = data["actual_amount"]             # 应收 (折前订单), 萨当整数
+        net_received = receivable - order_disc          # 真·实收 (萨当整数)
+
         # Top-N 价格档 + 其它销量
         price_tiers = data["price_tiers"]
         top_n = price_tiers[:TOP_N_PRICES]
@@ -275,15 +394,17 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             top_n.append((None, None))
 
         # SKU 级 prefix（merge: true，跨 BOM 行复制）
+        # 交易金额 (营业额/标准/实收/退款/取消) 是萨当整数, 列标 money_satang →
+        # 引擎写盘时 /100 还原成元 (PR-B 7b). 不在此 round (萨当整数已精确).
         prefix = [
             store_num,                              # 0  门店编号        A
             store_name,                             # 1  门店名称        B
             item_name,                              # 2  商品名称        C
             round(qty, 2),                          # 3  销量            D
             round(net_qty, 2),                      # 4  净销量          E
-            round(data["sales_price"], 2),          # 5  营业额          F
-            round(data["original_amount"], 2),      # 6  标准金额        G
-            round(data["actual_amount"], 2),        # 7  实收金额        H  ★
+            data["sales_price"],                    # 5  营业额(萨当)    F
+            data["original_amount"],                # 6  标准金额(萨当)  G
+            net_received,                           # 7  实收金额(真,萨当) H  ★ = 应收 − 订单折扣
             None, None, None,                       # 8-10 折损/客单实收/实收占比 (formula)
             # 价格档 5 对 + 其它销量
             (round(top_n[0][0], 2) if top_n[0][0] is not None else None),  # 11 售价1
@@ -300,9 +421,9 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             round(data["free_qty"], 2),             # 22 赠品数量        W
             round(data["give_qty"], 2),             # 23 赠送数量        X
             round(data["refund_qty"], 2),           # 24 退款数量        Y
-            round(data["refund_amount"], 2),        # 25 退款金额        Z
+            data["refund_amount"],                  # 25 退款金额(萨当)  Z
             round(data["cancelled_qty"], 2),        # 26 取消数量       AA
-            round(data["cancelled_amount"], 2),     # 27 取消金额       AB
+            data["cancelled_amount"],               # 27 取消金额(萨当) AB
         ]
         bom_list, bom_source, price_source = _bom_for_item(
             store_num, item_uuid_str, item_name,
@@ -310,12 +431,14 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             bom_layers, uploaded_prices, erp_prices,
             price_layers=price_layers, strict_price=strict_price,
             strict_bom=strict_bom, price_resolver=_price_resolver,
+            order_traced_boms=order_traced_boms,
         )
 
         # 渠道分实收 — 用于算 3 项费用
+        # 边界: revenue_by_channel 是萨当 → 元, 进入估算域跟费率算 (PR-B 7b)
         rev_ch = revenue_by_channel.get((store_num, item_uuid_str), {})
-        revenue_dine = float(rev_ch.get("dine", 0))
-        revenue_takeout = float(rev_ch.get("takeout", 0))
+        revenue_dine = float(rev_ch.get("dine", 0)) / 100.0      # 萨当→元
+        revenue_takeout = float(rev_ch.get("takeout", 0)) / 100.0  # 萨当→元
         payment_fee = revenue_dine * dine_pay_rate
         service_fee_income = revenue_dine * dine_svc_rate
         # 平台抽佣: 优先用对账单事实费率 (该店真实综合费率)
@@ -340,6 +463,8 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
             round(service_fee_income, 2),           # 42 服务费收入       AQ  (NEW)
             None,                                   # 43 净利润           AR  (formula)
             None,                                   # 44 净利率           AS  (formula)
+            receivable,                             # 45 应收金额(折前,萨当) AT  = 成交价口径, 未减订单折扣
+            order_disc,                             # 46 订单级折扣(萨当)    AU  = 7项营销减项分摊
         ]
 
         if not bom_list:
@@ -361,7 +486,7 @@ def _build_by_price_rows(grouped, bom_data, combo_structure, mode,
 def _sanity_check_cost(grouped, bom_data, combo_structure, mode,
                        bom_layers=None, uploaded_prices=None, erp_prices=None,
                        fallback_boms=None, price_layers=None, strict_price=False,
-                       top_n: int = 10):
+                       top_n: int = 10, order_traced_boms=None, strict_bom=False):
     """单份总成本 = 0 但有销量 = 数据异常（最常见原因：BOM 或物料价格未加载）。
 
     跟会计恒等式（必须严格成立）不同 —— 这是业务合理性检查。同一个 SKU
@@ -390,7 +515,8 @@ def _sanity_check_cost(grouped, bom_data, combo_structure, mode,
             bom_data, combo_structure, mode,
             bom_layers, uploaded_prices, erp_prices,
             price_layers=price_layers, strict_price=strict_price,
-            price_resolver=_price_resolver,
+            strict_bom=strict_bom, price_resolver=_price_resolver,
+            order_traced_boms=order_traced_boms,
         )
         per_unit_cost = sum(num * unit_price for _, _, num, unit_price, _ in bom_list)
         if per_unit_cost == 0:
@@ -401,7 +527,7 @@ def _sanity_check_cost(grouped, bom_data, combo_structure, mode,
 def _bom_for_item(store_num, item_uuid, item_name, bom_data, combo_structure,
                   mode, bom_layers, uploaded_prices, erp_prices,
                   price_layers=None, strict_price=False, strict_bom=False,
-                  price_resolver=None):
+                  price_resolver=None, order_traced_boms=None):
     """Compute BOM list with prices for one SKU.
 
     BOM 选取顺序 (跟 profit_margin 一致):
@@ -433,7 +559,21 @@ def _bom_for_item(store_num, item_uuid, item_name, bom_data, combo_structure,
         price_sources_seen.add(src)
         return p
 
-    if strict_bom:
+    # 套餐递归展开 BOM: 命中即覆盖定义法 (套餐期望法 1.333 / 单品全SKU累加)。
+    # 口径见 semantic/entities/recursive_bom.py —— 不过滤软删 + 递归到叶子, 对齐 ttpos expandBom。
+    native_label = "bq_native"
+    ot_bom = (order_traced_boms or {}).get(store_num, {}).get(item_uuid)
+    if ot_bom:
+        native_label = "recursive_def"
+        seen = set()
+        bom_list = []
+        for material_code, material_name, bom_num, bom_unit, conv_rate, bq_price in ot_bom:
+            if not material_code or material_code in seen:
+                continue
+            seen.add(material_code)
+            unit_price = _resolve(material_code, bq_price, material_name) * (conv_rate or 1)
+            bom_list.append((material_code, material_name, bom_num, unit_price, bom_unit))
+    elif strict_bom:
         # 跳过 BQ 原生 BOM 计算, bom_list 留空, 等下要么 bom_layers 命中, 要么"无"
         bom_list = []
     elif mode == "combo":
@@ -469,7 +609,7 @@ def _bom_for_item(store_num, item_uuid, item_name, bom_data, combo_structure,
             unit_price = _resolve(material_code, bq_price, material_name) * (conv_rate or 1)
             bom_list.append((material_code, material_name, bom_num, unit_price, bom_unit))
 
-    bom_source = "bq_native" if bom_list else None
+    bom_source = native_label if bom_list else None
 
     # 外挂 BOM override (priority 栈, 高 priority 覆盖 BQ 原生)
     matched, layer_name = _match_bom_layered(item_name, bom_layers or [])
@@ -531,8 +671,11 @@ def main() -> int:
     parser.add_argument("--allow-bq-native-bom", action="store_true",
                         help="允许 fallback BQ 内置 BOM (默认禁用)。默认: BOM 只走 bom_sources, "
                              "缺失即标 BOM来源='无', 成本列空。")
+    parser.add_argument("--force", action="store_true",
+                        help="强制导出即使校验未通过 (文件将带水印, 不得对外交付)")
     args = parser.parse_args()
 
+    assert_month_not_frozen(args.month)
     setup_proxy()
     start_ts, end_ts = month_to_ts_range(args.month)
     # 自动版本号: 默认输出 exports/profit_by_price_{月}_v{N}.xlsx，每次升版。
@@ -586,6 +729,11 @@ def main() -> int:
         print(f"[Platform Fees] ⚠️ 未加载到 {args.month} 平台抽佣事实, 全部走 fallback 费率")
 
     combo_structure = _load_combo_structures(engine, merchants, start_ts, end_ts, config)
+    # #2 实收口径: 订单级 7 项折扣分摊 (堂食), 真·实收 = 应收 − 此值
+    order_discounts = _load_order_discounts(engine, merchants, start_ts, end_ts)
+    # #3/#4 成本口径: 套餐 BOM 递归展开 (对齐 ttpos expandBom, 不过滤软删 + 递归到叶子)。
+    # 替代 v6 订单回溯 (取错源丢主料)。覆盖套餐; 单品走 bq_native。
+    order_traced_boms = _load_recursive_combo_bom(engine, merchants, start_ts, end_ts)
     bom_data = _load_boms(engine, merchants, config)
     bom_layers = _load_bom_layers(config)
     price_layers = _load_material_price_layers(config)
@@ -611,6 +759,19 @@ def main() -> int:
         combo_sql_t, single_sql_t = _build_sql_templates(dine_excl, takeout_excl)
     else:
         combo_sql_t, single_sql_t = COMBO_BY_PRICE_SQL, SINGLE_BY_PRICE_SQL
+
+    # 测试营业时段过滤 (对齐 ttpos 后台口径 ExcludeTestBusinessByBillSQL)
+    # 只对存在 ttpos_business_status_period 表的店启用 → 按店切换 SQL 模板
+    from semantic.dimensions.test_business import get_stores_with_test_business
+    merchant_uuids = [m[1] for m in merchants]
+    tb_stores = get_stores_with_test_business(engine.client, merchant_uuids)
+    if tb_stores:
+        print(f"[Test Business] 排除测试营业时段, 影响 {len(tb_stores)} 店: "
+              f"{sorted(tb_stores)}")
+        combo_sql_tb, single_sql_tb = _build_sql_templates(
+            dine_excl, takeout_excl, exclude_test_business=True)
+    else:
+        combo_sql_tb = single_sql_tb = None
 
     modes = ["combo", "single"] if args.mode == "both" else [args.mode]
 
@@ -642,11 +803,22 @@ def main() -> int:
               f"实收 {ext_rev_total:,.0f} 泰铢, "
               f"高置信 {ext_matched:,.0f} ({ext_matched/ext_rev_total*100:.1f}%)")
 
+    watermarked = False  # 多 mode 循环只打一次水印
+    from semantic.validators.gate import (
+        add_watermark_sheet_xlsxwriter, validate_and_gate)
+    from semantic.validators.identities import FULL_IDENTITIES
+
     for mode in modes:
         item_label = "套餐" if mode == "combo" else "单品"
         sql_template = combo_sql_t if mode == "combo" else single_sql_t
+        sql_template_tb = combo_sql_tb if mode == "combo" else single_sql_tb
         print(f"\n========== 处理 {item_label} ==========")
 
+        # 按 store 切换: 启用测试营业过滤的店用 _tb 版, 其他用普通版
+        sql_factory = (
+            (lambda u: sql_template_tb if u in tb_stores else sql_template)
+            if tb_stores else None
+        )
         raw_rows, errors = _timed("BQ 拉数", lambda: engine.query(
             sql_template=sql_template,
             merchants=merchants,
@@ -658,6 +830,7 @@ def main() -> int:
                 "account": acc, "store_num": num, "store_name": name,
             })(),
             label=item_label,
+            sql_template_factory=sql_factory,
         ))
 
         # Fine-grain (店, SKU, price) 聚合 — 用于收集每 SKU 价格档列表
@@ -692,6 +865,8 @@ def main() -> int:
             channel_fees=channel_fees,
             platform_fees_by_store=platform_fees_by_store,
             store_takeout_total=store_takeout_total,
+            order_discounts=order_discounts,
+            order_traced_boms=order_traced_boms,
         ))
 
         # 外部源 SKU 行: append 到该 mode 的 flat_rows 末尾
@@ -708,7 +883,9 @@ def main() -> int:
         if not external_rows:
             print(f"[{item_label}] {len(flat_rows)} 行")
 
-        # Accounting-identity validation (per fine-grain key — finer = 更严)
+        # 零容差闸门: 校验恒等式 + sanity (FULL_IDENTITIES)
+        # fine-grain (店, SKU, price) 粒度检查 — 更严
+        # 闸门在 wb.close() 前执行 — 有 MUST_FIX 且无 --force 则 exit(2), 不落盘
         check_rows = [
             {
                 "store_num": k[0], "item_name": k[3], "price": k[4],
@@ -719,14 +896,14 @@ def main() -> int:
             }
             for k, v in grouped.items()
         ]
-        print(f"\n[{item_label}] 校验恒等式 + sanity …")
-        result = _timed("校验恒等式", lambda: check(check_rows, FULL_IDENTITIES))
-        print_result(
-            result,
+        outcome = _timed("校验恒等式", lambda: validate_and_gate(
+            check_rows, FULL_IDENTITIES,
+            force=args.force, report_name=f"profit_by_price/{item_label}",
             row_label=lambda r: f"店 {r['store_num']:>3}  {r['item_name']:<24}  @¥{r['price']}",
-        )
-        if result.has_must_fix:
-            print(f"⚠️  [{item_label}] 有 🔴 离谱违反，发出前请核实数据/口径。\n")
+        ))
+        if outcome.needs_watermark and not watermarked:
+            add_watermark_sheet_xlsxwriter(wb, outcome.watermark_lines())
+            watermarked = True
 
         # 业务合理性 sanity check（独立于会计恒等式）
         zero_cost = _timed("sanity check", lambda: _sanity_check_cost(
@@ -734,6 +911,7 @@ def main() -> int:
             bom_layers=bom_layers,
             uploaded_prices=uploaded_prices, erp_prices=erp_prices,
             price_layers=price_layers, strict_price=strict_price,
+            strict_bom=strict_bom, order_traced_boms=order_traced_boms,
         ))
         if zero_cost:
             print(f"\n[{item_label}] 🟠 单份总成本=0 异常: {len(zero_cost)} SKU 行")
@@ -741,7 +919,8 @@ def main() -> int:
             print(f"   后果: 利润率显示为 100% (实际无意义)")
             for (k, q, actual) in sorted(zero_cost, key=lambda x: -x[2])[:10]:
                 # sku_key 现在是 (店编, 店名, item_uuid, SKU名)，已不含 price
-                print(f"   店 {k[0]:>3}  {k[3]:<28}  qty={q:>5.0f}  实收 ¥{actual:>10.0f}")
+                # actual 是萨当 → 元显示 (PR-B 7b)
+                print(f"   店 {k[0]:>3}  {k[3]:<28}  qty={q:>5.0f}  实收 ¥{actual/100.0:>10.0f}")
             if len(zero_cost) > 10:
                 print(f"   ⏬ 还有 {len(zero_cost)-10} 条略")
 

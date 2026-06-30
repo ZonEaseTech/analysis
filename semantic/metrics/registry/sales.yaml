@@ -1,0 +1,352 @@
+# 销售域 — sales domain metrics.
+# Authored from docs/metrics-catalog.md. This file is the single source of
+# truth; the catalog markdown is generated from it (render_catalog.py).
+metrics:
+  - id: gmv
+    name: "GMV / 总营业额"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    grain: "(item, price, channel)"
+    unit: THB
+    definition: >-
+      销售域总流水。商品按各渠道实际成交价 × 销量。含赠送/退款/折扣件，不含外卖取消订单。
+    formula:
+      business: "堂食 GMV + 外卖 GMV"
+      sql_refs:
+        - "semantic/entities/sale_line.py:38 — SUM(product_sale_price * product_num)"
+        - "semantic/entities/takeout_line.py:28 — SUM(IF(state IN (10,20,30,40), price * quantity, 0))"
+        - "semantic/entities/total_line.py:18-43 — merged AS (FULL OUTER JOIN shop_sales + takeout_sales)"
+    lineage:
+      source_tables: [ttpos_statistics_product, ttpos_takeout_order_item]
+      upstream_metrics: [dine_gmv, takeout_gmv]
+    report_display: "pnl_statement Sheet 1（总览）· Sheet 3（按店）· Sheet 4（按渠道）· Sheet 6（审计追溯）"
+    notes: >-
+      外卖侧 toi.price * qty 是商品级口径；ttpos 后端 CountTakeoutSale 用订单级 platform_total。
+      华莱士现状（merchant_charge_fee = merchant_discount = 0）两者数值一致；上线商家服务费后会偏离。
+    ttpos_source: "main/app/api/v1/shop/shop_statistics.go:274 CountProductSales (堂食) + main/app/repository/statistics_takeout.go:200 CountTakeoutSale (外卖)"
+    related_docs: [profit-margin-reconciliation-checklist.md]
+
+  - id: net_sales
+    name: "Net Sales / 净销售额"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    unit: THB
+    definition: >-
+      扣完所有损失项后的实收。等价于 ttpos 后端 CountProductSale.actual_sale_amount，是利润计算的分母锚点。
+    formula:
+      business: "GMV − Returns − Cancellations − Promotions(Free + Give + Discount) = ttpos actual_amount"
+      sql_refs:
+        - "semantic/entities/sale_line.py:42-43 — SUM(IF(free|give, 0, final_price * (num - refund_num)))"
+        - "semantic/entities/takeout_line.py:29 — 同 GMV 公式（外卖侧无折扣）"
+        - "semantic/entities/total_line.py:23-25 — IFNULL(s.actual_amount,0) + IFNULL(t.actual_amount,0)"
+    lineage:
+      source_tables: [ttpos_statistics_product, ttpos_takeout_order_item]
+      upstream_metrics: [gmv, refund_amount, free_amount, give_amount, discount_amount, cancelled_amount]
+    reconciliation:
+      anchor: "TtposAnchorCheck — BQ Net Sales == ttpos 后端 SQL 结果"
+      impl: "semantic/reconciliation/checks/ttpos_anchor.py"
+      status: "2026-04 实测差 69/3464 万 ≈ 0.0002%"
+    notes: >-
+      当前是管理会计 Net Sales，不等同法定财报口径（VAT 含税/不含税未确认）。详见 pnl-accounting-standards-gap.md Gap 3。
+      ⚠️ 标签有歧义: 此处实际是**应收 (receivable)** = ttpos actual_sale_amount，尚未扣除订单级 7 项营销折扣。
+      真·实收 (net_revenue) 需再减 order_discount。详见下方 receivable / net_revenue 拆分。
+    related_docs: [pnl-accounting-standards-gap.md]
+
+  # ── 应收 / 实收 (拆自原 net_sales, 对齐 ttpos CountProductSale + 订单折扣拆解) ──
+  - id: receivable
+    name: "Receivable / 营业应收"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    grain: "(item, channel)"
+    unit: THB
+    definition: >-
+      扣完行级折扣(调价 discount_amount)和退款/赠品/赠送后的净额，等于 ttpos CountProductSale.actual_sale_amount。
+      是"应收"，不等于"实收"——还没减订单级 7 项营销折扣。ttpos 后端 shop_statistics.go:274 CountProductSales
+      用 actual_sale_amount = IF(free|give, 0, final_price × (num − refund))。
+    formula:
+      business: "GMV − refund_amount − free_amount − give_amount − discount_amount"
+      sql_refs:
+        - "semantic/entities/sale_line.py:42-43 — IF(free_num|give_num, 0, product_final_price × (product_num − refund_num))"
+        - "semantic/entities/takeout_line.py:29 — 外卖侧 active states 的 platform_total"
+        - "semantic/entities/total_line.py:23-25 — IFNULL(s.actual_amount,0) + IFNULL(t.actual_amount,0)"
+    lineage:
+      source_tables: [ttpos_statistics_product, ttpos_takeout_order]
+      upstream_metrics: [gmv, refund_amount, free_amount, give_amount, discount_amount]
+    reconciliation:
+      anchor: "TtposAnchorCheck — BQ receivable == ttpos 后端 CountProductSale SQL 结果"
+      impl: "semantic/reconciliation/checks/ttpos_anchor.py"
+      status: "2026-04 实测差 69/3464 万 ≈ 0.0002%"
+    report_display: "pnl_statement::Net Sales 行（实为应收）"
+    notes: >-
+      对应 ttpos 后台"成本毛利"页的"营业额"列(cost_profit.go 算法) + 外卖 platform_total。
+      与实收(见 net_revenue)差 ≈ coupon + 活动 + 会员折扣 + 自定义折扣 + 抹零 + 积分抵扣(7 项订单营销折扣)。
+      bridge 脚本: scripts/adhoc/recon_cost_vs_summary_bridge.py。
+
+  - id: net_revenue
+    name: "Net Revenue / 门店实收"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    grain: "(item, channel)"
+    unit: THB
+    definition: >-
+      receivable 再减 7 项订单营销折扣后的真·实收。对应 ttpos 后台"支付汇总"页口径:
+      (payment_amount − refund_amount − payment_balance) + 外卖 platform_total。
+      是利润表的真分母。
+    formula:
+      business: "receivable − Σ(coupon + member_discount + custom_discount + activity + gift + pay_points + zero_checkout)"
+      sql_refs:
+        - "semantic/entities/order_discount.py:L28-31 — 7 项 DISCOUNT_EXPR"
+        - "semantic/entities/order_discount.py:L60 — CAST(ROUND(disc × rev/Σrev × 100) AS INT64)"
+    lineage:
+      source_tables: [ttpos_statistics_product, ttpos_sale_order, ttpos_takeout_order]
+      upstream_metrics: [receivable]
+      downstream_metrics: [payment_collected]
+    reconciliation:
+      anchor: "2026-06 桥已建(recon_cost_vs_summary_bridge.py), receivable − payment_collected ≈ coupon + other − refund_gap + takeout_gap, 残差抹零级"
+      status: "桥验证, 但未入闸门(待月跑自动锚)"
+    notes: >-
+      ttpos 系统里没有"net_revenue"这张表; 它是 receivable(成本表) − 7 项订单折扣。
+      实际到账 (bank_deposited) 还需再减平台抽佣/退款时效差, 见 payment 域。
+
+  - id: gross_profit
+    name: "Gross Profit / 销售毛利"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    unit: THB
+    definition: "扣完物料成本后的毛利。不含平台抽佣/人力/房租。"
+    formula:
+      business: "Net Sales − COGS"
+      sql_refs:
+        - "bq_reports/pnl_statement.py::_compute_cogs_from_rows — COGS"
+        - "semantic/aggregations/pnl_layers.py::build_pnl — 集团层减法"
+    lineage:
+      upstream_metrics: [net_sales, cogs]
+    current_value: "2026-04 华莱士毛利率 5.1% 🔴（远低健康线，反映 ERP 单价虚高 + fallback_bom 误匹配）"
+
+  - id: dine_gmv
+    name: "dine_gmv / 堂食营业额"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    grain: "(item, price, channel='dine')"
+    unit: THB
+    definition: "仅 channel='dine' 的 GMV 部分。"
+    formula:
+      business: "Σ(堂食 price × qty)"
+      sql_refs:
+        - "semantic/entities/sale_event.py:23-54 — UNION ALL 的堂食段"
+    lineage:
+      source_tables: [ttpos_statistics_product]
+    report_display: "pnl_statement::aggregate_sales_by_channel 按 channel 拆 → Sheet 4"
+
+  - id: takeout_gmv
+    name: "takeout_gmv / 外卖营业额"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    grain: "(item, price, channel='takeout')"
+    unit: THB
+    definition: >-
+      仅 channel='takeout' 的 GMV 部分（含 state=60 取消单的标价金额，GMV 一般用 active states 数据）。
+    formula:
+      business: "Σ(外卖 price × qty)"
+      sql_refs:
+        - "semantic/entities/sale_event.py:56-91 — UNION ALL 的外卖段"
+    lineage:
+      source_tables: [ttpos_takeout_order_item]
+    notes: >-
+      外卖侧 toi.price 是平台实付价（已含可能的促销让利）；商家结算价是订单级 platform_total
+      = subtotal + merchant_charge_fee − merchant_discount。华莱士现状两者数值一致。
+
+  - id: cogs
+    name: "COGS / 物料成本"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    unit: THB
+    definition: "跟着销量按 BOM 配方 × 物料单价算出来的食材成本。"
+    formula:
+      business: "Σ over SKU [ per_unit_cost × qty ]，其中 per_unit_cost = Σ(bom_num × unit_price) 跨 BOM 物料"
+      excel: "=SUMPRODUCT(消耗数量, 物料单价)"
+      sql_refs:
+        - "bq_reports/pnl_statement.py::_compute_cogs_from_rows"
+    lineage:
+      source_tables: [ttpos_product_bom, ttpos_material]
+    reconciliation:
+      anchor: "profit_margin 跟 pnl_statement COGS byte-equal"
+      status: "2026-04 差 0.23/3287 万 ≈ 0 浮点累积"
+    current_value: "Food Cost% 2026-04 = 94.9% 🔴（业务侧要治理，非 SQL bug）"
+    notes: >-
+      单品 = bom_num × unit_price × qty；套餐遍历 combo_structure 子商品。BOM 数量源
+      ttpos_product_bom(BQ) + bom_layers(客户外挂)；物料单价走 price_layers > uploaded_prices >
+      ERPNext > bq_native priority 栈。配置 resources/config.yaml 的 bom_sources / material_price_sources。
+      排障：单份成本异常高八成是 fallback_bom 误匹配；=0 多为 strict 模式未维护单价 / 套餐无配方。
+    combo_methodology: >-
+      ⚠️ 套餐成本只准走"订单→子品→物料"逐层拆解, 绝对禁止摊销/均匀分配。规则真源:
+        - optional 组(z选k): 按**订单事实表该单实际选中的子品**展开(堂食: ttpos_sale_order_product
+          product_type=2 子品行; 外卖: ttpos_takeout_order_item + ttpos_takeout_order_material 真实扣料)。
+          绝不准用 weight=optional_count/candidate_count 均匀摊(踩坑: 1.333 个打包袋)。
+        - 固定组: 直接取定义配方 ttpos_product_bom(已验= ttpos BOM 卡导出, 如薯条 150g 一字不差)。
+        - 两渠道都卖的套餐: 堂食(订单子品×配方)+ 外卖(真实扣料)按各自销量加权混合。
+        - 禁止任何 amortize / candidate / expected_cost 写法。实现: semantic/entities/recursive_bom.py。
+    related_docs: [profit-margin-reconciliation-checklist.md]
+
+  # ── 支付三口径 (营业额 vs 支付净额 vs 实际到账, 拆自 recon_cost_vs_summary_bridge.py) ──
+  - id: turnover
+    name: "Turnover / 营业额(成本表口径)"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    unit: THB
+    definition: >-
+      ttpos 后台"成本毛利"页显示的营业额。堂食 = receivable(已扣行级折扣);
+      外卖 = subtotal(price×qty, 非 platform_total)。华莱士现状下外卖 sub≈platform_total(merchant_charge_fee=0)。
+    formula:
+      business: "dine_receivable + takeout_subtotal"
+      sql_refs:
+        - "semantic/entities/sale_line.py:42-43 — 堂食 final_price×(num−refund), 免单赠送=0"
+        - "recon_cost_vs_summary_bridge.py:34-37 — 堂食段: SUM(IF(free|give,0,product_final_price×(product_num−refund_num)))"
+        - "recon_cost_vs_summary_bridge.py:42-46 — 外卖段: SUM(IF(state IN(10,20,30,40),subtotal,0))"
+    lineage:
+      source_tables: [ttpos_statistics_product, ttpos_takeout_order]
+      upstream_metrics: [receivable]
+    reconciliation:
+      anchor: "recon_cost_vs_summary_bridge.py — turnover − payment_collected = coupon + other_disc − refund_gap + takeout_gap, 残差抹零级"
+      status: "2026-06 60店桥验证, 净残差抹零级"
+    report_display: "ttpos 后台 → 成本毛利 → 统计 → 营业额列"
+    ttpos_source: "main/app/api/v1/shop/shop_statistics.go:274 CountProductSales + shop_statistics.go:304(unit_cost 列)+ repository/statistics_takeout.go:200 CountTakeoutSale"
+    notes: >-
+      营业额 ≠ 支付净额 ≠ 实际到账。客户拿营业额对银行会喊"数据错"——根因就三个口径混了。
+      见下方 payment_collected / bank_deposited 区分。
+
+  - id: payment_collected
+    name: "Payment Collected / 支付净额(汇总表口径)"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    unit: THB
+    definition: >-
+      ttpos 后台"支付汇总"页的实收金额。堂食 = payment_amount − refund_amount − payment_balance
+      (ttpos_statistics_sale 的实收, 扣了支付退款+挂账); 外卖 = platform_total(订单级结算价)。
+      是门店实际收到(但还没扣平台抽佣/银行手续费)的钱。
+    formula:
+      business: "(payment_amount − refund_amount − payment_balance) + takeout platform_total"
+      sql_refs:
+        - "recon_cost_vs_summary_bridge.py:38-40 — 堂食段: IFNULL(SUM(payment_amount−refund_amount−payment_balance),0)"
+        - "recon_cost_vs_summary_bridge.py:42-46 — 外卖段: SUM(platform_total) for active states"
+        - "semantic/entities/sale_event.py — 堂食 bill.payment_amount 仅含 POS 收款"
+    lineage:
+      source_tables: [ttpos_statistics_sale, ttpos_takeout_order, ttpos_sale_bill]
+      upstream_metrics: [turnover]
+    reconciliation:
+      anchor: "recon_cost_vs_summary_bridge.py — turnover−payment_collected ≈ 7项订单折扣 − 退款口径差 + 外卖口径差"
+      status: "coupon 是主因; other(gift/pay_points) ≈0 未被样本检验(若某月搞整单赠送/积分抵扣可能双算)"
+    report_display: "ttpos 后台 → 支付汇总 → 支付金额列"
+    ttpos_source: "main/app/service/statistics.go:27 CountSale (ttpos_statistics_sale.payment_amount−refund−balance) + statistics_takeout.go:200 CountTakeoutSale(platform_total)"
+    notes: >-
+      ⚠ coverage gap: payment_amount 仅含堂食 POS 收款(sale_bill.payment_amount), 外卖支付走平台侧不经 sale_bill。
+      实测 shop001/005/010 payment_amount ≈ stat_actual_dine(缺口 ±0.2~2.5%)。外卖侧支付对账待接 Grab/LINE MAN 平台对账单(子项目 D)。
+
+  - id: bank_deposited
+    name: "Bank Deposited / 实际到账"
+    domain: sales
+    status: planned
+    confidence: NA
+    unit: THB
+    definition: >-
+      银行账户实际入账金额。真源 = 银行流水 / 平台结算单(Grab/LINE MAN/Shopee),
+      不是 ttpos。payment_collected − 平台抽佣 − 支付通道费 − 退款时效差 − 结算周期差 ≈ bank_deposited。
+    formula:
+      business: "payment_collected − platform_commission − payment_processing_fee ± timing_differences"
+      sql_refs:
+        - "无 SQL 源 (bank statement / platform settlement CSV)"
+    lineage:
+      source_tables: "[external] bank statement / Grab-LINEMAN-Shopee settlement report"
+      upstream_metrics: [payment_collected, platform_commission]
+    reconciliation:
+      anchor: "待接平台对账单 loader → platform_payout anchor → bank reconciliation"
+      status: "Phase 2 待实施, 依赖客户给平台对账单样本"
+    ttpos_source: "非 ttpos 系统 — 银行流水 / Grab Merchant Portal / LINE MAN Partner Portal"
+    notes: >-
+      华莱士现状: 外卖占销售额 ~15%, 平台抽佣 28%, 结算周期 T+7~30 天。
+      当前 payment_collected 与 bank_deposited 的差 ≈ platform_commission(估算) + 结算时间差。
+      真·三大口径对齐: turnover − refunds/discounts = payment_collected − platform_fees = bank_deposited ± timing
+
+  - id: refund_amount
+    name: "refund_amount / 退款金额"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    unit: THB
+    definition: "堂食侧退款标价金额。只有堂食有，外卖侧固定 0。"
+    formula:
+      business: "标价 × 退款数量"
+      sql_refs:
+        - "semantic/entities/sale_line.py:45 — SUM(product_sale_price * refund_num)"
+    lineage:
+      source_tables: [ttpos_statistics_product]
+    notes: "进 pnl_layers 减项；进 validators.AMOUNT_IDENTITY 平账等式。"
+
+  - id: free_amount
+    name: "free_amount / 赠品金额"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    unit: THB
+    definition: "赠品（公司活动赠送，进 free_num，整行金额计 0）。ttpos 把整行算赠送，不区分单件。"
+    formula:
+      business: "Σ IF(free_num > 0, sale_price × num, 0)"
+      sql_refs:
+        - "semantic/entities/sale_line.py:50 — free 段"
+    lineage:
+      source_tables: [ttpos_statistics_product]
+    notes: "外卖侧无此概念固定 0。进 pnl_layers::promo_deductions 减项。与 give_amount 在 catalog 同一节文档。"
+
+  - id: give_amount
+    name: "give_amount / 赠送金额"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    unit: THB
+    definition: "赠送（顾客感谢/补偿赠送，进 give_num，整行金额计 0）。"
+    formula:
+      business: "Σ IF(give_num > 0, sale_price × num, 0)"
+      sql_refs:
+        - "semantic/entities/sale_line.py:51 — give 段"
+    lineage:
+      source_tables: [ttpos_statistics_product]
+    notes: "进 pnl_layers::promo_deductions 减项。"
+
+  - id: discount_amount
+    name: "discount_amount / 调价折扣"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    unit: THB
+    definition: "堂食侧成交价低于标价的部分。"
+    formula:
+      business: "(product_sale_price − product_final_price) × (num − refund_num)"
+      sql_refs:
+        - "semantic/entities/sale_line.py:53-54"
+    lineage:
+      source_tables: [ttpos_statistics_product]
+    notes: "进 pnl_layers::promo_deductions 减项。"
+
+  - id: cancelled_amount
+    name: "cancelled_amount / 外卖取消"
+    domain: sales
+    status: live
+    confidence: ACTUAL
+    unit: THB
+    definition: "外卖订单 state=60（取消）的标价金额。只有外卖有，堂食侧固定 0。"
+    formula:
+      business: "Σ IF(state = 60, price × quantity, 0)"
+      sql_refs:
+        - "semantic/entities/takeout_line.py:42"
+    lineage:
+      source_tables: [ttpos_takeout_order_item]

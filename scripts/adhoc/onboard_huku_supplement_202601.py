@@ -32,6 +32,53 @@ EXISTING_BOM = "resources/wallace.20260514/最终BOM_202605.csv"
 OUT_BOM = "resources/wallace.20260514/huku_补充BOM_202601.csv"
 OUT_ALIAS = "resources/wallace.20260514/huku_补充alias_202601.csv"
 
+# ── 手工补充 BOM (市场后续在报表 xlsx 里手填的, 不在 Sheet1/2/3) ────────────
+# 2026-05-19: THD华莱士庆祝套餐 1/2 — 市场在 profit_by_price_202601_v22(1).xlsx
+#   套餐 sheet 里手工补的 BOM, 抽出来固化.
+MANUAL_BOM = {
+    "THD华莱士庆祝套餐 1": [
+        ("PA99020", "单杯袋", 1, "pc"), ("PA99001", "16A 冷杯", 1, "pc"),
+        ("BE01004", "百事可乐原味", 25, "g"), ("PA99024", "PLA尖头吸管", 1, "pc"),
+        ("PA99027", "哑光塑料封口膜", 1, "pc"), ("PA99008", "4#全鸡袋", 1, "pc"),
+        ("PA99025", "一次性餐包", 1, "pc"), ("CK01002", "鸡块", 5, "pc"),
+        ("SA01003", "甜辣酱（小包）", 1, "pc"), ("DR02001", "起酥油", 10, "g"),
+        ("PA99012", "小号方底袋", 1, "pc"), ("PA99018", "打包袋 (小号)", 1, "pc"),
+        ("SA01004", "番茄酱 （小包）", 1, "pc"), ("SE05002", "辣味粉", 10, "g"),
+        ("PA99023", "手套", 1, "pc"), ("FR01004", "翅根", 8, "pc"),
+        ("DR02002", "炸鸡炸粉", 10, "g"),
+    ],
+    # 2026-05-19: 鸡翅桶 — 市场图片提供的 8 物料 BOM
+    "鸡翅桶": [
+        ("DR02001", "起酥油", 10, "g"), ("PA99004", "65oz 桶(含盖)", 1, "pc"),
+        ("FR01004", "翅根", 8, "pc"), ("DR02002", "炸鸡炸粉", 10, "g"),
+        ("PA99016", "托盘纸", 1, "pc"), ("PA99023", "手套", 1, "pc"),
+        ("SA01008", "甜辣酱（大包）", 10, "g"), ("SA01009", "番茄酱（大包）", 10, "g"),
+    ],
+    "THD华莱士庆祝套餐2": [
+        ("PA99020", "单杯袋", 1, "pc"), ("PA99001", "16A 冷杯", 1, "pc"),
+        ("BE01004", "百事可乐原味", 25, "g"), ("PA99024", "PLA尖头吸管", 1, "pc"),
+        ("PA99027", "哑光塑料封口膜", 1, "pc"), ("PA99019", "打包袋 (大号)", 1, "pc"),
+        ("SA02001", "沙拉酱", 15, "g"), ("PA99025", "一次性餐包", 1, "pc"),
+        ("PA99034", "食安封签", 1, "pc"), ("SE05002", "辣味粉", 10, "g"),
+        ("PA99017", "五合一汉堡纸", 1, "pc"), ("DR02001", "起酥油", 10, "g"),
+        ("FR01001", "无骨方腿腿肉汉堡用", 1, "pc"), ("SA01013", "番茄酱（小包）", 1, "pc"),
+        ("DR02002", "炸鸡炸粉", 10, "g"), ("MK01019", "生菜", 15, "g"),
+        ("DR01001", "汉堡面包", 1, "pc"), ("PA99008", "4#全鸡袋", 1, "pc"),
+        ("FR01004", "翅根", 8, "pc"), ("PA99004", "65oz 桶(含盖)", 1, "pc"),
+        ("PA99023", "手套", 1, "pc"), ("PA99016", "托盘纸", 1, "pc"),
+    ],
+}
+
+# ── 调味衍生 BOM ────────────────────────────────────────────────────────
+# 2026-05-19 用户拍板: 辣番茄系列 = 基础商品 + SE05004 辣番茄调味料 10g
+#                      蒜香柠檬系列 = 基础商品 + DE01010 柠檬大蒜粉 10g
+# 这里给 X炸鸡桶+饮料 拆解用的成分商品建 BOM (基础=炸鸡桶).
+SEASONING_DERIVED = {
+    # 衍生商品名: (基础商品名, 调味物料)
+    "辣番茄炸鸡桶": ("炸鸡桶", ("SE05004", "辣番茄调味料", 10, "g")),
+    "蒜香柠檬炸鸡桶": ("炸鸡桶", ("DE01010", "柠檬大蒜粉", 10, "g")),
+}
+
 
 def load_existing_bom_keys():
     keys = set()
@@ -39,6 +86,17 @@ def load_existing_bom_keys():
         for r in csv.DictReader(f):
             keys.add(r["商品名称"])
     return keys
+
+
+def load_existing_bom(name: str):
+    """读现有 csv 里某商品的物料列表 → [(code, mname, qty, unit), ...]."""
+    recs = []
+    with open(EXISTING_BOM, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            if r["商品名称"] == name:
+                recs.append((r["物品编号"], r["物品名称"],
+                             float(r["单耗"] or 0), r["单位"]))
+    return recs
 
 
 def parse_sheet1(ws):
@@ -171,6 +229,24 @@ def main():
                 # 后到的源覆盖 (sheet3 > sheet2 > sheet1)? 实际同一商品只应出现一份
                 continue
             all_bom[name] = (recs, src_label)
+    # 手工补充 BOM (THD套餐 等)
+    for name, recs in MANUAL_BOM.items():
+        if name in existing_keys:
+            skipped_dup.append((name, "manual", len(recs)))
+        else:
+            all_bom[name] = (recs, "manual")
+
+    # 调味衍生 BOM (辣番茄炸鸡桶 = 炸鸡桶 + 辣番茄调味料 等)
+    for derived, (base, seasoning) in SEASONING_DERIVED.items():
+        if derived in existing_keys:
+            skipped_dup.append((derived, "seasoning", 0))
+            continue
+        base_recs = load_existing_bom(base)
+        if not base_recs:
+            print(f"  ⚠️ 调味衍生 {derived}: 基础商品 {base!r} 在现有 csv 找不到, 跳过")
+            continue
+        all_bom[derived] = (base_recs + [seasoning], "seasoning")
+
     print(f"  新加 BOM 商品: {len(all_bom)} ({sum(len(v[0]) for v in all_bom.values())} 物料行)")
     print(f"  跟现有 csv 重名跳过: {len(skipped_dup)}")
     for name, src, n in skipped_dup:

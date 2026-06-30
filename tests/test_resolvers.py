@@ -276,7 +276,7 @@ class BuilderTests(unittest.TestCase):
 
 class LegacyBridgeTests(unittest.TestCase):
     def test_from_layers(self):
-        from utils.layered_resource import Layer
+        from semantic.resolvers.layered_resource import Layer
         layers = [
             Layer(name="A", priority=100, data={"x": 1}),
             Layer(name="B", priority=50, data={"x": 0, "y": 2}),
@@ -295,7 +295,7 @@ class LegacyBridgeTests(unittest.TestCase):
 
     def test_from_layers_with_matcher(self):
         """模拟 BOM 模糊匹配场景，验证 Resolver 行为跟 lookup_layered 等价。"""
-        from utils.layered_resource import Layer
+        from semantic.resolvers.layered_resource import Layer
 
         layers = [
             Layer(name="market", priority=100, data={"鸡块（中）": [1, 2, 3]}),

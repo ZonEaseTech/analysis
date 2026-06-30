@@ -209,8 +209,8 @@ class CancelRatioBandTests(unittest.TestCase):
 
 class BundlesTests(unittest.TestCase):
     def test_default_unchanged(self):
-        """DEFAULT 仍是 2 个 (销量 + 金额)，没污染."""
-        self.assertEqual(len(DEFAULT_IDENTITIES), 2)
+        """DEFAULT 是 3 个 (销量 + 金额 + 毛额守恒)."""
+        self.assertEqual(len(DEFAULT_IDENTITIES), 3)
 
     def test_source_coverage_bundle(self):
         self.assertEqual(len(SOURCE_COVERAGE_IDENTITIES), 2)
@@ -233,11 +233,13 @@ class BundlesTests(unittest.TestCase):
             "free_qty": 0, "give_qty": 0, "refund_qty": 0, "cancelled_qty": 0,
             "sales_price": 100, "revenue": 100,
             "refund_amount": 0, "free_amount": 0, "give_amount": 0,
-            "discount_amount": 0,
+            "discount_amount": 0, "cancelled_amount": 0,
+            "gross_amount": 100,  # = sales_price(100) + cancelled_amount(0)
         }]
         result = check(rows, FULL_IDENTITIES)
         # 没 source 字段 → coverage opt-in 跳过; 没异常率 → bands pass
         # 金额恒等式: sales(100) = actual(100)+0+0+0+0 ✓
+        # 毛额恒等式: gross(100) = sales(100)+cancelled(0) ✓
         self.assertEqual(result.violations, [])
 
 

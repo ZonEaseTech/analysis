@@ -1,0 +1,30 @@
+# 元数据 / 审计 — provenance columns that travel with every report row.
+metrics:
+  - id: bom_source
+    name: "bom_source / BOM 来源"
+    domain: metadata
+    status: audit-meta
+    confidence: ACTUAL
+    definition: "审计列。标记某 SKU 的 BOM 数据来自哪个 priority 层。"
+    formula:
+      business: "取 priority 栈命中的层名：bq_native / 外挂层名 / 无"
+      sql_refs:
+        - "bq_reports/profit_margin_report.py::_annotate_agg_data_sources"
+    lineage:
+      source_tables: [ttpos_product_bom]
+    report_display: "profit_margin.yaml（BOM来源列）+ pnl_statement Sheet 6 审计"
+    notes: "无 = 该 SKU 没匹配到任何 BOM；有销量则 SOURCE_COVERAGE identity 报警 🔴。"
+
+  - id: price_source
+    name: "price_source / 物料价来源"
+    domain: metadata
+    status: audit-meta
+    confidence: ACTUAL
+    definition: "审计列。标记物料单价来自哪个 priority 层（跟 BOM 数量来源解耦）。"
+    formula:
+      business: "取 priority 栈命中层名（高→低）：客户外挂层 / uploaded_price_list / ERPNext / bq_native / 无(strict)"
+      sql_refs:
+        - "bq_reports/profit_margin_report.py::_resolve_unit_price_with_source"
+    lineage:
+      source_tables: [ttpos_material]
+    notes: "多源用 ' + ' 拼接。无(strict) = strict 模式客户成本表未命中（成本算 0，审计列标黄）。"

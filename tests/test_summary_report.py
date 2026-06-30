@@ -25,30 +25,30 @@ class NewSqlFieldsTests(unittest.TestCase):
 
     def test_free_amount_clause(self):
         self.assertIn(
-            "SUM(IF(sp.free_num > 0, sp.product_sale_price * sp.product_num, 0)) AS free_amount",
+            "CAST(ROUND(SUM(IF(sp.free_num > 0, sp.product_sale_price * sp.product_num, 0)) * 100) AS INT64) AS free_amount",
             self.sql,
         )
 
     def test_give_amount_clause(self):
         self.assertIn(
-            "SUM(IF(sp.give_num > 0, sp.product_sale_price * sp.product_num, 0)) AS give_amount",
+            "CAST(ROUND(SUM(IF(sp.give_num > 0, sp.product_sale_price * sp.product_num, 0)) * 100) AS INT64) AS give_amount",
             self.sql,
         )
 
     def test_discount_amount_clause_uses_same_if_as_actual(self):
         """discount must use the same exclusion (free|give → 0, deduct refund)
-        as actual_amount, otherwise the金额恒等式 won't balance."""
+        as actual_amount, otherwise the金额恒等式 won't balance (萨当整数化)."""
         self.assertIn(
-            "SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,\n"
-            "           (sp.product_sale_price - sp.product_final_price) * (sp.product_num - sp.refund_num))) AS discount_amount",
+            "CAST(ROUND(SUM(IF(sp.free_num > 0 OR sp.give_num > 0, 0,\n"
+            "           (sp.product_sale_price - sp.product_final_price) * (sp.product_num - sp.refund_num))) * 100) AS INT64) AS discount_amount",
             self.sql,
         )
 
     def test_takeout_side_zeros_new_fields(self):
-        """Takeout has no free/give/discount — must zero them to align schema."""
-        self.assertIn("0 AS free_amount", self.sql)
-        self.assertIn("0 AS give_amount", self.sql)
-        self.assertIn("0 AS discount_amount", self.sql)
+        """Takeout has no free/give/discount — must zero them to align schema (萨当 INT64)."""
+        self.assertIn("CAST(0 AS INT64) AS free_amount", self.sql)
+        self.assertIn("CAST(0 AS INT64) AS give_amount", self.sql)
+        self.assertIn("CAST(0 AS INT64) AS discount_amount", self.sql)
 
     def test_merged_cte_aggregates_new_fields(self):
         self.assertIn(
@@ -100,9 +100,10 @@ class BuildSummaryRowsTests(unittest.TestCase):
     """Flatten produces one row per (store, SKU) with pre-computed numbers."""
 
     def _agg(self, bom=None, **fields):
+        # 交易金额字段值是萨当整数 (PR-B 7b): revenue 30000 萨当 = 300 元
         defaults = dict(
-            qty=10.0, net_qty=8.0, revenue=300.0, sales_price=500.0,
-            original_amount=480.0, refund_qty=0, refund_amount=0,
+            qty=10.0, net_qty=8.0, revenue=30000, sales_price=50000,
+            original_amount=48000, refund_qty=0, refund_amount=0,
             cancelled_qty=0, cancelled_amount=0,
             free_amount=0, give_amount=0, discount_amount=0,
             free_qty=1.0, give_qty=1.0, avg_member_discount=1.0,
@@ -146,10 +147,10 @@ class BuildSummaryRowsTests(unittest.TestCase):
         self.assertEqual(rows[0][8], 20)
 
     def test_profit_and_margin(self):
-        rows = _build_summary_rows(self._agg(qty=10, revenue=300.0,
+        rows = _build_summary_rows(self._agg(qty=10, revenue=30000,
                                               bom=[("M1", "x", 1.0, 2.0, "g")]),
                                     mode="single")
-        # cost=20, profit=300-20=280, margin=280/300
+        # revenue 30000 萨当 = 300 元; cost=20, profit=300-20=280, margin=280/300
         self.assertEqual(rows[0][9], 280)
         self.assertAlmostEqual(rows[0][10], 280 / 300, places=4)
 

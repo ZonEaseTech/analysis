@@ -152,3 +152,4 @@ Operating Income (EBIT)
 - [pnl-statement-design.md](./pnl-statement-design.md) — P&L 入口完整设计
 - [pnl-primer-for-engineers.md](./pnl-primer-for-engineers.md) — 工程师视角财务 P&L 入门
 - [architecture-evolution-roadmap.md](./architecture-evolution-roadmap.md) — 整体演进路线图（含 P0 阶段说明）
+- [2026-06-12-zero-tolerance-design.md](./superpowers/specs/2026-06-12-zero-tolerance-design.md) — 内部一致性零容差改造(跨账本互证/导出闸门,PR-A 已落地);本文件的法定口径 gap 不受影响,仍待客户财务输入

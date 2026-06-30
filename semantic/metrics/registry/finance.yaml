@@ -1,0 +1,56 @@
+# 财务域 — finance domain metrics. Fixed OpEx, all pending fact-table onboarding.
+# Onboarding path: P3 fact_overrides via resolvers.yaml (skill: onboard-fact-table).
+metrics:
+  - id: labor
+    name: "labor / 人力成本"
+    domain: finance
+    status: planned
+    confidence: NA
+    unit: THB
+    definition: "人力/工资成本。待接入。"
+    formula:
+      business: "Σ 工资 + 社保 + 福利（来源 HR / 工资系统）"
+    notes: "接入路径 P3 fact_overrides 走 resolvers.yaml::labor_cost。详见 skill onboard-fact-table。"
+
+  - id: rent
+    name: "rent / 房租"
+    domain: finance
+    status: planned
+    confidence: NA
+    unit: THB
+    definition: "门店房租。待接入（财务 ERP / 合同）。"
+    formula:
+      business: "门店月租（来源财务 ERP / 合同）"
+
+  - id: utilities
+    name: "utilities / 水电气"
+    domain: finance
+    status: planned
+    confidence: NA
+    unit: THB
+    definition: "水电气能耗成本。待接入（财务 ERP）。"
+    formula:
+      business: "水 + 电 + 气（来源财务 ERP）"
+
+  - id: marketing
+    name: "marketing / 营销"
+    domain: finance
+    status: planned
+    confidence: NA
+    unit: THB
+    definition: "营销 / 推广费用。待接入（营销系统 / 财务）。"
+    formula:
+      business: "营销投放 + 推广（来源营销系统 / 财务）"
+
+  - id: operating_income
+    name: "operating_income / 经营利润"
+    domain: finance
+    status: planned
+    confidence: NA
+    unit: THB
+    definition: >-
+      EBIT（Earnings Before Interest & Tax）。当前一律 N/A（依赖固定成本接入）。
+    formula:
+      business: "Contribution Margin − Fixed OpEx(Rent + Labor + Utilities + Marketing)"
+    lineage:
+      upstream_metrics: [contribution_margin, labor, rent, utilities, marketing]

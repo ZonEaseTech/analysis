@@ -18,7 +18,7 @@ from openpyxl.utils.cell import range_boundaries
 
 from tests import _setup  # noqa: F401
 
-from utils.report_engine import (
+from bq_reports.shared.report_engine import (
     ColumnConfig,
     SheetConfig,
     write_configured_sheet,
@@ -232,6 +232,66 @@ class ZeroYellowTest(unittest.TestCase):
         try:
             ws = load_workbook(path)["测试"]
             self.assertEqual(list(ws.conditional_formatting), [])
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class MoneySatangTest(unittest.TestCase):
+    """money_satang — 萨当整数列写盘时 /100 还原成元 (PR-B 7b).
+
+    交易金额在语义层整数化成萨当 (1 元 = 100 萨当). YAML 标 money_satang: true
+    的列, 引擎写盘时唯一一次 /100 还原, 客户看到的是元.
+    """
+
+    def _cfg(self):
+        return SheetConfig(
+            name="测试",
+            columns=[
+                ColumnConfig(name="商品", field_index=0, merge=True),
+                # 萨当列 (merge) + 萨当列 (非 merge) 两条路径都要测
+                ColumnConfig(name="营业额", field_index=1, col_type="value",
+                             format_str="0.00", merge=True, money_satang=True),
+                ColumnConfig(name="退款金额", field_index=2, col_type="value",
+                             format_str="0.00", money_satang=True),
+                # 非萨当数值列: 原样写 (不 /100)
+                ColumnConfig(name="销量", field_index=3, col_type="value",
+                             format_str="0.00"),
+            ],
+            merge_key_indices=[0],
+        )
+
+    def _write(self, rows):
+        tmpdir = tempfile.mkdtemp()
+        path = os.path.join(tmpdir, "out.xlsx")
+        wb = xlsxwriter.Workbook(path)
+        write_configured_sheet(wb, "测试", self._cfg(), rows)
+        wb.close()
+        return path, tmpdir
+
+    def test_satang_divided_by_100_on_write(self):
+        # 营业额 3900 萨当 → 39.00 元; 退款金额 50 萨当 → 0.50 元; 销量 12 原样
+        rows = [["A", 3900, 50, 12], ["A", 3900, 50, 12]]
+        path, tmpdir = self._write(rows)
+        try:
+            ws = load_workbook(path)["测试"]
+            # merge 列: 萨当 /100 写在 block 第一行
+            self.assertEqual(ws.cell(row=2, column=2).value, 39.0)
+            # 非 merge 萨当列
+            self.assertEqual(ws.cell(row=2, column=3).value, 0.5)
+            # 非萨当列原样
+            self.assertEqual(ws.cell(row=2, column=4).value, 12)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_none_value_not_divided(self):
+        rows = [["A", None, 100, 0]]
+        path, tmpdir = self._write(rows)
+        try:
+            ws = load_workbook(path)["测试"]
+            self.assertIsNone(ws.cell(row=2, column=2).value)
+            self.assertEqual(ws.cell(row=2, column=3).value, 1.0)
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)

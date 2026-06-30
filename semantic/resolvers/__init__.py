@@ -29,10 +29,12 @@ from .base import Provider, Resolved, Resolver
 from .providers import DictProvider, YamlMatchProvider, CallableProvider
 from .builder import build_resolver, from_layers, from_layers_with_matcher
 from .loader import load_resolvers_from_yaml
+from .layered_resource import Layer, load_layers
 
 __all__ = [
     "Provider", "Resolved", "Resolver",
     "DictProvider", "YamlMatchProvider", "CallableProvider",
     "build_resolver", "from_layers", "from_layers_with_matcher",
     "load_resolvers_from_yaml",
+    "Layer", "load_layers",
 ]

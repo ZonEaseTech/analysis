@@ -181,7 +181,27 @@ def _merge_runs(ws, col_letter: str, start_row: int, end_row: int, value_of):
         ws.merge_cells(f"{col_letter}{run_start}:{col_letter}{end_row}")
 
 
-def write_excel(no_bom_rows, output_path: str):
+def write_excel(no_bom_rows, output_path: str, force: bool = False):
+    from semantic.validators.gate import (
+        add_watermark_sheet_openpyxl, validate_and_gate)
+    from semantic.validators.identities import (
+        make_required_fields_identity, make_unique_key_identity)
+
+    uniq_ident, prepare = make_unique_key_identity(
+        ("product_uuid",), name="商品UUID唯一")
+    check_rows = prepare([
+        {"product_name": r.product_name or "",
+         "product_uuid": str(r.product_uuid) if r.product_uuid else ""}
+        for r in no_bom_rows
+    ])
+    outcome = validate_and_gate(
+        check_rows,
+        [make_required_fields_identity(("product_name",), name="未设置BOM菜品中文名必填"),
+         uniq_ident],
+        force=force, report_name="menu_no_bom_bilingual",
+        row_label=lambda r: r.get("product_name", ""),
+    )
+
     wb = Workbook()
     ws = wb.active
     ws.title = "未设置BOM菜品"
@@ -215,6 +235,9 @@ def write_excel(no_bom_rows, output_path: str):
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = w
     ws.freeze_panes = "A2"
 
+    if outcome.needs_watermark:
+        add_watermark_sheet_openpyxl(wb, outcome.watermark_lines())
+
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
 
@@ -226,6 +249,8 @@ def parse_args():
                    help=f"BQ dataset(任意一家分店即可,默认 {DEFAULT_DATASET})")
     p.add_argument("--output", default="exports/menu_no_bom_bilingual.xlsx",
                    help="输出 Excel 文件路径")
+    p.add_argument("--force", action="store_true",
+                   help="强制导出 (有 🔴 违反时打水印而非阻断)")
     return p.parse_args()
 
 
@@ -243,7 +268,7 @@ def main():
     singles = sum(1 for r in no_bom if r.sort_type == 0)
     sauces = sum(1 for r in no_bom if r.sort_type == 1)
 
-    write_excel(no_bom, args.output)
+    write_excel(no_bom, args.output, force=args.force)
     print(f"[完成] 输出 {args.output}")
     print(f"  单品: {singles} 个")
     print(f"  加料: {sauces} 个")

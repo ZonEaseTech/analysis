@@ -4,26 +4,29 @@
 
 ```
 analysis/
-├── venv/                       # Python 虚拟环境
-├── scripts/                    # 报表脚本
-│   ├── report_bom_sales_bq.py      # BOM 商品销量报表
-│   ├── report_daily_item_sales_bq.py  # 门店单品销量按日明细
-│   ├── report_sales_simple_bq.py     # 销售业绩明细（原始订单行）
-│   ├── export_sales_takeout.py       # 外卖平台销售数据导出
-│   └── export_takeout_revenue.py     # 外卖收入报表导出
-├── utils/                      # 工具函数
-│   └── bq_client.py                # BigQuery 客户端配置（共用）
-├── templates/                  # 模板文件
-│   └── template_analysis.py        # 分析脚本模板
-├── docs/                       # 文档
-│   ├── query-patterns.md           # 查询模式参考
-│   └── schema-reference.md         # 数据库结构参考
-├── sql/                        # SQL 查询文件
-│   └── takeout_revenue_query.sql   # 外卖收入查询
-├── exports/                    # 导出文件（报表输出）
-├── resources/                  # 资源文件（输入数据）
-└── README.md                   # 本文件
+├── semantic/                     # 数据架构核心 — 口径真源
+│   ├── entities/                 #   CTE 工厂 (12 实体)
+│   ├── cogs/                     #   成本解析 (material_price 4层 priority)
+│   ├── aggregations/             #   聚合 (by_grain/pnl_layers/kpi_ratios)
+│   ├── metrics/                  #   指标注册表 (5 yaml, 30 指标)
+│   ├── validators/               #   恒等式 + 闸门
+│   ├── reconciliation/           #   对账锚 (ttpos/cost/platform_payout)
+│   └── resolvers/                #   priority 解析器
+├── bq_reports/                   # 报表层 = 数据排列组合
+│   ├── shared/                   #   报表引擎 (report_engine + cache)
+│   ├── utils/                    #   BQ/ERP 客户端
+│   └── [19 个报表入口]
+├── bom_pipeline/                 # 生产管线 (clean_bom + payment 锚定)
+├── external_sales/               # 外部销售接入 (huku)
+├── utils/                        # 跨层共享 (resource_adapter)
+├── scripts/adhoc/                # 审计/对账/接入工具
+├── resources/                    # 配置 + data archives
+├── tests/                        # 584 tests
+├── docs/                         # 架构·计划·spec·审计
+└── exports/                      # 导出物 (gitignored)
 ```
+
+> 原则: **报表 = 不同数据的排列组合**。共享逻辑收口在 `semantic/`, 报表特有逻辑在 `bq_reports/` 内自洽。详见 `docs/pipelines-overview.md`。
 
 ## 快速开始
 

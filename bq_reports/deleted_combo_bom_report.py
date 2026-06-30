@@ -173,11 +173,36 @@ def _write_sheet(ws, rows, store_name: str):
     ws.freeze_panes = "A2"
 
 
-def write_excel(rows, store_name: str, output_path: str):
+def write_excel(rows, store_name: str, output_path: str, force: bool = False):
+    from semantic.validators.gate import (
+        add_watermark_sheet_openpyxl, validate_and_gate)
+    from semantic.validators.identities import (
+        make_required_fields_identity, make_unique_key_identity)
+
+    uniq_ident, prepare = make_unique_key_identity(
+        ("combo_name", "group_name", "child_name"), name="套餐+分组+子品主键唯一")
+    check_rows = prepare([
+        {"combo_name": r.combo_name or "",
+         "group_name": r.group_name or "",
+         "child_name": r.child_name or ""}
+        for r in rows
+    ])
+    outcome = validate_and_gate(
+        check_rows,
+        [make_required_fields_identity(
+            ("combo_name", "child_name"), name="已删除套餐BOM必填字段"),
+         uniq_ident],
+        force=force, report_name="deleted_combo_bom_report",
+        row_label=lambda r: f"{r.get('combo_name', '')} / {r.get('child_name', '')}",
+    )
+
     wb = Workbook()
     ws = wb.active
     ws.title = "已删除套餐组成"
     _write_sheet(ws, rows, store_name)
+
+    if outcome.needs_watermark:
+        add_watermark_sheet_openpyxl(wb, outcome.watermark_lines())
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -202,6 +227,8 @@ def parse_args():
                    help=f"删除时间截止 Unix 时间戳(默认 {DEFAULT_END_TS}=2026-04-01)")
     p.add_argument("--output", required=True,
                    help=f"输出 Excel 文件路径(自动追加版本号 _{REPORT_VERSION})")
+    p.add_argument("--force", action="store_true",
+                   help="强制导出 (有 🔴 违反时打水印而非阻断)")
     return p.parse_args()
 
 
@@ -232,7 +259,7 @@ def main():
     unique_combos = set(r.combo_uuid for r in rows)
     print(f"[BQ] 涉及 {len(unique_combos)} 个不同的已删除套餐")
 
-    write_excel(rows, store_name, output_path)
+    write_excel(rows, store_name, output_path, force=args.force)
 
     print(f"[完成] 输出 {output_path}")
     print(f"  Sheet「已删除套餐组成」: {len(rows)} 行, {len(unique_combos)} 个套餐")
